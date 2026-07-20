@@ -40,62 +40,84 @@ def _run_fixture(xlsm: Path) -> bool:
 
     xl = None
     wb = None
+    print(f"[START] {xlsm.name}", flush=True)
     try:
-        print(f"  Opening {xlsm.name}...", end=" ", flush=True)
+        print(f"  [1] Dispatching Excel.Application...", flush=True)
         xl = win32com.client.Dispatch("Excel.Application")
+        print(f"  [1.1] Setting display alerts...", flush=True)
         xl.DisplayAlerts = False
         xl.Visible = False
 
+        print(f"  [2] Opening workbook at {xlsm.absolute()}...", flush=True)
         wb = xl.Workbooks.Open(str(xlsm.absolute()))
-        time.sleep(0.5)  # Give Excel time to load
-        print("running macro...", end=" ", flush=True)
+        print(f"  [2.1] Workbook opened, waiting 0.5s...", flush=True)
+        time.sleep(0.5)
+        
+        print(f"  [3] Running Module1.RunFixture...", flush=True)
         try:
             xl.Application.Run("Module1.RunFixture")
+            print(f"  [3.1] Macro completed, waiting 0.5s...", flush=True)
         except Exception as macro_err:
-            print(f"FAIL (macro error: {macro_err})")
+            print(f"  [3.E] FAIL - macro execution error: {macro_err}")
+            traceback.print_exc()
             return False
         time.sleep(0.5)  # Give macro time to complete
+        
+        print(f"  [4] Closing workbook (SaveChanges=False)...", flush=True)
         wb.Close(SaveChanges=False)
         wb = None
-        print("closed.", end=" ", flush=True)
+        print(f"  [4.1] Workbook closed.", flush=True)
 
         expected = xlsm.with_suffix(".txt")
-        time.sleep(0.5)  # Extra wait for file I/O
+        print(f"  [5] Waiting 0.5s for file I/O...", flush=True)
+        time.sleep(0.5)
         
-        # Debug: list files in directory
-        dir_contents = list(xlsm.parent.glob("*"))
+        print(f"  [5.1] Checking for {expected.name}...", flush=True)
         if not expected.exists():
-            print(f"FAIL (output file not found)")
+            print(f"  [5.E] FAIL - output file not created")
+            dir_contents = list(xlsm.parent.glob("*"))
             print(f"      Expected: {expected}")
-            print(f"      Dir contents: {[f.name for f in dir_contents]}")
+            print(f"      Dir contents: {sorted([f.name for f in dir_contents])}")
             return False
 
+        print(f"  [6] Reading output file...", flush=True)
         content = expected.read_text(encoding="utf-8").strip()
-        print(f"PASS  -> {expected.name}: {content!r}")
+        print(f"[END] PASS -> {expected.name}: {content!r}", flush=True)
         return True
 
     except Exception as exc:
-        print(f"FAIL  {type(exc).__name__}: {exc}")
-        if exc:
-            traceback.print_exc()
+        print(f"[ERROR] {type(exc).__name__}: {exc}")
+        traceback.print_exc()
         return False
 
     finally:
+        print(f"  [CLEANUP] Starting cleanup...", flush=True)
         if wb is not None:
+            print(f"  [CLEANUP.1] Closing workbook...", flush=True)
             try:
                 wb.Close(SaveChanges=False)
-            except Exception:
-                pass
+                print(f"  [CLEANUP.1.OK] Workbook closed.", flush=True)
+            except Exception as e:
+                print(f"  [CLEANUP.1.E] Error closing workbook: {e}", flush=True)
             wb = None
+        
         if xl is not None:
+            print(f"  [CLEANUP.2] Calling xl.Quit()...", flush=True)
             try:
                 xl.Quit()
-            except Exception:
-                pass
+                print(f"  [CLEANUP.2.OK] Excel.Quit() completed.", flush=True)
+            except Exception as e:
+                print(f"  [CLEANUP.2.E] Error quitting Excel: {e}", flush=True)
             xl = None
-        # Force garbage collection and give Excel time to fully exit
+        
+        print(f"  [CLEANUP.3] Running gc.collect()...", flush=True)
         gc.collect()
+        print(f"  [CLEANUP.3] gc.collect() done.", flush=True)
+        
+        print(f"  [CLEANUP.4] Waiting 3 seconds for Excel to fully exit...", flush=True)
         time.sleep(3)
+        print(f"  [CLEANUP.4] Wait complete.", flush=True)
+        print(f"[CLEANUP.DONE]\n", flush=True)
 
 
 def main() -> None:
@@ -109,14 +131,21 @@ def main() -> None:
         print(f"No .xlsm files found")
         sys.exit(1)
 
-    print(f"Running {len(xlsm_files)} fixture(s) from {BUILD_DIR}\n")
+    print(f"[MAIN] Running {len(xlsm_files)} fixture(s)")
+    print(f"[MAIN] Build dir: {BUILD_DIR}\n")
 
-    results = [_run_fixture(xlsm) for xlsm in xlsm_files]
+    results = []
+    for i, xlsm in enumerate(xlsm_files, 1):
+        print(f"[MAIN] ({i}/{len(xlsm_files)}) Processing {xlsm.name}", flush=True)
+        result = _run_fixture(xlsm)
+        results.append(result)
+        print(f"[MAIN] ({i}/{len(xlsm_files)}) Result: {'PASS' if result else 'FAIL'}\n", flush=True)
 
     passed = sum(results)
     failed = len(results) - passed
     print(f"\n{'-' * 40}")
-    print(f"{passed}/{len(results)} passed" + (f"  ({failed} failed)" if failed else ""))
+    print(f"[SUMMARY] {passed}/{len(results)} passed" + (f"  ({failed} failed)" if failed else ""))
+    print(f"[SUMMARY] Completed at {__import__('datetime').datetime.now()}", flush=True)
 
     if failed:
         sys.exit(1)
