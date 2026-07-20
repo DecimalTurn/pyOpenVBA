@@ -41,7 +41,10 @@ jobs:
           office-apps: Excel
 
       - name: Install pywin32
-        run: pip install pywin32
+        shell: pwsh
+        run: |
+          pip install pywin32
+          python -m Scripts.pywin32_postinstall -install
 
       - name: Run Excel macros and verify output
         run: python scripts/run_excel_fixtures.py

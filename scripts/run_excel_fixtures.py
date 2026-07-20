@@ -27,30 +27,36 @@ BUILD_DIR = Path(__file__).resolve().parents[1] / "build" / "fixtures" / "excel"
 def _run_fixture(xlsm: Path) -> bool:
     """Open *xlsm*, run Module1.RunFixture, verify the sentinel file. Return True on pass."""
     import win32com.client  # type: ignore[import]
+    import time
 
     xl = None
     wb = None
     try:
+        print(f"  Opening {xlsm.name}...", end=" ", flush=True)
         xl = win32com.client.Dispatch("Excel.Application")
         xl.DisplayAlerts = False
         xl.Visible = False
 
-        wb = xl.Workbooks.Open(str(xlsm))
+        wb = xl.Workbooks.Open(str(xlsm.absolute()))
+        time.sleep(0.5)  # Give Excel time to load
+        print("running macro...", end=" ", flush=True)
         xl.Application.Run("Module1.RunFixture")
+        time.sleep(0.5)  # Give macro time to complete
         wb.Close(SaveChanges=False)
         wb = None
+        print("closed.", end=" ", flush=True)
 
         expected = xlsm.with_suffix(".txt")
         if not expected.exists():
-            print(f"  FAIL  output file not created: {expected.name}")
+            print(f"FAIL  output file not created: {expected.name}")
             return False
 
         content = expected.read_text(encoding="utf-8").strip()
-        print(f"  PASS  {xlsm.name} → {expected.name}: {content!r}")
+        print(f"PASS  → {expected.name}: {content!r}")
         return True
 
     except Exception as exc:
-        print(f"  FAIL  {xlsm.name}: {exc}")
+        print(f"FAIL  {exc}")
         return False
 
     finally:
@@ -72,7 +78,7 @@ def main() -> None:
         print(f"No .xlsm files found in {BUILD_DIR}")
         sys.exit(1)
 
-    print(f"Running {len(xlsm_files)} fixture(s) from {BUILD_DIR.relative_to(Path.cwd()) if BUILD_DIR.is_relative_to(Path.cwd()) else BUILD_DIR}\n")
+    print(f"Running {len(xlsm_files)} fixture(s) from {BUILD_DIR}\n")
 
     results = [_run_fixture(xlsm) for xlsm in xlsm_files]
 
