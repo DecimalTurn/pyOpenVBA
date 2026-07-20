@@ -1,0 +1,14 @@
+name: Build Test
+
+on:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: windows-latest
+    timeout-minutes: 8
+    env:
+      PYTHONPATH: src
+
+    steps:
+      - run: echo "Stub – run this workflow from the test branch for the full implementation."
