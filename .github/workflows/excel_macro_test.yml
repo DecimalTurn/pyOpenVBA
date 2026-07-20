@@ -48,7 +48,7 @@ jobs:
           python -m Scripts.pywin32_postinstall -install
 
       - name: Run Excel macros and verify output
-        timeout-minutes: 3
+        timeout-minutes: 1
         run: python scripts/run_excel_fixtures.py
 
       - name: Take screenshot on failure
