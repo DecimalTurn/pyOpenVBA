@@ -19,6 +19,12 @@ Exit code: 0 = all passed, 1 = one or more failed.
 from __future__ import annotations
 
 import sys
+import os
+
+# Force UTF-8 output on Windows
+if sys.platform == "win32":
+    sys.stdout.reconfigure(encoding="utf-8")
+
 from pathlib import Path
 
 BUILD_DIR = Path(__file__).resolve().parents[1] / "build" / "fixtures" / "excel"
@@ -64,7 +70,7 @@ def _run_fixture(xlsm: Path) -> bool:
             return False
 
         content = expected.read_text(encoding="utf-8").strip()
-        print(f"PASS  → {expected.name}: {content!r}")
+        print(f"PASS  -> {expected.name}: {content!r}")
         return True
 
     except Exception as exc:
