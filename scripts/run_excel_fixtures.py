@@ -84,7 +84,7 @@ def main() -> None:
 
     passed = sum(results)
     failed = len(results) - passed
-    print(f"\n{'─' * 40}")
+    print(f"\n{'-' * 40}")
     print(f"{passed}/{len(results)} passed" + (f"  ({failed} failed)" if failed else ""))
 
     if failed:
