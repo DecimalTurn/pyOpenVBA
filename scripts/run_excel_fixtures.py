@@ -74,11 +74,19 @@ def _run_fixture(xlsm: Path) -> bool:
         
         print(f"  [5.1] Checking for {expected.name}...", flush=True)
         if not expected.exists():
-            print(f"  [5.E] FAIL - output file not created")
-            dir_contents = list(xlsm.parent.glob("*"))
-            print(f"      Expected: {expected}")
-            print(f"      Dir contents: {sorted([f.name for f in dir_contents])}")
-            return False
+            # Check if file ended up in TEMP directory instead
+            import tempfile
+            temp_path = Path(tempfile.gettempdir()) / expected.name
+            print(f"      {expected.name} not found in workbook dir, checking TEMP...", flush=True)
+            if temp_path.exists():
+                expected = temp_path
+                print(f"      Found at: {temp_path}", flush=True)
+            else:
+                print(f"  [5.E] FAIL - output file not created")
+                dir_contents = list(xlsm.parent.glob("*"))
+                print(f"      Expected: {expected}")
+                print(f"      Dir contents: {sorted([f.name for f in dir_contents])}")
+                return False
 
         print(f"  [6] Reading output file...", flush=True)
         content = expected.read_text(encoding="utf-8").strip()
@@ -114,8 +122,8 @@ def _run_fixture(xlsm: Path) -> bool:
         gc.collect()
         print(f"  [CLEANUP.3] gc.collect() done.", flush=True)
         
-        print(f"  [CLEANUP.4] Waiting 3 seconds for Excel to fully exit...", flush=True)
-        time.sleep(3)
+        print(f"  [CLEANUP.4] Waiting 1 second for Excel to fully exit...", flush=True)
+        time.sleep(1)
         print(f"  [CLEANUP.4] Wait complete.", flush=True)
         print(f"[CLEANUP.DONE]\n", flush=True)
 

@@ -48,4 +48,28 @@ jobs:
           python -m Scripts.pywin32_postinstall -install
 
       - name: Run Excel macros and verify output
+        timeout-minutes: 5
         run: python scripts/run_excel_fixtures.py
+
+      - name: Take screenshot on failure
+        if: failure()
+        shell: pwsh
+        run: |
+          Add-Type -AssemblyName System.Windows.Forms
+          $screenshot = New-Object System.Drawing.Bitmap([System.Windows.Forms.Screen]::PrimaryScreen.Bounds.Width, [System.Windows.Forms.Screen]::PrimaryScreen.Bounds.Height)
+          $graphics = [System.Drawing.Graphics]::FromImage($screenshot)
+          $graphics.CopyFromScreen([System.Windows.Forms.Screen]::PrimaryScreen.Bounds.Location, [System.Drawing.Point]::Empty, [System.Windows.Forms.Screen]::PrimaryScreen.Bounds.Size)
+          $screenshotDir = "${{ github.workspace }}/screenshots"
+          New-Item -ItemType Directory -Path $screenshotDir -Force | Out-Null
+          $screenshot.Save("$screenshotDir/failure_screenshot.png")
+          $graphics.Dispose()
+          $screenshot.Dispose()
+          Write-Host "Screenshot saved to $screenshotDir/failure_screenshot.png"
+
+      - name: Upload failure screenshots
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: failure-screenshots
+          path: ./screenshots/
+          if-no-files-found: warn
