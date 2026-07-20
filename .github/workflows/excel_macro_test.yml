@@ -60,13 +60,17 @@ jobs:
           . "${{ github.workspace }}/scripts/utils/Screenshot.ps1"
           . "${{ github.workspace }}/scripts/utils/Minimize.ps1"
           . "${{ github.workspace }}/scripts/utils/MinimizeCurrentWindow.ps1"
+          . "${{ github.workspace }}/scripts/utils/ListVisibleWindows.ps1"
           
           $screenshotDir = "${{ github.workspace }}/screenshots"
           if (!(Test-Path -Path $screenshotDir)) {
             New-Item -ItemType Directory -Path $screenshotDir -Force | Out-Null
           }
+
+          Write-VisibleWindowsReport -OutputPath "$screenshotDir/failure_visible_windows_before.txt" -Header "Visible windows before failure screenshot"
           
           Minimize-Window "HostedComputeAgent"
+          Minimize-Window "Administrator"
           Minimize-CurrentWindow
           Start-Sleep -Seconds 1
           Take-Screenshot -OutputPath "$screenshotDir/failure_screenshot.png"
@@ -91,10 +95,15 @@ jobs:
           . "${{ github.workspace }}/scripts/utils/Minimize.ps1"
           . "${{ github.workspace }}/scripts/utils/Screenshot.ps1"
           . "${{ github.workspace }}/scripts/utils/MinimizeCurrentWindow.ps1"
+          . "${{ github.workspace }}/scripts/utils/ListVisibleWindows.ps1"
           
           Write-Host "=== BEFORE MINIMIZATION ===" -ForegroundColor Cyan
           $processes = Get-Process | Where-Object { $_.MainWindowHandle -ne 0 }
           $processes | ForEach-Object { Write-Host "  - $($_.ProcessName): $($_.MainWindowTitle)" }
+
+          $screenshotDir = "${{ github.workspace }}/screenshots"
+          New-Item -ItemType Directory -Path $screenshotDir -Force | Out-Null
+          Write-VisibleWindowsReport -OutputPath "$screenshotDir/minimize_test_visible_windows_before.txt" -Header "Visible windows before minimization test screenshot"
           
           Write-Host "`n=== ATTEMPTING MINIMIZATION ===" -ForegroundColor Cyan
           Minimize-Window "cmd"
@@ -103,9 +112,6 @@ jobs:
           Minimize-CurrentWindow
           
           Start-Sleep -Seconds 2
-          
-          $screenshotDir = "${{ github.workspace }}/screenshots"
-          New-Item -ItemType Directory -Path $screenshotDir -Force | Out-Null
           
           Write-Host "`n=== TAKING SCREENSHOT ===" -ForegroundColor Cyan
           Take-Screenshot -OutputPath "$screenshotDir/minimize_test_screenshot.png"
