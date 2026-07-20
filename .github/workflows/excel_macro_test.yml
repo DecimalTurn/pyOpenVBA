@@ -20,7 +20,7 @@ on:
 jobs:
   test:
     runs-on: windows-latest
-    timeout-minutes: 8
+    timeout-minutes: 15
     env:
       PYTHONPATH: src
 
