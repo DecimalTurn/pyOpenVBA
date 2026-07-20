@@ -8,6 +8,7 @@ on:
       - 'tests/fixtures/excel/**'
       - 'scripts/build_excel_fixtures.py'
       - 'scripts/run_excel_fixtures.py'
+      - 'scripts/take-screenshot-on-failure.ps1'
       - '.github/workflows/excel_macro_test.yml'
   pull_request:
     branches: [main]
@@ -15,6 +16,7 @@ on:
       - 'tests/fixtures/excel/**'
       - 'scripts/build_excel_fixtures.py'
       - 'scripts/run_excel_fixtures.py'
+      - 'scripts/take-screenshot-on-failure.ps1'
       - '.github/workflows/excel_macro_test.yml'
 
 jobs:

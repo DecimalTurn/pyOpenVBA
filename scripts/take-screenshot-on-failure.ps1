@@ -16,8 +16,11 @@ param (
     [string]$OutputPath
 )
 
-Add-Type -AssemblyName System.Windows.Forms
-Add-Type -AssemblyName System.Drawing
+# Ensure output directory exists
+$outputDir = Split-Path -Parent $OutputPath
+if (!(Test-Path -Path $outputDir)) {
+    New-Item -ItemType Directory -Path $outputDir -Force | Out-Null
+}
 
 # Win32 API for window manipulation
 Add-Type @"
@@ -27,51 +30,51 @@ public class Win32 {
     [DllImport("user32.dll")]
     [return: MarshalAs(UnmanagedType.Bool)]
     public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
-    
-    [DllImport("user32.dll")]
-    [return: MarshalAs(UnmanagedType.Bool)]
-    public static extern bool IsWindowVisible(IntPtr hWnd);
 }
 "@
 
-# Minimize all PowerShell windows to see Excel clearly
+# Minimize all PowerShell windows
 Write-Host "Minimizing PowerShell windows..." -ForegroundColor Cyan
 $processes = Get-Process | Where-Object { $_.MainWindowHandle -ne 0 }
-$minimized = 0
 
 foreach ($proc in $processes) {
     if ($proc.ProcessName -like "*pwsh*" -or $proc.ProcessName -like "*powershell*") {
         try {
-            if ([Win32]::IsWindowVisible($proc.MainWindowHandle)) {
-                [Win32]::ShowWindow($proc.MainWindowHandle, 6) # SW_MINIMIZE = 6
-                $minimized++
-                Write-Host "Minimized: $($proc.ProcessName)" -ForegroundColor Green
-            }
+            [Win32]::ShowWindow($proc.MainWindowHandle, 6) # SW_MINIMIZE = 6
+            Write-Host "Minimized: $($proc.ProcessName)" -ForegroundColor Green
         }
         catch {
-            Write-Host "Could not minimize $($proc.ProcessName): $($_.Exception.Message)" -ForegroundColor Yellow
+            # Continue silently
         }
     }
 }
 
-Write-Host "Minimized $minimized window(s). Waiting 1 second..." -ForegroundColor Cyan
-Start-Sleep -Seconds 1
+Write-Host "Waiting 2 seconds for windows to minimize..." -ForegroundColor Cyan
+Start-Sleep -Seconds 2
 
-# Take screenshot
-$bounds = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
-$screenshot = New-Object System.Drawing.Bitmap($bounds.Width, $bounds.Height)
-$graphics = [System.Drawing.Graphics]::FromImage($screenshot)
-$graphics.CopyFromScreen($bounds.Location, [System.Drawing.Point]::Empty, $bounds.Size)
+# Create temp script for screenshot
+$tempScript = [System.IO.Path]::GetTempFileName() -replace '\.tmp$', '.ps1'
+$screenshotCode = @"
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
+`$bounds = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
+`$screenshot = New-Object System.Drawing.Bitmap(`$bounds.Width, `$bounds.Height)
+`$graphics = [System.Drawing.Graphics]::FromImage(`$screenshot)
+`$graphics.CopyFromScreen(`$bounds.Location, [System.Drawing.Point]::Empty, `$bounds.Size)
+`$screenshot.Save('$OutputPath')
+`$graphics.Dispose()
+`$screenshot.Dispose()
+"@
 
-# Ensure output directory exists
-$outputDir = Split-Path -Parent $OutputPath
-if (!(Test-Path -Path $outputDir)) {
-    New-Item -ItemType Directory -Path $outputDir -Force | Out-Null
-}
+$screenshotCode | Out-File -FilePath $tempScript -Encoding UTF8
 
-$screenshot.Save($OutputPath)
-$graphics.Dispose()
-$screenshot.Dispose()
+# Run screenshot in hidden PowerShell process
+Start-Process pwsh -ArgumentList "-NoProfile", "-Command", ". '$tempScript'" -WindowStyle Hidden -Wait
+
+# Clean up temp script
+Remove-Item -Path $tempScript -Force -ErrorAction SilentlyContinue
 
 Write-Host "Screenshot saved to: $OutputPath" -ForegroundColor Green
+
+
 
