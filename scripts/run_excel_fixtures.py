@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import sys
 import os
+import gc
 
 # Force UTF-8 output on Windows
 if sys.platform == "win32":
@@ -85,11 +86,16 @@ def _run_fixture(xlsm: Path) -> bool:
                 wb.Close(SaveChanges=False)
             except Exception:
                 pass
+            wb = None
         if xl is not None:
             try:
                 xl.Quit()
             except Exception:
                 pass
+            xl = None
+        # Force garbage collection and give Excel time to fully exit
+        gc.collect()
+        time.sleep(3)
 
 
 def main() -> None:
