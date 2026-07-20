@@ -44,9 +44,9 @@ def _run_fixture(xlsm: Path) -> bool:
     try:
         print(f"  [1] Dispatching Excel.Application...", flush=True)
         xl = win32com.client.Dispatch("Excel.Application")
-        print(f"  [1.1] Setting display alerts...", flush=True)
+        print(f"  [1.1] Setting display alerts and visibility...", flush=True)
         xl.DisplayAlerts = False
-        xl.Visible = False
+        xl.Visible = True  # Make visible for debugging screenshots
 
         print(f"  [2] Opening workbook at {xlsm.absolute()}...", flush=True)
         wb = xl.Workbooks.Open(str(xlsm.absolute()))
