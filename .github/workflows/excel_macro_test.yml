@@ -48,39 +48,7 @@ jobs:
       - name: Test module_only.xlsm
         shell: pwsh
         run: |
-          python -c "
-import sys, time
-from pathlib import Path
-xlsm = Path('tests/live_excel_testing/module_only.xlsm')
-if not xlsm.exists():
-    print(f'ERROR: {xlsm} not found')
-    sys.exit(1)
-import win32com.client
-xl = None
-try:
-    print(f'  Opening {xlsm.name}...', end=' ', flush=True)
-    xl = win32com.client.Dispatch('Excel.Application')
-    xl.DisplayAlerts = False
-    xl.Visible = False
-    wb = xl.Workbooks.Open(str(xlsm.absolute()))
-    time.sleep(0.5)
-    print('running macro...', end=' ', flush=True)
-    xl.Application.Run('Module1.RunFixture')
-    time.sleep(0.5)
-    wb.Close(SaveChanges=False)
-    print('closed.', end=' ', flush=True)
-    expected = xlsm.with_suffix('.txt')
-    time.sleep(0.5)
-    if not expected.exists():
-        print(f'FAIL')
-        sys.exit(1)
-    content = expected.read_text(encoding='utf-8').strip()
-    print(f'PASS -> {content!r}')
-finally:
-    if xl:
-        try: xl.Quit()
-        except: pass
-          "
+          python scripts/run_excel_fixtures.py tests/live_excel_testing/module_only.xlsm
 
   test-full:
     name: Build and test all fixtures

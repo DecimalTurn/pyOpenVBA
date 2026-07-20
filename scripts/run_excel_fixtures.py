@@ -93,9 +93,14 @@ def _run_fixture(xlsm: Path) -> bool:
 
 
 def main() -> None:
-    xlsm_files = sorted(BUILD_DIR.glob("*.xlsm"))
+    # Accept optional path argument for testing a single file
+    if len(sys.argv) > 1:
+        xlsm_files = [Path(sys.argv[1])]
+    else:
+        xlsm_files = sorted(BUILD_DIR.glob("*.xlsm"))
+    
     if not xlsm_files:
-        print(f"No .xlsm files found in {BUILD_DIR}")
+        print(f"No .xlsm files found")
         sys.exit(1)
 
     print(f"Running {len(xlsm_files)} fixture(s) from {BUILD_DIR}\n")
