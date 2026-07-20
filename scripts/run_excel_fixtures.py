@@ -28,6 +28,8 @@ def _run_fixture(xlsm: Path) -> bool:
     """Open *xlsm*, run Module1.RunFixture, verify the sentinel file. Return True on pass."""
     import win32com.client  # type: ignore[import]
     import time
+    import os
+    import traceback
 
     xl = None
     wb = None
@@ -40,15 +42,25 @@ def _run_fixture(xlsm: Path) -> bool:
         wb = xl.Workbooks.Open(str(xlsm.absolute()))
         time.sleep(0.5)  # Give Excel time to load
         print("running macro...", end=" ", flush=True)
-        xl.Application.Run("Module1.RunFixture")
+        try:
+            xl.Application.Run("Module1.RunFixture")
+        except Exception as macro_err:
+            print(f"FAIL (macro error: {macro_err})")
+            return False
         time.sleep(0.5)  # Give macro time to complete
         wb.Close(SaveChanges=False)
         wb = None
         print("closed.", end=" ", flush=True)
 
         expected = xlsm.with_suffix(".txt")
+        time.sleep(0.5)  # Extra wait for file I/O
+        
+        # Debug: list files in directory
+        dir_contents = list(xlsm.parent.glob("*"))
         if not expected.exists():
-            print(f"FAIL  output file not created: {expected.name}")
+            print(f"FAIL (output file not found)")
+            print(f"      Expected: {expected}")
+            print(f"      Dir contents: {[f.name for f in dir_contents]}")
             return False
 
         content = expected.read_text(encoding="utf-8").strip()
@@ -56,7 +68,9 @@ def _run_fixture(xlsm: Path) -> bool:
         return True
 
     except Exception as exc:
-        print(f"FAIL  {exc}")
+        print(f"FAIL  {type(exc).__name__}: {exc}")
+        if exc:
+            traceback.print_exc()
         return False
 
     finally:
