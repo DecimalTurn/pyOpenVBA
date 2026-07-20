@@ -55,16 +55,8 @@ jobs:
         if: failure()
         shell: pwsh
         run: |
-          Add-Type -AssemblyName System.Windows.Forms
-          $screenshot = New-Object System.Drawing.Bitmap([System.Windows.Forms.Screen]::PrimaryScreen.Bounds.Width, [System.Windows.Forms.Screen]::PrimaryScreen.Bounds.Height)
-          $graphics = [System.Drawing.Graphics]::FromImage($screenshot)
-          $graphics.CopyFromScreen([System.Windows.Forms.Screen]::PrimaryScreen.Bounds.Location, [System.Drawing.Point]::Empty, [System.Windows.Forms.Screen]::PrimaryScreen.Bounds.Size)
           $screenshotDir = "${{ github.workspace }}/screenshots"
-          New-Item -ItemType Directory -Path $screenshotDir -Force | Out-Null
-          $screenshot.Save("$screenshotDir/failure_screenshot.png")
-          $graphics.Dispose()
-          $screenshot.Dispose()
-          Write-Host "Screenshot saved to $screenshotDir/failure_screenshot.png"
+          & "${{ github.workspace }}/scripts/take-screenshot-on-failure.ps1" -OutputPath "$screenshotDir/failure_screenshot.png"
 
       - name: Upload failure screenshots
         if: failure()
