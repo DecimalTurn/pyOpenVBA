@@ -8,7 +8,6 @@ on:
       - 'tests/fixtures/excel/**'
       - 'scripts/build_excel_fixtures.py'
       - 'scripts/run_excel_fixtures.py'
-      - 'tests/live_excel_testing/module_only.xlsm'
       - '.github/workflows/excel_macro_test.yml'
   pull_request:
     branches: [main]
@@ -16,42 +15,11 @@ on:
       - 'tests/fixtures/excel/**'
       - 'scripts/build_excel_fixtures.py'
       - 'scripts/run_excel_fixtures.py'
-      - 'tests/live_excel_testing/module_only.xlsm'
       - '.github/workflows/excel_macro_test.yml'
 
 jobs:
-  test-fast:
-    name: Test pre-built fixture (fast)
-    runs-on: windows-latest
-    timeout-minutes: 5
-    env:
-      PYTHONPATH: src
-
-    steps:
-      - uses: actions/checkout@v7
-
-      - uses: actions/setup-python@v7
-        with:
-          python-version: "3.12"
-
-      - name: Setup VBA
-        uses: DecimalTurn/setup-vba@797e4a232699a98507cb4411d5bea3697427ad57 # v0.3.0
-        with:
-          office-apps: Excel
-
-      - name: Install pywin32
-        shell: pwsh
-        run: |
-          pip install pywin32
-          python -m Scripts.pywin32_postinstall -install
-
-      - name: Test module_only.xlsm
-        shell: pwsh
-        run: |
-          python scripts/run_excel_fixtures.py tests/live_excel_testing/module_only.xlsm
-
-  test-full:
-    name: Build and test all fixtures
+  test:
+    name: Build and test Excel fixtures
     runs-on: windows-latest
     timeout-minutes: 15
     env:
