@@ -59,6 +59,7 @@ jobs:
         run: |
           . "${{ github.workspace }}/scripts/utils/Screenshot.ps1"
           . "${{ github.workspace }}/scripts/utils/Minimize.ps1"
+          . "${{ github.workspace }}/scripts/utils/MinimizeCurrentWindow.ps1"
           
           $screenshotDir = "${{ github.workspace }}/screenshots"
           if (!(Test-Path -Path $screenshotDir)) {
@@ -66,6 +67,7 @@ jobs:
           }
           
           Minimize-Window "HostedComputeAgent"
+          Minimize-CurrentWindow
           Start-Sleep -Seconds 1
           Take-Screenshot -OutputPath "$screenshotDir/failure_screenshot.png"
 
@@ -88,6 +90,7 @@ jobs:
         run: |
           . "${{ github.workspace }}/scripts/utils/Minimize.ps1"
           . "${{ github.workspace }}/scripts/utils/Screenshot.ps1"
+          . "${{ github.workspace }}/scripts/utils/MinimizeCurrentWindow.ps1"
           
           Write-Host "=== BEFORE MINIMIZATION ===" -ForegroundColor Cyan
           $processes = Get-Process | Where-Object { $_.MainWindowHandle -ne 0 }
@@ -97,6 +100,7 @@ jobs:
           Minimize-Window "cmd"
           Minimize-Window "Administrator"
           Minimize-Window "HostedComputeAgent"
+          Minimize-CurrentWindow
           
           Start-Sleep -Seconds 2
           
