@@ -8,7 +8,7 @@ on:
       - 'tests/fixtures/excel/**'
       - 'scripts/build_excel_fixtures.py'
       - 'scripts/run_excel_fixtures.py'
-      - 'scripts/take-screenshot-on-failure.ps1'
+      - 'scripts/utils/**'
       - '.github/workflows/excel_macro_test.yml'
   pull_request:
     branches: [main]
@@ -16,7 +16,7 @@ on:
       - 'tests/fixtures/excel/**'
       - 'scripts/build_excel_fixtures.py'
       - 'scripts/run_excel_fixtures.py'
-      - 'scripts/take-screenshot-on-failure.ps1'
+      - 'scripts/utils/**'
       - '.github/workflows/excel_macro_test.yml'
 
 jobs:
@@ -57,8 +57,17 @@ jobs:
         if: failure()
         shell: pwsh
         run: |
+          . "${{ github.workspace }}/scripts/utils/Screenshot.ps1"
+          . "${{ github.workspace }}/scripts/utils/Minimize.ps1"
+          
           $screenshotDir = "${{ github.workspace }}/screenshots"
-          & "${{ github.workspace }}/scripts/take-screenshot-on-failure.ps1" -OutputPath "$screenshotDir/failure_screenshot.png"
+          if (!(Test-Path -Path $screenshotDir)) {
+            New-Item -ItemType Directory -Path $screenshotDir -Force | Out-Null
+          }
+          
+          Minimize-Window "Administrator"
+          Start-Sleep -Seconds 1
+          Take-Screenshot -OutputPath "$screenshotDir/failure_screenshot.png"
 
       - name: Upload failure screenshots
         if: failure()
@@ -67,3 +76,43 @@ jobs:
           name: failure-screenshots
           path: ./screenshots/
           if-no-files-found: warn
+
+  test-window-minimization:
+    name: Test window minimization on Windows
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: List all windows and minimize test
+        shell: pwsh
+        run: |
+          . "${{ github.workspace }}/scripts/utils/Minimize.ps1"
+          . "${{ github.workspace }}/scripts/utils/Screenshot.ps1"
+          
+          Write-Host "=== BEFORE MINIMIZATION ===" -ForegroundColor Cyan
+          $processes = Get-Process | Where-Object { $_.MainWindowHandle -ne 0 }
+          $processes | ForEach-Object { Write-Host "  - $($_.ProcessName): $($_.MainWindowTitle)" }
+          
+          Write-Host "`n=== ATTEMPTING MINIMIZATION ===" -ForegroundColor Cyan
+          Minimize-Window "Administrator"
+          
+          Start-Sleep -Seconds 2
+          
+          $screenshotDir = "${{ github.workspace }}/screenshots"
+          New-Item -ItemType Directory -Path $screenshotDir -Force | Out-Null
+          
+          Write-Host "`n=== TAKING SCREENSHOT ===" -ForegroundColor Cyan
+          Take-Screenshot -OutputPath "$screenshotDir/minimize_test_screenshot.png"
+          
+          Write-Host "`n=== AFTER SCREENSHOT ===" -ForegroundColor Cyan
+          $processes = Get-Process | Where-Object { $_.MainWindowHandle -ne 0 }
+          $processes | ForEach-Object { Write-Host "  - $($_.ProcessName): $($_.MainWindowTitle)" }
+
+      - name: Upload minimization test screenshot
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: minimization-test-screenshot
+          path: ./screenshots/
+          if-no-files-found: warn
+
