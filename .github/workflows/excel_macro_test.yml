@@ -21,6 +21,8 @@ jobs:
   test:
     runs-on: windows-latest
     timeout-minutes: 8
+    env:
+      PYTHONPATH: src
 
     steps:
       - uses: actions/checkout@v7
@@ -29,9 +31,6 @@ jobs:
         with:
           python-version: "3.12"
           cache: pip
-
-      - name: Install pyOpenVBA
-        run: pip install -e .
 
       - name: Build Excel fixtures
         run: python scripts/build_excel_fixtures.py

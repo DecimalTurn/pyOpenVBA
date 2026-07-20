@@ -18,14 +18,11 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-REPO = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(REPO / "src"))
-
 from pyopenvba import ExcelFile  # noqa: E402
 from pyopenvba.vba import VBAModuleKind  # noqa: E402
 
-FIXTURES_DIR = REPO / "tests" / "fixtures" / "excel"
-BUILD_DIR = REPO / "build" / "fixtures" / "excel"
+FIXTURES_DIR = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "excel"
+BUILD_DIR = Path(__file__).resolve().parents[1] / "build" / "fixtures" / "excel"
 
 # Modules that exist by default in a new workbook (no add_module needed).
 _DEFAULT_MODULES = {"ThisWorkbook", "Sheet1", "Module1"}
@@ -67,7 +64,7 @@ def main() -> None:
         output = _build_fixture(fixture_dir)
         with ExcelFile(output) as wb:
             modules = wb.module_names()
-        print(f"Built: {output.relative_to(REPO)}  modules={modules}")
+        print(f"Built: {output.relative_to(BUILD_DIR.parents[2])}  modules={modules}")
 
 
 if __name__ == "__main__":
