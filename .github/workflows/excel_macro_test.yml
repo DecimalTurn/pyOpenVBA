@@ -65,7 +65,7 @@ jobs:
             New-Item -ItemType Directory -Path $screenshotDir -Force | Out-Null
           }
           
-          Minimize-Window "Administrator"
+          Minimize-Window "cmd"
           Start-Sleep -Seconds 1
           Take-Screenshot -OutputPath "$screenshotDir/failure_screenshot.png"
 
@@ -94,6 +94,7 @@ jobs:
           $processes | ForEach-Object { Write-Host "  - $($_.ProcessName): $($_.MainWindowTitle)" }
           
           Write-Host "`n=== ATTEMPTING MINIMIZATION ===" -ForegroundColor Cyan
+          Minimize-Window "cmd"
           Minimize-Window "Administrator"
           
           Start-Sleep -Seconds 2
