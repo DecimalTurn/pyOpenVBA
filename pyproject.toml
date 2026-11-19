@@ -4,8 +4,8 @@ build-backend = "hatchling.build"
 
 [project]
 name = "pyOpenVBA"
-version = "3.1.0"
-description = "Read and write VBA macros inside Excel, Word, and PowerPoint files in pure Python, no dependencies."
+version = "6.6.0"
+description = "Read and write VBA macros and Excel Power Query in pure Python, no dependencies."
 readme = "README.md"
 license = { text = "MIT" }
 requires-python = ">=3.10"
@@ -14,9 +14,16 @@ authors = [
 ]
 keywords = [
     "vba",
+    "power-query",
+    "powerquery",
+    "m-language",
+    "datamashup",
     "excel",
     "word",
     "powerpoint",
+    "access",
+    "accdb",
+    "mdb",
     "xlsm",
     "xlsb",
     "xls",
@@ -54,6 +61,10 @@ dev = [
     "pyright>=1.1.350",
     "build>=1.2",
     "twine>=5",
+    # Test-time only, and the runtime keeps its promise of no dependencies.
+    # openpyxl writes the same parts a different legal way, which is what
+    # the interop tests are for.
+    "openpyxl>=3.1",
 ]
 
 [project.urls]
@@ -75,7 +86,12 @@ include = [
     "LICENSE.md",
     "pyproject.toml",
     "docs/architecture.md",
+    "docs/power_query.md",
     "docs/roadmap.md",
+    "docs/host_completeness.md",
+    "docs/in_memory_engine/excel_api_coverage.md",
+    "docs/excel_checklist.csv",
+    "docs/vba_runtime.md",
     "docs/ms-ovba-implementation-guide_v2.md",
 ]
 
@@ -84,6 +100,8 @@ testpaths = ["tests"]
 
 [tool.pyright]
 include = ["src", "tests"]
+# A fixture folder keeps the script that measured it byte for byte, as the record of how it was made.
+exclude = ["tests/fixtures", "**/__pycache__", "**/.*"]
 pythonVersion = "3.10"
 typeCheckingMode = "strict"
 

@@ -1,0 +1,1808 @@
+"""Windows: Application.ActiveWindow, Windows and Goto, and the view of each sheet a file keeps.
+
+Measured in live Excel with its window shown and sized 700 by 500 points
+(scripts/measure_windows.py, tests/fixtures/windows/). Hidden, Excel lays
+out no panes, and a freeze it saves there has no split in it.
+
+* Each sheet has its own view, which the window shows while the sheet is
+  active: zoom, gridlines, headings, zeros and formulas, the view it is
+  in, where it is scrolled to, its panes and each pane's selection. Each
+  view keeps its own zoom: the page break preview opens at 60, the normal
+  view's zoom is kept apart once another view is chosen, and 85.6 is 85.
+* FreezePanes freezes the rows above and the columns left of the active
+  cell, which has to be in view. SplitRow and SplitColumn count them;
+  ScrollRow and ScrollColumn scroll the pane under or right of them, never
+  above or left of it, and scroll the whole window along a way nothing is
+  frozen. SplitVertical and SplitHorizontal are the frozen rows' and
+  columns' pixels at the zoom, each rounded to a whole pixel, in points.
+* The macro recorder's Freeze Top Row sets SplitColumn and SplitRow, then
+  FreezePanes: a split frozen in place, which the file keeps as
+  frozenSplit. A split that is not frozen is kept in twips of the rows,
+  columns and headings it runs past, which depend on the window: the
+  model answers for one and does not save one.
+* Select sets the active pane's selection. Activate moves the active cell
+  when the range's first cell is in the selection, else selects the
+  range; on a sheet that is not the active one, both are error 1004. Goto
+  activates the range's sheet and selects the range, and with Scroll
+  puts its first cell at the top left of the window, or of the pane that
+  scrolls.
+* Windows lists the windows front to back. A workbook added or opened
+  comes to the front; activating one brings it forward only while the
+  screen updates, and closing the active workbook activates the window
+  behind it.
+* DisplayWorkbookTabs, TabRatio and the scroll bars belong to the
+  workbook, and its workbookView keeps them with the active tab.
+"""
+
+from __future__ import annotations
+
+import re
+from collections.abc import Generator, Iterator, Sequence
+from contextlib import contextmanager
+from dataclasses import dataclass, field, replace
+from typing import TYPE_CHECKING, Any, Final, cast
+
+from pyopenvba._a1 import MAX_COLUMNS, MAX_ROWS, Area, column_letter, parse_area
+from pyopenvba._xml import attributes, tag_attributes
+from pyopenvba.apps.excel import _dimensions, _events
+from pyopenvba.apps.excel._creator import ItemDefault
+from pyopenvba.apps.excel._model import ExcelObject, Range, Worksheet
+from pyopenvba.apps.excel._styles import XL_AUTOMATIC
+from pyopenvba.apps.excel._window_states import SheetState, WindowPlace, bring_in, fresh_sheet, fresh_view, sheet_state
+from pyopenvba.exceptions import VBARuntimeError, VBAUnsupportedError
+from pyopenvba.formula._r1c1 import to_a1
+from pyopenvba.interpreter._objects import VBACollection, member, method, setter
+from pyopenvba.interpreter._values import (
+    EMPTY,
+    ERR_SUBSCRIPT_OUT_OF_RANGE,
+    MISSING,
+    NULL,
+    VBAInt,
+    error,
+    to_bool,
+    to_integer,
+    to_number,
+    to_text,
+)
+
+if TYPE_CHECKING:
+    from pyopenvba.apps.excel._model import Application, Workbook, Worksheet
+
+#: XlWindowView by number, as a sheetView names it.
+VIEWS: Final = {1: "normal", 2: "pageBreakPreview", 3: "pageLayout"}
+#: What each view opens at until a zoom is chosen in it.
+_OPENING_ZOOM: Final = {1: 100, 2: 60, 3: 100}
+_FROZEN: Final = ("frozen", "frozenSplit")
+#: The attributes of a sheetView and of a workbookView in the order the schema gives them.
+_SHEET_VIEW_ORDER: Final = (
+    "windowProtection", "showFormulas", "showGridLines", "showRowColHeaders", "showZeros", "rightToLeft",
+    "tabSelected", "showRuler", "showOutlineSymbols", "defaultGridColor", "showWhiteSpace", "view", "topLeftCell",
+    "colorId", "zoomScale", "zoomScaleNormal", "zoomScaleSheetLayoutView", "zoomScalePageLayoutView",
+    "workbookViewId",
+)
+_BOOK_VIEW_ORDER: Final = (
+    "visibility", "minimized", "showHorizontalScroll", "showVerticalScroll", "showSheetTabs", "xWindow", "yWindow",
+    "windowWidth", "windowHeight", "tabRatio", "firstSheet", "activeTab", "autoFilterDateGrouping", "xr2:uid",
+)
+_SHEET_VIEW = re.compile(r"<sheetView\b[^>]*?(?:/>|>.*?</sheetView>)", re.DOTALL)
+_PANE = re.compile(r"<pane\b[^>]*/>")
+_SELECTION = re.compile(r"<selection\b[^>]*/>")
+#: What a sheetView holds besides its pane and selections, which the model keeps as it was.
+_KEPT = re.compile(r"<pivotSelection\b[^>]*?(?:/>|>.*?</pivotSelection>)|<extLst\b.*?</extLst>", re.DOTALL)
+_WORKBOOK_VIEW = re.compile(r"<workbookView\b[^>]*?/?>")
+_OTHER_VIEW = re.compile(r'<sheetView\b[^>]*\bworkbookViewId="[1-9]\d*"[^>]*?(?:/>|(?<!/)>.*?</sheetView>)', re.DOTALL)
+#: How far along a new window lies from the one before it, in twips, as measured.
+_NEW_WINDOW_STEP = 345
+
+
+@dataclass
+class SheetViewState:
+    """A sheet's view in its workbook's window, as the sheet's first sheetView keeps it."""
+
+    view: int = 1
+    data_type_icons: bool = True
+    #: zoomScale, the zoom of the view the sheet is in.
+    zoom: int = 100
+    #: The normal view's zoom, the page break preview's and the page layout view's once each is kept apart; 0 before.
+    zoom_normal: int = 0
+    zoom_break: int = 0
+    zoom_layout: int = 0
+    gridlines: bool = True
+    headings: bool = True
+    zeros: bool = True
+    formulas: bool = False
+    #: rightToLeft, Worksheet.DisplayRightToLeft and the window's (tests/fixtures/worksheet_settings.json).
+    right_to_left: bool = False
+    #: showOutlineSymbols, showRuler and showWhiteSpace: DisplayOutline, DisplayRuler and DisplayWhitespace.
+    outline: bool = True
+    ruler: bool = True
+    whitespace: bool = True
+    #: The gridlines' palette slot, GridlineColorIndex, 0 while they are automatic; the file keeps it as colorId,
+    #: seven past it, with defaultGridColor="0".
+    grid_color: int = 0
+    top_left: tuple[int, int] = (1, 1)
+    #: The pane's state: "" with no panes, "split", "frozen" or "frozenSplit".
+    state: str = ""
+    #: The rows and columns above and left of the split.
+    rows: int = 0
+    columns: int = 0
+    #: The first cell the pane under and right of the split shows.
+    pane_top_left: tuple[int, int] = (1, 1)
+    active_pane: str = "topLeft"
+    #: Each pane's selection, active cell and sqref, in the order the file lists them; the active pane's is the
+    #: sheet's own selection.
+    selections: dict[str, tuple[str, str]] = field(default_factory=lambda: {})
+    #: A pane the model does not lay out, kept as the file had it: a split in twips, or panes frozen with nothing
+    #: split, which a hidden Excel saves.
+    split_xml: str = ""
+    #: Whether the file has the sheet's tab selected, as each sheet of a group is.
+    tab_selected: bool = False
+    changed: bool = False
+
+
+@dataclass
+class BookViewState:
+    """The workbook's window, as its workbookView keeps it."""
+
+    tabs: bool = True
+    #: The first tab showing, which goes with the tabs when a sheet before it is deleted.
+    first_sheet: int = 0
+    tab_ratio: float = 0.6
+    horizontal_scroll: bool = True
+    vertical_scroll: bool = True
+    #: AutoFilterDateGrouping, the workbook's, which its workbookView keeps.
+    date_grouping: bool = True
+    #: What Caption was set to; the workbook's name until it is.
+    caption: str | None = None
+    #: The procedure Window.OnWindow names, which nothing here runs: no user activates a window.
+    on_window: str = ""
+    #: WindowState, Left, Top, Width and Height once a macro sets them; before, they are the screen's.
+    state: int | None = None
+    left: float | None = None
+    top: float | None = None
+    width: float | None = None
+    height: float | None = None
+    #: The sheet whose tab the file has selected, so a save moves that only when another sheet is active.
+    saved_active: Worksheet | None = None
+    #: The active tab's place in the file, which moving or deleting a tab changes though the same sheet stays active, and
+    #: the file's firstSheet, which Excel will not open past the last tab (tests/fixtures/active_tab/active_tab.json).
+    saved_tab: int = 0
+    saved_first: int = 0
+    #: The sheets the file has selected, so a save rewrites their tabs only when another group is.
+    saved_selected: list[Worksheet] = field(default_factory=lambda: [])
+    changed: bool = False
+    #: The workbook's windows, front to back (see _window_states).
+    windows: list[Window] = field(default_factory=lambda: [])
+    #: The one whose state the workbook and its sheets hold, the one in front but while another is asked for something.
+    live: WindowPlace | None = None
+    #: Whether windows were made or closed since the file was read or saved.
+    windows_changed: bool = False
+    #: The views a file holds for the windows behind, by window (from 0) and sheet.
+    extra_views: dict[tuple[int, int], SheetState] = field(default_factory=lambda: {})
+
+
+# --- the file ------------------------------------------------------------------------------------
+
+
+def read_view(sheet: Worksheet, xml: str) -> None:
+    """A sheet's view and its selection, from the first sheetView of its part; those of other windows are kept for them."""
+    found = _SHEET_VIEW.search(xml)
+    if found is None:
+        return
+    if not xml.startswith("<sheetView"):
+        _read_other_views(sheet, xml)
+    element = found.group(0)
+    head = tag_attributes(element)
+    view = sheet.view
+    view.view = next((number for number, name in VIEWS.items() if name == head.get("view", "normal")), 1)
+    view.zoom = _number(head.get("zoomScale"), 100)
+    view.zoom_normal = _number(head.get("zoomScaleNormal"), 0)
+    view.zoom_break = _number(head.get("zoomScaleSheetLayoutView"), 0)
+    view.zoom_layout = _number(head.get("zoomScalePageLayoutView"), 0)
+    view.formulas = _flag(head.get("showFormulas"), False)
+    view.gridlines = _flag(head.get("showGridLines"), True)
+    view.headings = _flag(head.get("showRowColHeaders"), True)
+    view.zeros = _flag(head.get("showZeros"), True)
+    view.right_to_left = _flag(head.get("rightToLeft"), False)
+    view.outline = _flag(head.get("showOutlineSymbols"), True)
+    view.ruler = _flag(head.get("showRuler"), True)
+    view.whitespace = _flag(head.get("showWhiteSpace"), True)
+    color = _number(head.get("colorId"), 64)
+    view.grid_color = color - 7 if not _flag(head.get("defaultGridColor"), True) and 8 <= color < 64 else 0
+    view.tab_selected = _flag(head.get("tabSelected"), False)
+    view.top_left = _cell(head.get("topLeftCell", "")) or (1, 1)
+    pane = _PANE.search(element)
+    if pane is not None:
+        split = attributes(pane.group(0))
+        view.state = split.get("state", "split")
+        view.active_pane = split.get("activePane", "topLeft")
+        rows, columns = int(float(split.get("ySplit", "0") or 0)), int(float(split.get("xSplit", "0") or 0))
+        if view.state in _FROZEN and (rows or columns):
+            view.rows, view.columns = rows, columns
+            corner = _cell(split.get("topLeftCell", ""))
+            view.pane_top_left = corner or (view.top_left[0] + rows, view.top_left[1] + columns)
+        else:
+            # A split kept in twips, or panes frozen with nothing split, as a hidden Excel saves them.
+            view.split_xml = pane.group(0)
+    view.selections = {}
+    for selection in _SELECTION.findall(element):
+        chosen = attributes(selection)
+        view.selections[chosen.get("pane", "topLeft")] = (chosen.get("activeCell") or "A1",
+                                                          chosen.get("sqref") or "A1")
+    cell, sqref = view.selections.get(view.active_pane, ("A1", "A1"))
+    if (cell, sqref) != ("A1", "A1"):
+        try:
+            sheet.selection_range = Range(sheet, [parse_area(part, sheet=sheet.name) for part in sqref.split()])
+            sheet.active_cell_range = Range(sheet, [parse_area(cell, sheet=sheet.name)])
+        except ValueError:
+            sheet.selection_range = sheet.active_cell_range = None
+
+
+def _read_other_views(sheet: Worksheet, xml: str) -> None:
+    for found in _SHEET_VIEW.finditer(xml):
+        number = _number(tag_attributes(found.group(0)).get("workbookViewId"), 0)
+        if number:
+            held = sheet.view, sheet.selection_range, sheet.active_cell_range
+            sheet.view, sheet.selection_range, sheet.active_cell_range = fresh_sheet()
+            read_view(sheet, found.group(0))
+            sheet.book.view.extra_views[(number, id(sheet))] = (sheet.view, sheet.selection_range, sheet.active_cell_range)
+            sheet.view, sheet.selection_range, sheet.active_cell_range = held
+
+
+def _number(text: str | None, default: int) -> int:
+    try:
+        return int(text) if text else default
+    except ValueError:
+        return default
+
+
+#: What Window.Caption holds before error 1004 (tests/fixtures/member_audit.json).
+CAPTION_LIMIT = 200
+
+
+def _flag(text: str | None, default: bool) -> bool:
+    return default if text is None else text in ("1", "true")
+
+
+def _cell(text: str) -> tuple[int, int] | None:
+    try:
+        area = parse_area(text)
+    except ValueError:
+        return None
+    return area.top, area.left
+
+
+def _spelled_cell(row: int, column: int) -> str:
+    return f"{column_letter(column)}{row}"
+
+
+def _selected(row: int, column: int) -> tuple[str, str]:
+    """A pane's selection of one cell, as its active cell and its sqref."""
+    cell = _spelled_cell(row, column)
+    return cell, cell
+
+
+def _spelled(area: Area) -> str:
+    """An area as a selection's sqref spells it: whole rows and columns in full, C1:C1048576."""
+    first = _spelled_cell(area.top, area.left)
+    bottom, right = min(area.bottom, MAX_ROWS), min(area.right, MAX_COLUMNS)
+    return first if (area.top, area.left) == (bottom, right) else f"{first}:{_spelled_cell(bottom, right)}"
+
+
+def _active_place(book: Workbook) -> int:
+    """The active tab's place among the tabs, chart sheets counted."""
+    current = book.active_chart_sheet or book.active_sheet
+    return book.tabs().index(current) if current is not None else 0
+
+
+def _first_place(book: Workbook) -> int:
+    """The first tab the bar shows: not past the active one, and not a hidden one, which it passes over."""
+    first = min(book.view.first_sheet, _active_place(book))
+    tabs = book.tabs()
+    while first < len(tabs) - 1 and tabs[first].visible != -1:
+        first += 1
+    return first
+
+
+def tabs_moved(book: Workbook) -> bool:
+    """Whether another sheet is active than the one whose tab the file has selected, or other sheets selected."""
+    selected = book.selected()
+    saved = book.view.saved_selected
+    return (book.active_sheet is not book.view.saved_active or len(selected) != len(saved)
+            or _active_place(book) != book.view.saved_tab or _first_place(book) != book.view.saved_first
+            or any(one is not other for one, other in zip(selected, saved)))
+
+
+def with_view(sheet: Worksheet, xml: str, *, tabs: bool) -> str:
+    """A worksheet part with a sheetView for each of the workbook's windows, as the model has them."""
+    windows = sheet.book.view.windows
+    if len(windows) < 2 and not sheet.book.view.windows_changed:
+        return _with_first_view(sheet, xml, tabs=tabs)
+    by_number = sorted(windows, key=lambda one: one.place.number)
+    with _showing(sheet, by_number[0]):
+        xml = _with_first_view(sheet, xml, tabs=tabs)
+    changed = sheet.book.view.windows_changed or any(sheet_state(sheet.book, one.place, sheet)[0].changed for one in by_number[1:])
+    if not changed:
+        return xml
+    xml = _OTHER_VIEW.sub("", xml)
+    active = any(one is sheet for one in sheet.book.selected())
+    others = ""
+    for number, window in enumerate(by_number[1:], 1):
+        with _showing(sheet, window):
+            others += _rewritten(sheet, f'<sheetView workbookViewId="{number}"/>', active)
+    return xml.replace("</sheetViews>", others + "</sheetViews>", 1)
+
+
+@contextmanager
+def _showing(sheet: Worksheet, window: Window) -> Generator[None]:
+    """The sheet with its view and selection in that window."""
+    held = sheet.view, sheet.selection_range, sheet.active_cell_range
+    sheet.view, sheet.selection_range, sheet.active_cell_range = sheet_state(sheet.book, window.place, sheet)
+    try:
+        yield
+    finally:
+        sheet.view, sheet.selection_range, sheet.active_cell_range = held
+
+
+def _with_first_view(sheet: Worksheet, xml: str, *, tabs: bool) -> str:
+    """A worksheet part with its first sheetView as the model has the view: all of it when the view changed, else
+    only its tab's selection when ``tabs`` says the active sheet moved."""
+    view = sheet.view
+    if not (view.changed or tabs):
+        return xml
+    # Every sheet of a group has its tab selected, the active one among them.
+    active = any(one is sheet for one in sheet.book.selected())
+    found = _SHEET_VIEW.search(xml)
+    if found is None:
+        at = re.search(r"<sheetFormatPr\b|<cols\b|<sheetData\b", xml)
+        if not view.changed or at is None:
+            return xml
+        markup = "<sheetViews>" + _rewritten(sheet, '<sheetView workbookViewId="0"/>', active) + "</sheetViews>"
+        return xml[:at.start()] + markup + xml[at.start():]
+    element = found.group(0)
+    if view.changed:
+        replacement = _rewritten(sheet, element, active)
+    else:
+        opening, inside = _opening(element)
+        replacement = _closed(with_attribute(opening, "tabSelected", "1" if active else "", _SHEET_VIEW_ORDER),
+                              inside, "sheetView")
+    return xml[:found.start()] + replacement + xml[found.end():]
+
+
+def _opening(element: str) -> tuple[str, str]:
+    """An element's opening tag without its closing mark, and what it holds."""
+    end = element.index(">")
+    if element[end - 1] == "/":
+        return element[:end - 1].rstrip(), ""
+    return element[:end], element[end + 1:element.rindex("</")]
+
+
+def _closed(opening: str, inside: str, tag: str) -> str:
+    return f"{opening}>{inside}</{tag}>" if inside else f"{opening}/>"
+
+
+def with_attribute(opening: str, name: str, value: str, order: tuple[str, ...]) -> str:
+    """An opening tag with one attribute set, in the place the schema gives it, or taken out when ``value`` is ""."""
+    opening = re.sub(rf'\s{re.escape(name)}="[^"]*"', "", opening)
+    if not value:
+        return opening
+    later = set(order[order.index(name) + 1:])
+    for found in re.finditer(r'\s([\w:]+)="', opening):
+        if found.group(1) in later:
+            return f'{opening[:found.start()]} {name}="{value}"{opening[found.start():]}'
+    return f'{opening} {name}="{value}"'
+
+
+def _rewritten(sheet: Worksheet, element: str, active: bool) -> str:
+    """A sheetView as the model has the view, keeping the attributes and children it does not model."""
+    view = sheet.view
+    opening, inside = _opening(element)
+    zooms = (("zoomScale", "" if view.zoom == 100 else str(view.zoom)),
+             ("zoomScaleNormal", str(view.zoom_normal) if view.zoom_normal else ""),
+             ("zoomScaleSheetLayoutView", str(view.zoom_break) if view.zoom_break else ""),
+             ("zoomScalePageLayoutView", str(view.zoom_layout) if view.zoom_layout else ""))
+    for name, value in (("showFormulas", "1" if view.formulas else ""),
+                        ("showGridLines", "" if view.gridlines else "0"),
+                        ("showRowColHeaders", "" if view.headings else "0"),
+                        ("showZeros", "" if view.zeros else "0"),
+                        ("rightToLeft", "1" if view.right_to_left else ""),
+                        ("tabSelected", "1" if active else ""),
+                        ("showRuler", "" if view.ruler else "0"),
+                        ("showOutlineSymbols", "" if view.outline else "0"),
+                        ("defaultGridColor", "0" if view.grid_color else ""),
+                        ("showWhiteSpace", "" if view.whitespace else "0"),
+                        ("view", "" if view.view == 1 else VIEWS[view.view]),
+                        ("topLeftCell", "" if view.top_left == (1, 1) else _spelled_cell(*view.top_left)),
+                        ("colorId", str(view.grid_color + 7) if view.grid_color else ""),
+                        *zooms):
+        opening = with_attribute(opening, name, value, _SHEET_VIEW_ORDER)
+    kept = "".join(found.group(0) for found in _KEPT.finditer(inside))
+    return _closed(opening, _pane_xml(view) + _selections_xml(sheet) + kept, "sheetView")
+
+
+def _pane_xml(view: SheetViewState) -> str:
+    if view.split_xml or not view.state:
+        return view.split_xml
+    if view.state == "split":
+        raise VBAUnsupportedError("saving a window split without being frozen is not implemented: Excel keeps the "
+                                  "split in twips of the rows, columns and headings the window shows")
+    split = (f'xSplit="{view.columns}" ' if view.columns else "") + (f'ySplit="{view.rows}" ' if view.rows else "")
+    return (f'<pane {split}topLeftCell="{_spelled_cell(*view.pane_top_left)}" activePane="{view.active_pane}" '
+            f'state="{view.state}"/>')
+
+
+def _selections_xml(sheet: Worksheet) -> str:
+    """Each pane's selection, the active pane's the sheet's own; an attribute at its default, A1, is left out."""
+    view = sheet.view
+    chosen = dict(view.selections)
+    chosen.setdefault(view.active_pane, ("A1", "A1"))
+    out: list[str] = []
+    for pane, (cell, sqref) in chosen.items():
+        if pane == view.active_pane:
+            cell, sqref = _sheet_selection(sheet)
+        parts = [] if pane == "topLeft" else [f'pane="{pane}"']
+        parts += [f'activeCell="{cell}"'] if cell != "A1" else []
+        parts += [f'sqref="{sqref}"'] if sqref != "A1" else []
+        if parts:
+            out.append(f"<selection {' '.join(parts)}/>")
+    return "".join(out)
+
+
+def _sheet_selection(sheet: Worksheet) -> tuple[str, str]:
+    active = sheet.active_cell_range
+    selection = sheet.selection_range
+    cell = _spelled_cell(active.first.top, active.first.left) if active is not None else "A1"
+    return cell, " ".join(_spelled(area) for area in selection.areas) if selection is not None else "A1"
+
+
+def read_book_view(book: Workbook, xml: str) -> None:
+    """The workbook's window from its first workbookView, and the sheet its active tab makes active."""
+    found = _WORKBOOK_VIEW.search(xml)
+    if found is not None:
+        head = attributes(found.group(0))
+        view = book.view
+        view.tabs = _flag(head.get("showSheetTabs"), True)
+        view.first_sheet = _number(head.get("firstSheet"), 0)
+        view.horizontal_scroll = _flag(head.get("showHorizontalScroll"), True)
+        view.vertical_scroll = _flag(head.get("showVerticalScroll"), True)
+        view.tab_ratio = _number(head.get("tabRatio"), 600) / 1000
+        view.date_grouping = _flag(head.get("autoFilterDateGrouping"), True)
+        if book.sheets_:
+            tabs = book.tabs()
+            tab = tabs[min(_number(head.get("activeTab"), 0), len(tabs) - 1)]
+            if isinstance(tab, Worksheet):
+                book.active_sheet_index = book.sheets_.index(tab)
+            else:
+                book.active_chart_sheet = tab
+    _read_other_windows(book, xml)
+    # A group the file keeps selected, its active tab among them, stays selected.
+    book.selected_sheets = [sheet for sheet in book.sheets_ if sheet.view.tab_selected]
+    book.view.saved_active = book.active_sheet
+    book.view.saved_selected = book.selected()
+    # Excel opens a file whose first tab is past its active one with the first brought back to it.
+    book.view.saved_first, book.view.first_sheet = book.view.first_sheet, min(book.view.first_sheet, _active_place(book))
+    book.view.saved_tab = _active_place(book)
+
+
+def _read_other_windows(book: Workbook, xml: str) -> None:
+    """A window for each further workbookView, behind the first and numbered in file order."""
+    tags = _WORKBOOK_VIEW.findall(xml)
+    if len(tags) < 2:
+        return
+    window_of(book)
+    for number, tag in enumerate(tags[1:], 2):
+        head = attributes(tag)
+        kept = fresh_view(book)
+        kept.book.update(tabs=_flag(head.get("showSheetTabs"), True), horizontal_scroll=_flag(head.get("showHorizontalScroll"), True),
+                         vertical_scroll=_flag(head.get("showVerticalScroll"), True), tab_ratio=_number(head.get("tabRatio"), 600) / 1000)
+        book.view.windows.append(Window(book, WindowPlace(number, number, kept)))
+    book.view.windows[0].place.suffix = 1
+
+
+def _window_view(book: Workbook, window: Window) -> BookViewState:
+    """The workbook's view with that window's settings."""
+    kept = window.place.kept
+    return book.view if kept is None else replace(book.view, **cast("dict[str, Any]", kept.book))
+
+
+def with_book_view(book: Workbook, xml: str) -> str:
+    """A workbook part with a workbookView for each window: the model's tabs, scroll bars, tab ratio and active and first tabs."""
+    found = _WORKBOOK_VIEW.search(xml)
+    if found is None:
+        return xml
+    windows = sorted(book.view.windows, key=lambda one: one.place.number)
+    tag = found.group(0)
+    first = _book_view_tag(book, tag, _window_view(book, windows[0]) if windows else book.view)
+    rest = xml[found.end():]
+    if book.view.windows_changed:
+        rest = _WORKBOOK_VIEW.sub("", rest)
+        for number, window in enumerate(windows[1:], 1):
+            placed = re.sub(r"\s*\bxr2:uid=\"[^\"]*\"", "", first)
+            for name in ("xWindow", "yWindow"):
+                placed = re.sub(rf'\b{name}="(-?\d+)"', lambda one: f'{name}="{int(one.group(1)) + number * _NEW_WINDOW_STEP}"', placed)  # noqa: B023
+            first_of_it = _book_view_tag(book, placed, _window_view(book, window))
+            first += first_of_it
+    return xml[:found.start()] + first + rest
+
+
+def _book_view_tag(book: Workbook, tag: str, view: BookViewState) -> str:
+    closing = "/>" if tag.endswith("/>") else ">"
+    opening = tag[:-len(closing)].rstrip()
+    ratio = round(view.tab_ratio * 1000)
+    active = _active_place(book)
+    for name, value in (("showHorizontalScroll", "" if view.horizontal_scroll else "0"),
+                        ("showVerticalScroll", "" if view.vertical_scroll else "0"),
+                        ("showSheetTabs", "" if view.tabs else "0"),
+                        ("tabRatio", "" if ratio == 600 else str(ratio)),
+                        ("firstSheet", str(_first_place(book)) if _first_place(book) else ""),
+                        ("activeTab", str(active) if active else ""),
+                        ("autoFilterDateGrouping", "" if view.date_grouping else "0")):
+        opening = with_attribute(opening, name, value, _BOOK_VIEW_ORDER)
+    return opening + closing
+
+
+def saved(book: Workbook) -> None:
+    """The file now has every view as the model has it."""
+    for sheet in book.sheets_:
+        sheet.view.changed = False
+    book.view.changed = False
+    book.view.windows_changed = False
+    for window in book.view.windows:
+        for sheet in book.sheets_:
+            sheet_state(book, window.place, sheet)[0].changed = False
+    book.view.saved_active = book.active_sheet
+    book.view.saved_selected = book.selected()
+    book.view.saved_tab = _active_place(book)
+    book.view.saved_first = book.view.first_sheet = _first_place(book)
+
+
+def copied(source: Worksheet, copy: Worksheet) -> None:
+    """A sheet's copy has its view and its selection, measured."""
+    copy.view = replace(source.view, selections=dict(source.view.selections), changed=True)
+    for name in ("selection_range", "active_cell_range"):
+        chosen = getattr(source, name)
+        if chosen is not None:
+            setattr(copy, name, Range(copy, [Area(a.top, a.left, a.bottom, a.right, copy.name) for a in chosen.areas]))
+
+
+# --- rows and columns inserted and deleted -----------------------------------------------------------
+
+
+def _frozen_after(view: SheetViewState, *, rows: bool, start: int, count: int, delete: bool) -> int | None:
+    """How many rows or columns are frozen after whole ones are inserted or deleted among them, never fewer than
+    one; None when the edit is at or past the split, which leaves the view alone, measured."""
+    split = view.rows if rows else view.columns
+    if view.split_xml or not view.state or not split:
+        return None
+    top = view.top_left[0 if rows else 1]
+    if start >= top + split:
+        return None
+    if start < top or (delete and start + count > top + split):
+        raise VBAUnsupportedError("inserting or deleting rows or columns that run past the frozen ones is not "
+                                  "implemented")
+    return max(1, split - count) if delete else split + count
+
+
+def edit_admitted(sheet: Worksheet, *, rows: bool, start: int, count: int, delete: bool) -> None:
+    """Refuse an edit whose effect on the frozen rows or columns is not modelled, before anything moves."""
+    _frozen_after(sheet.view, rows=rows, start=start, count=count, delete=delete)
+
+
+def edited(sheet: Worksheet, *, rows: bool, start: int, count: int, delete: bool) -> None:
+    """The frozen rows or columns grow or shrink with an edit among them, and the pane past them is scrolled back to
+    the first row or column after them, however far it was scrolled, on that axis only; the selections and the
+    window's top left stay where they were. The sheet active or not, measured."""
+    view = sheet.view
+    after = _frozen_after(view, rows=rows, start=start, count=count, delete=delete)
+    if after is None:
+        return
+    axis = 0 if rows else 1
+    if rows:
+        view.rows = after
+    else:
+        view.columns = after
+    corner = list(view.pane_top_left)
+    corner[axis] = view.top_left[axis] + after
+    view.pane_top_left = (corner[0], corner[1])
+    view.changed = True
+
+
+# --- selecting ---------------------------------------------------------------------------------------
+
+
+def check_shown(target: Range, verb: str) -> None:
+    """Select and Activate work only on the active sheet of the active workbook: error 1004 elsewhere, measured."""
+    book = target.sheet.book
+    if book.application.active_book is not book or book.active_sheet is not target.sheet:
+        raise error(1004, f"{verb} method of Range class failed")
+
+
+def activate(target: Range) -> None:
+    """Range.Activate: the active cell moves when the range's first cell is in the selection, else the range is
+    selected."""
+    check_shown(target, "Activate")
+    sheet = target.sheet
+    sheet.active_chart = None
+    first = target.first
+    selection = sheet.selection_range
+    areas = selection.areas if selection is not None else [Area(1, 1, 1, 1)]
+    if not any(area.contains(first.top, first.left) for area in areas):
+        target.select_as_excel_does()
+        return
+    sheet.active_cell_range = Range(sheet, [Area(first.top, first.left, first.top, first.left, first.sheet)])
+    sheet.view.changed = True
+    from pyopenvba.apps.excel._table_filters import refocus
+
+    refocus(sheet)
+
+
+def goto(application: Application, reference: object, scroll: object) -> None:
+    """Application.Goto: the range's workbook and sheet activated and the range selected, scrolled to with Scroll."""
+    if reference is MISSING:
+        raise VBAUnsupportedError("Goto without a reference, which goes back to where the last Goto started, is not "
+                                  "implemented")
+    if isinstance(reference, Range):
+        target = reference
+    else:
+        # A text reference is in R1C1 notation, or a name.
+        found = application.vba_get("Range", [to_a1("=" + to_text(reference), 1, 1)[1:]])
+        if not isinstance(found, Range):
+            raise error(1004, "Reference is not valid.")
+        target = found
+    sheet = target.sheet
+    scrolled = scroll is not MISSING and to_bool(scroll)
+    if scrolled:
+        _check_scrollable(sheet.view)
+    if application.active_book is not sheet.book or sheet.book.active_sheet is not sheet:
+        sheet.Activate()
+    from pyopenvba.apps.excel._worksheet_settings import check_goto
+
+    check_goto(target)
+    target.select_as_excel_does()
+    if scrolled:
+        _scroll_to(sheet.view, 0, target.first.top)
+        _scroll_to(sheet.view, 1, target.first.left)
+
+
+def _check_scrollable(view: SheetViewState) -> None:
+    if view.state == "split" or view.split_xml:
+        raise VBAUnsupportedError("scrolling a window split without being frozen, or one whose panes the model does "
+                                  "not lay out, is not implemented")
+
+
+def _scroll_to(view: SheetViewState, axis: int, number: int) -> None:
+    """Scroll the window along one axis, 0 down and 1 across: the pane past a frozen split, never above or left
+    of it; the whole window where nothing is split that way."""
+    _check_scrollable(view)
+    split = view.rows if axis == 0 else view.columns
+    if view.state in _FROZEN and split:
+        corner = list(view.pane_top_left)
+        corner[axis] = max(number, view.top_left[axis] + split)
+        view.pane_top_left = (corner[0], corner[1])
+    else:
+        corner = list(view.top_left)
+        corner[axis] = number
+        view.top_left = (corner[0], corner[1])
+    view.changed = True
+
+
+# --- VBA -------------------------------------------------------------------------------------
+
+
+def front_to_back(application: Application) -> list[Workbook]:
+    """The open workbooks by their windows, front to back."""
+    books = [book for book in application.workbooks_.books if not book.is_addin]
+    known = [book for book in application.window_order if book in books]
+    return known + [book for book in reversed(books) if book not in known]
+
+
+def brought_forward(application: Application, book: Workbook) -> None:
+    """A workbook activated: a new one's window comes to the front, another's only while the screen updates."""
+    order = application.window_order
+    if book in order and not application.screen_updating:
+        return
+    if book in order:
+        order.remove(book)
+    order.insert(0, book)
+
+
+def window_of(book: Workbook) -> Window:
+    """The workbook's window in front, the same object each time it is asked for."""
+    if not book.view.windows:
+        window = Window(book)
+        book.view.windows.append(window)
+        book.view.live = window.place
+    return book.view.windows[0]
+
+
+def all_windows(application: Application) -> list[Window]:
+    """Every window, the windows of each workbook together, as the model keeps no order across workbooks but theirs."""
+    return [window for book in front_to_back(application) for window in windows_of(book)]
+
+
+def windows_of(book: Workbook) -> list[Window]:
+    window_of(book)
+    return list(book.view.windows)
+
+
+def new_window(book: Workbook) -> Window:
+    """Workbook.NewWindow: a window at the front, showing the sheet of the one that was."""
+    window_of(book)
+    windows = book.view.windows
+    place = WindowPlace(1 + max(one.place.number for one in windows), 1 + sum(one.default_caption() for one in windows), fresh_view(book))
+    # The window that was in front goes to the back: three windows run 3, 1, 2.
+    windows[:] = [Window(book, place), *windows[1:], windows[0]]
+    bring_in(book, place)
+    book.view.windows_changed = True
+    book.application.activate_book(book)
+    # The macro holds an object of its own, which is not ActiveWindow, though it is that window.
+    return Window(book, place)
+
+
+def activate_window(window: Window) -> None:
+    """A window to the front, and its workbook with it."""
+    book = window.book
+    windows = book.view.windows
+    bring_in(book, window.place)
+    order = [one for one in windows if one.place is not window.place]
+    held = next(one for one in windows if one.place is window.place)
+    windows[:] = [held, *order]
+    book.application.activate_book(book)
+
+
+def _renumbered(book: Workbook) -> None:
+    """Numbers close up over a window gone, in the order they were made, and so do the numbers captions show."""
+    by_number = sorted(book.view.windows, key=lambda one: one.place.number)
+    suffix = 0
+    for number, window in enumerate(by_number, 1):
+        window.place.number = number
+        if window.default_caption():
+            suffix += 1
+            window.place.suffix = suffix
+
+
+class Windows(VBACollection, ItemDefault, ExcelObject):
+    """Application.Windows, front to back, or Workbook.Windows, a workbook's own."""
+
+    vba_type_name = "Windows"
+
+    def __init__(self, application: Application, book: Workbook | None = None) -> None:
+        self.application = application
+        self.book = book
+
+    def vba_items(self) -> list[object]:
+        if self.book is None:
+            return list(all_windows(self.application))
+        return [] if self.book.is_addin else list(windows_of(self.book))
+
+    def vba_lookup(self, index: object, items: list[object]) -> object:
+        if isinstance(index, str):
+            for window in items:
+                if isinstance(window, Window) and window.caption().casefold() == index.casefold():
+                    return window
+            raise error(ERR_SUBSCRIPT_OUT_OF_RANGE)
+        return super().vba_lookup(index, items)
+
+    @member
+    def Application(self) -> object:
+        return self.application
+
+    @member
+    def Parent(self) -> object:
+        return self.application if self.book is None else self.book
+
+    # -- side by side, which one window at a time never is (tests/fixtures/window_members.json)
+
+    @member
+    def SyncScrollingSideBySide(self) -> object:
+        return False
+
+    @method
+    def BreakSideBySide(self) -> object:
+        return False
+
+    @method
+    def ResetPositionsSideBySide(self) -> object:
+        return EMPTY
+
+    @method
+    def CompareSideBySideWith(self, WindowName: object = MISSING) -> object:  # noqa: N803
+        self.vba_lookup(WindowName, self.vba_items())
+        return False
+
+
+def pane_count(view: SheetViewState) -> int:
+    if not view.state:
+        return 1
+    if view.split_xml:
+        split = attributes(view.split_xml)
+        both = float(split.get("xSplit", "0") or 0) and float(split.get("ySplit", "0") or 0)
+        return 4 if both else 2
+    return 4 if view.rows and view.columns else 2
+
+
+class _OfWindow(ExcelObject):
+    """Something of a window, which answers with that window's state whichever is in front."""
+
+    vba_type_name = ""
+    window: Window
+
+    def vba_get(self, name: str, args: Sequence[object] = (), named: dict[str, object] | None = None) -> object:
+        with self.window.brought():
+            return super().vba_get(name, args, named)
+
+    def vba_set(self, name: str, value: object, args: Sequence[object] = (), named: dict[str, object] | None = None, *, by_ref: bool = False) -> None:
+        with self.window.brought():
+            super().vba_set(name, value, args, named, by_ref=by_ref)
+
+    def vba_call(self, name: str, args: Sequence[object] = (), named: dict[str, object] | None = None) -> object:
+        with self.window.brought():
+            return super().vba_call(name, args, named)
+
+
+class Pane(_OfWindow):
+    """The one pane of a window with no split (tests/fixtures/window_members.json)."""
+
+    vba_type_name = "Pane"
+
+    def __init__(self, window: Window) -> None:
+        self.window = window
+
+    @member
+    def Index(self) -> object:
+        return VBAInt(1, "Long")
+
+    @member
+    def Parent(self) -> object:
+        return self.window
+
+    @member
+    def Application(self) -> object:
+        return self.window.book.application
+
+    @method
+    def Activate(self) -> object:
+        return True
+
+    @member
+    def ScrollRow(self) -> object:
+        return self.window.vba_get("ScrollRow")
+
+    @setter("ScrollRow")
+    def _set_scroll_row(self, value: object) -> None:
+        self.window.vba_set("ScrollRow", value)
+
+    @member
+    def ScrollColumn(self) -> object:
+        return self.window.vba_get("ScrollColumn")
+
+    @setter("ScrollColumn")
+    def _set_scroll_column(self, value: object) -> None:
+        self.window.vba_set("ScrollColumn", value)
+
+    @method
+    def SmallScroll(self, Down: object = MISSING, Up: object = MISSING, ToRight: object = MISSING,  # noqa: N803
+                    ToLeft: object = MISSING) -> object:  # noqa: N803
+        self.window.SmallScroll(Down, Up, ToRight, ToLeft)
+        return True
+
+
+class Panes(VBACollection, ItemDefault, _OfWindow):
+    """A window's panes: one, two when it is split one way, four when both."""
+
+    vba_type_name = "Panes"
+
+    def __init__(self, window: Window) -> None:
+        self.window = window
+
+    @member
+    def Parent(self) -> object:
+        return self.window
+
+    @member
+    def Application(self) -> object:
+        return self.window.book.application
+
+    def vba_items(self) -> list[object]:
+        if pane_count(self.window.view()) == 1:
+            return [Pane(self.window)]
+        raise VBAUnsupportedError("a window's panes, each scrolled on its own, are not implemented; Panes.Count is")
+
+    def vba_lookup(self, index: object, items: list[object]) -> object:
+        """Below 1 is 1004; any number above answers the one pane, 2 measured (tests/fixtures/application_rest.json)."""
+        if int(to_integer(index, "Long")) < 1:
+            raise error(1004, "Item method of Panes class failed")
+        return items[0]
+
+    def vba_iterate(self) -> Iterator[object]:
+        """For Each over a window's panes is 438 (tests/fixtures/application_rest.json)."""
+        raise error(438, "Object doesn't support this property or method")
+
+    @member
+    def Count(self) -> object:
+        return VBAInt(pane_count(self.window.sheet().view), "Long")
+
+
+class SheetViews(VBACollection, ItemDefault, _OfWindow):
+    """A window's view of each of its workbook's sheets, in tab order whichever are selected
+    (tests/fixtures/sheet_views.json)."""
+
+    vba_type_name = "SheetViews"
+
+    def __init__(self, window: Window) -> None:
+        self.window = window
+
+    @member
+    def Parent(self) -> object:
+        return self.window
+
+    @member
+    def Application(self) -> object:
+        return self.window.book.application
+
+    def vba_items(self) -> list[object]:
+        return [WorksheetView(self.window, sheet) for sheet in self.window.book.sheets_]
+
+    def vba_lookup(self, index: object, items: list[object]) -> object:
+        if isinstance(index, str):
+            for view in items:
+                if isinstance(view, WorksheetView) and view.sheet.name.casefold() == index.casefold():
+                    return view
+            raise VBAUnsupportedError("SheetViews by the name of no sheet is not implemented")
+        place = int(to_integer(index, "Long"))
+        if not 1 <= place <= len(items):
+            raise error(1004, "Unable to get the Item property of the SheetViews class")
+        return items[place - 1]
+
+
+class WorksheetView(_OfWindow):
+    """How a window shows one sheet: the view settings the window shows while that sheet is active, held for the
+    sheet whichever one is (tests/fixtures/sheet_views.json)."""
+
+    vba_type_name = "WorksheetView"
+
+    def __init__(self, window: Window, sheet: Worksheet) -> None:
+        self.window, self.sheet = window, sheet
+
+    def view(self) -> SheetViewState:
+        if not any(one is self.sheet for one in self.window.book.sheets_):
+            raise VBAUnsupportedError("the view of a deleted sheet is not implemented")
+        return self.sheet.view
+
+    @member
+    def Parent(self) -> object:
+        return self.window
+
+    @member
+    def Application(self) -> object:
+        return self.window.book.application
+
+    @member
+    def Sheet(self) -> object:
+        self.view()
+        return self.sheet
+
+    @member
+    def DisplayDataTypeIcons(self) -> object:
+        """Kept for the session; whether it reaches the file was not measured (tests/fixtures/small_rows.json)."""
+        return self.view().data_type_icons
+
+    @setter("DisplayDataTypeIcons")
+    def _display_data_type_icons(self, value: object) -> None:
+        wanted = to_bool(value)
+        self.view().data_type_icons = wanted
+
+    @member
+    def DisplayGridlines(self) -> object:
+        return self.view().gridlines
+
+    @setter("DisplayGridlines")
+    def _set_gridlines(self, value: object) -> None:
+        self.view()
+        self.window.set_flag("gridlines", value, self.sheet)
+
+    @member
+    def DisplayFormulas(self) -> object:
+        return self.view().formulas
+
+    @setter("DisplayFormulas")
+    def _set_formulas(self, value: object) -> None:
+        self.view()
+        self.window.set_flag("formulas", value, self.sheet)
+
+    @member
+    def DisplayHeadings(self) -> object:
+        return self.view().headings
+
+    @setter("DisplayHeadings")
+    def _set_headings(self, value: object) -> None:
+        self.view()
+        self.window.set_flag("headings", value, self.sheet)
+
+    @member
+    def DisplayZeros(self) -> object:
+        return self.view().zeros
+
+    @setter("DisplayZeros")
+    def _set_zeros(self, value: object) -> None:
+        self.view()
+        self.window.set_flag("zeros", value, self.sheet)
+
+    @member
+    def DisplayOutline(self) -> object:
+        return self.view().outline
+
+    @setter("DisplayOutline")
+    def _set_outline(self, value: object) -> None:
+        self.view()
+        self.window.show_outline(value, self.sheet)
+
+
+#: What a window does for itself, not by having its state brought in for the while.
+_WINDOW_TURNS = frozenset({"activate", "activatenext", "activateprevious", "close", "newwindow", "parent", "application", "creator"})
+
+
+class Window(ExcelObject):
+    """A window of a workbook, which shows its active sheet (see _window_states for a workbook with several)."""
+
+    vba_type_name = "Window"
+
+    def __init__(self, book: Workbook, place: WindowPlace | None = None) -> None:
+        self.book = book
+        self.place = place or WindowPlace()
+
+    @contextmanager
+    def brought(self) -> Generator[None]:
+        """While the workbook and its sheets hold this window's state, whichever is in front."""
+        live = self.book.view.live
+        if live is None or live is self.place:
+            yield
+            return
+        bring_in(self.book, self.place)
+        try:
+            yield
+        finally:
+            bring_in(self.book, live)
+
+    def _alive(self) -> None:
+        if self.place.gone:
+            raise VBAUnsupportedError("A window that has closed, while its workbook stays open, is not implemented")
+
+    def vba_get(self, name: str, args: Sequence[object] = (), named: dict[str, object] | None = None) -> object:
+        self._alive()
+        if name.lower() in _WINDOW_TURNS:
+            return super().vba_get(name, args, named)
+        with self.brought():
+            return super().vba_get(name, args, named)
+
+    def vba_set(self, name: str, value: object, args: Sequence[object] = (), named: dict[str, object] | None = None, *, by_ref: bool = False) -> None:
+        self._alive()
+        with self.brought():
+            super().vba_set(name, value, args, named, by_ref=by_ref)
+
+    def vba_call(self, name: str, args: Sequence[object] = (), named: dict[str, object] | None = None) -> object:
+        self._alive()
+        if name.lower() in _WINDOW_TURNS:
+            return super().vba_call(name, args, named)
+        with self.brought():
+            return super().vba_call(name, args, named)
+
+    def sheet(self) -> Worksheet:
+        with self.brought():
+            sheet = self.book.active_sheet
+        if sheet is None:
+            raise error(1004, "the window shows no sheet")
+        return sheet
+
+    def view(self) -> SheetViewState:
+        with self.brought():
+            return self.sheet().view
+
+    def default_caption(self) -> bool:
+        with self.brought():
+            return self.book.view.caption is None
+
+    def caption(self) -> str:
+        with self.brought():
+            caption = self.book.view.caption
+        if caption is not None:
+            return caption
+        return self.book.name if len(self.book.view.windows) < 2 else f"{self.book.name}  -  {self.place.suffix}"
+
+    def _changing(self, sheet: Worksheet | None = None) -> SheetViewState:
+        """The view a setter changes, the active sheet's unless ``sheet`` is given; panes the model does not lay out
+        are kept as the file had them."""
+        view = (sheet or self.sheet()).view
+        if view.split_xml:
+            raise VBAUnsupportedError("changing the view of a window whose panes the model does not lay out, a split "
+                                      "Excel kept in twips of what the window shows, is not implemented")
+        view.changed = True
+        return view
+
+    def _book_changing(self) -> BookViewState:
+        self.book.view.changed = True
+        return self.book.view
+
+    # -- the sheet it shows
+
+    @member
+    def ActiveSheet(self) -> object:
+        # A chart sheet in front, not the worksheet behind it (tests/fixtures/new_window.json).
+        return self.book.active_chart_sheet or self.sheet()
+
+    @member
+    def SelectedSheets(self) -> object:
+        """The selected sheets, in tab order (tests/fixtures/sheet_groups.json)."""
+        from pyopenvba.apps.excel._sheet_groups import SheetGroup
+
+        if self.book.active_chart_sheet is not None:
+            # A group of one chart sheet, which answers what a macro asks a selection of sheets.
+            return SheetGroup(self.book, cast("list[Worksheet]", [self.book.active_chart_sheet]))
+        return SheetGroup(self.book, self.book.selected())
+
+    @member
+    def ActiveCell(self) -> object:
+        return self.sheet().active_cell
+
+    @member
+    def Selection(self) -> object:
+        from pyopenvba.apps.excel._charts import ChartObject, selection
+
+        sheet = self.sheet()
+        found = selection(sheet)
+        # Whatever part of an active chart is selected, a window answers its frame
+        # (tests/fixtures/chart_element_select.json).
+        return found if sheet.active_chart is None else ChartObject(sheet, sheet.active_chart)
+
+    @member
+    def ActiveChart(self) -> object:
+        return self.book.vba_get("ActiveChart")
+
+    @member
+    def RangeSelection(self) -> object:
+        return self.sheet().selection
+
+    @member
+    def Parent(self) -> object:
+        return self.book
+
+    @member
+    def Application(self) -> object:
+        return self.book.application
+
+    @member
+    def Index(self) -> object:
+        order = [one.place for one in all_windows(self.book.application)]
+        return VBAInt(next(at for at, one in enumerate(order, 1) if one is self.place), "Long")
+
+    @method
+    def Activate(self) -> object:
+        activate_window(self)
+        return EMPTY
+
+    @method
+    def NewWindow(self) -> object:
+        return new_window(self.book)
+
+    @member
+    def OnWindow(self) -> object:
+        """The procedure a window's activation runs, its workbook's name before it; none set is 1004
+        (tests/fixtures/application_rest.json)."""
+        if not self.book.view.on_window:
+            raise error(1004, "Unable to get the OnWindow property of the Window class")
+        return self.book.view.on_window
+
+    @setter("OnWindow")
+    def _set_on_window(self, value: object) -> None:
+        name = to_text(value)
+        self.book.view.on_window = f"{self.book.name}!{name}" if name else ""
+
+    @member
+    def ActivePane(self) -> object:
+        """The one pane of a window with no split; with panes, which is active the model does not keep."""
+        if pane_count(self.view()) != 1:
+            raise VBAUnsupportedError("the active pane of a split window is not implemented")
+        return Pane(self)
+
+    @setter("ActivePane")
+    def _set_active_pane(self, value: object) -> None:
+        raise error(438, "Object doesn't support this property or method")
+
+    @member
+    def EnableResize(self) -> object:
+        return True
+
+    @member
+    def DisplayDataTypeIcons(self) -> object:
+        return True
+
+    @method
+    def ScrollWorkbookTabs(self, Sheets: object = MISSING, Position: object = MISSING) -> object:  # noqa: N803
+        """No tabs to scroll here: 1004 given nothing, and anything else goes by (tests/fixtures/window_members.json)."""
+        if Sheets is MISSING and Position is MISSING:
+            raise error(1004, "ScrollWorkbookTabs method of Window class failed")
+        return EMPTY
+
+    @method
+    def Close(self, SaveChanges: object = MISSING, Filename: object = MISSING,  # noqa: N803
+              RouteWorkbook: object = MISSING) -> object:  # noqa: N803
+        """A workbook's only window closed: the workbook closes (tests/fixtures/more_events.json); with others left, it stays."""
+        windows = self.book.view.windows
+        if len(windows) < 2:
+            self.book.Close(SaveChanges, Filename, RouteWorkbook)
+            return True
+        if (SaveChanges, Filename, RouteWorkbook) != (MISSING, MISSING, MISSING):
+            raise VBAUnsupportedError("Window.Close with arguments, with other windows of its workbook left, is not implemented")
+        left = [one for one in windows if one.place is not self.place]
+        if self.book.view.live is self.place:
+            bring_in(self.book, left[0].place)
+        windows[:] = left
+        self.place.gone = True
+        self.book.view.windows_changed = True
+        _renumbered(self.book)
+        return True
+
+    @method
+    def PrintOut(self, From: object = MISSING, To: object = MISSING, Copies: object = MISSING,  # noqa: N803
+                 Preview: object = MISSING, ActivePrinter: object = MISSING, PrintToFile: object = MISSING,  # noqa: N803
+                 Collate: object = MISSING, PrToFileName: object = MISSING) -> object:  # noqa: N803
+        """Refused before any event (tests/fixtures/more_events.json print_window)."""
+        raise error(1004, "PrintOut method of Window class failed")
+
+    @method
+    def ActivateNext(self) -> object:
+        """The window behind this one activated, so that two in a row swap the front two; True
+        (tests/fixtures/window_activate_next.json). A window not in front leaves the windows as they are."""
+        return self._stepped(1)
+
+    @method
+    def ActivatePrevious(self) -> object:
+        """The window at the back activated, so that steps go round every window (tests/fixtures/
+        window_activate_next.json)."""
+        return self._stepped(-1)
+
+    def _stepped(self, step: int) -> object:
+        order = all_windows(self.book.application)
+        if len(order) > 1 and order[0].place is self.place:
+            activate_window(order[step])
+        return True
+
+    # -- the window itself
+
+    @member
+    def Caption(self) -> object:
+        return self.caption()
+
+    @setter("Caption")
+    def _set_caption(self, value: object) -> None:
+        """Null is empty, and Excel refuses more than it holds (tests/fixtures/member_audit.json)."""
+        text = "" if value is NULL else str(value).upper() if isinstance(value, bool) else to_text(value)
+        if len(text) > CAPTION_LIMIT:
+            raise error(1004, "Unable to set the Caption property of the Window class")
+        self.book.view.caption = text
+
+    @member
+    def Visible(self) -> object:
+        return True
+
+    @setter("Visible")
+    def _set_visible(self, value: object) -> None:
+        raise VBAUnsupportedError("hiding a workbook's window is not implemented")
+
+    @member
+    def WindowState(self) -> object:
+        state = self.book.view.state
+        if state is None:
+            raise VBAUnsupportedError("a window's state before a macro sets it is the screen's, which the model does "
+                                      "not have")
+        return VBAInt(state, "Long")
+
+    @setter("WindowState")
+    def _set_window_state(self, value: object) -> None:
+        state = int(to_integer(value, "Long"))
+        changed = state != self.book.view.state
+        self.book.view.state = state
+        if changed:
+            _events.window_resized(self.book)
+
+    @member
+    def Left(self) -> object:
+        return self._size(self.book.view.left)
+
+    @setter("Left")
+    def _set_left(self, value: object) -> None:
+        self.book.view.left = float(to_number(value))
+
+    @member
+    def Top(self) -> object:
+        return self._size(self.book.view.top)
+
+    @setter("Top")
+    def _set_top(self, value: object) -> None:
+        self.book.view.top = float(to_number(value))
+
+    @member
+    def Width(self) -> object:
+        return self._size(self.book.view.width)
+
+    @setter("Width")
+    def _set_width(self, value: object) -> None:
+        width = float(to_number(value))
+        changed = width != self.book.view.width
+        self.book.view.width = width
+        self._resized(changed)
+
+    @member
+    def Height(self) -> object:
+        return self._size(self.book.view.height)
+
+    @setter("Height")
+    def _set_height(self, value: object) -> None:
+        height = float(to_number(value))
+        changed = height != self.book.view.height
+        self.book.view.height = height
+        self._resized(changed)
+
+    def _resized(self, changed: bool) -> None:
+        """A width or height set raises WindowResize, whatever it was, and again when it changes
+        (tests/fixtures/more_events.json)."""
+        _events.window_resized(self.book)
+        if changed:
+            _events.window_resized(self.book)
+
+    @staticmethod
+    def _size(points: float | None) -> object:
+        if points is None:
+            raise VBAUnsupportedError("a window's size before a macro sets it is the screen's, which the model does "
+                                      "not have")
+        return points
+
+    # -- the view of the sheet
+
+    @member
+    def Zoom(self) -> object:
+        return float(self.view().zoom)
+
+    @setter("Zoom")
+    def _set_zoom(self, value: object) -> None:
+        if value is True:
+            raise VBAUnsupportedError("zooming to fit the selection, which depends on the window's size, is not "
+                                      "implemented")
+        zoom = int(float(to_number(value)))
+        if not 10 <= zoom <= 400:
+            raise error(1004, "Unable to set the Zoom property of the Window class")
+        view = self._changing()
+        view.zoom = zoom
+        if view.view == 1:
+            view.zoom_normal = zoom
+        elif view.view == 2:
+            view.zoom_break = zoom
+        else:
+            view.zoom_layout = zoom
+
+    @member
+    def View(self) -> object:
+        return VBAInt(self.view().view, "Long")
+
+    @setter("View")
+    def _set_view(self, value: object) -> None:
+        number = int(to_integer(value, "Long"))
+        if number not in VIEWS:
+            raise error(1004, "Unable to set the View property of the Window class")
+        view = self.view()
+        if number == view.view:
+            return
+        if view.state:
+            raise VBAUnsupportedError("changing the view of a window with panes is not implemented")
+        view = self._changing()
+        if view.view == 1:
+            view.zoom_normal = view.zoom_normal or view.zoom
+        kept = {1: view.zoom_normal, 2: view.zoom_break, 3: view.zoom_layout}[number]
+        view.zoom = kept or _OPENING_ZOOM[number]
+        view.view = number
+
+    def set_flag(self, name: str, value: object, sheet: Worksheet | None = None) -> None:
+        setattr(self._changing(sheet), name, to_bool(value))
+
+    @member
+    def DisplayGridlines(self) -> object:
+        return self.view().gridlines
+
+    @setter("DisplayGridlines")
+    def _set_gridlines(self, value: object) -> None:
+        self.set_flag("gridlines", value)
+
+    @member
+    def DisplayHeadings(self) -> object:
+        return self.view().headings
+
+    @setter("DisplayHeadings")
+    def _set_headings(self, value: object) -> None:
+        self.set_flag("headings", value)
+
+    @member
+    def DisplayZeros(self) -> object:
+        return self.view().zeros
+
+    @setter("DisplayZeros")
+    def _set_zeros(self, value: object) -> None:
+        self.set_flag("zeros", value)
+
+    @member
+    def DisplayFormulas(self) -> object:
+        return self.view().formulas
+
+    @setter("DisplayFormulas")
+    def _set_formulas(self, value: object) -> None:
+        self.set_flag("formulas", value)
+
+    @member
+    def DisplayRightToLeft(self) -> object:
+        """The active sheet's, Worksheet.DisplayRightToLeft (rtl_window)."""
+        return self.view().right_to_left
+
+    @setter("DisplayRightToLeft")
+    def _set_right_to_left(self, value: object) -> None:
+        self.set_flag("right_to_left", value)
+
+    @member
+    def DisplayOutline(self) -> object:
+        """The active sheet's outline symbols, which the file keeps in its sheetView and its outlinePr
+        (tests/fixtures/window_settings.json)."""
+        return self.view().outline
+
+    @setter("DisplayOutline")
+    def _set_outline(self, value: object) -> None:
+        self.show_outline(value)
+
+    def show_outline(self, value: object, sheet: Worksheet | None = None) -> None:
+        from pyopenvba.apps.excel._outline import state
+
+        shown = sheet or self.sheet()
+        self.set_flag("outline", value, shown)
+        outline = state(shown)
+        if not shown.view.outline:
+            outline.attributes["showOutlineSymbols"] = outline.changes["showOutlineSymbols"] = "0"
+        elif outline.attributes.pop("showOutlineSymbols", None) is not None:
+            outline.changes["showOutlineSymbols"] = None
+
+    @member
+    def DisplayRuler(self) -> object:
+        return self.view().ruler
+
+    @setter("DisplayRuler")
+    def _set_ruler(self, value: object) -> None:
+        self.set_flag("ruler", value)
+
+    @member
+    def DisplayWhitespace(self) -> object:
+        return self.view().whitespace
+
+    @setter("DisplayWhitespace")
+    def _set_whitespace(self, value: object) -> None:
+        self.set_flag("whitespace", value)
+
+    @member
+    def GridlineColorIndex(self) -> object:
+        """The active sheet's gridlines' palette slot, xlColorIndexAutomatic while they are automatic."""
+        slot = self.view().grid_color
+        return VBAInt(slot if slot else XL_AUTOMATIC, "Long")
+
+    @setter("GridlineColorIndex")
+    def _set_gridline_color_index(self, value: object) -> None:
+        """1 to 56; 0 and xlColorIndexAutomatic make them automatic, anything else error 1004
+        (tests/fixtures/window_settings.json)."""
+        slot = int(to_integer(value, "Long"))
+        if slot == XL_AUTOMATIC:
+            slot = 0
+        if not 0 <= slot <= 56:
+            raise error(1004, "Unable to set the GridlineColorIndex property of the Window class")
+        self._changing().grid_color = slot
+
+    @member
+    def GridlineColor(self) -> object:
+        """The colour of the gridlines' palette slot, 0 while they are automatic."""
+        slot = self.view().grid_color
+        if not slot:
+            return VBAInt(0, "Long")
+        rrggbb = self.book.stylesheet.colors.indexed[slot + 7]
+        return VBAInt(int(rrggbb[4:6], 16) << 16 | int(rrggbb[2:4], 16) << 8 | int(rrggbb[0:2], 16), "Long")
+
+    @setter("GridlineColor")
+    def _set_gridline_color(self, value: object) -> None:
+        """The palette slot nearest the colour, its low 24 bits (tests/fixtures/window_settings.json)."""
+        color = int(to_integer(value, "Long")) & 0xFFFFFF
+        rrggbb = f"{color & 0xFF:02X}{color >> 8 & 0xFF:02X}{color >> 16:02X}"
+        self._changing().grid_color = self.book.stylesheet.colors.nearest(rrggbb)
+
+    @member
+    def AutoFilterDateGrouping(self) -> object:
+        """The workbook's, which its workbookView keeps (tests/fixtures/window_settings.json)."""
+        return self.book.view.date_grouping
+
+    @setter("AutoFilterDateGrouping")
+    def _set_date_grouping(self, value: object) -> None:
+        self._book_changing().date_grouping = to_bool(value)
+
+    @member
+    def WindowNumber(self) -> object:
+        return VBAInt(self.place.number, "Long")
+
+    @member
+    def Type(self) -> object:
+        """xlWorkbook."""
+        return VBAInt(1, "Long")
+
+    # -- scrolling
+
+    @method
+    def SmallScroll(self, Down: object = MISSING, Up: object = MISSING, ToRight: object = MISSING,
+                    ToLeft: object = MISSING) -> object:
+        """ScrollRow moved by Down less Up and ScrollColumn by ToRight less ToLeft, each a whole number of rows and
+        columns cut toward zero, and kept on the sheet; text is error 1004 (tests/fixtures/window_settings.json)."""
+        def amount(value: object) -> int:
+            if value is MISSING:
+                return 0
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                try:
+                    value = to_number(value)
+                except VBARuntimeError:
+                    raise error(1004, "SmallScroll method of Window class failed") from None
+            return int(value)
+
+        rows, columns = amount(Down) - amount(Up), amount(ToRight) - amount(ToLeft)
+        for axis, moved, last in ((0, rows, MAX_ROWS), (1, columns, MAX_COLUMNS)):
+            if moved:
+                _scroll_to(self._changing(), axis, min(max(self._scrolled(axis) + moved, 1), last))
+        return True
+
+    # -- the grid's size, what it shows, and scrolling by it
+
+    def _unmeasured_display(self, member: str) -> VBAUnsupportedError:
+        """UsableWidth, UsableHeight, VisibleRange, LargeScroll and ScrollIntoView follow _window_geometry's rules,
+        which depend on the display's DPI and were measured at 144 DPI only; the model lays sheets out at 96 DPI."""
+        return VBAUnsupportedError(f"Window.{member} depends on the display's DPI; it was measured at 144 DPI only, "
+                                   "and the model lays sheets out at 96 DPI")
+
+    @member
+    def UsableWidth(self) -> object:
+        raise self._unmeasured_display("UsableWidth")
+
+    @member
+    def UsableHeight(self) -> object:
+        raise self._unmeasured_display("UsableHeight")
+
+    @member
+    def VisibleRange(self) -> object:
+        raise self._unmeasured_display("VisibleRange")
+
+    @method
+    def LargeScroll(self, Down: object = MISSING, Up: object = MISSING, ToRight: object = MISSING,
+                    ToLeft: object = MISSING) -> object:
+        raise self._unmeasured_display("LargeScroll")
+
+    @method
+    def ScrollIntoView(self, Left: object = MISSING, Top: object = MISSING, Width: object = MISSING,
+                       Height: object = MISSING, Start: object = MISSING) -> object:
+        raise self._unmeasured_display("ScrollIntoView")
+
+    def _scrolled(self, axis: int) -> int:
+        view = self.view()
+        split = view.rows if axis == 0 else view.columns
+        return (view.pane_top_left if view.state in _FROZEN and split else view.top_left)[axis]
+
+    def _scroll(self, axis: int, value: object) -> None:
+        number = int(to_integer(value, "Long"))
+        if not 1 <= number <= (MAX_ROWS if axis == 0 else MAX_COLUMNS):
+            name = "ScrollRow" if axis == 0 else "ScrollColumn"
+            raise error(1004, f"Unable to set the {name} property of the Window class")
+        _scroll_to(self._changing(), axis, number)
+
+    @member
+    def ScrollRow(self) -> object:
+        return VBAInt(self._scrolled(0), "Long")
+
+    @setter("ScrollRow")
+    def _set_scroll_row(self, value: object) -> None:
+        self._scroll(0, value)
+
+    @member
+    def ScrollColumn(self) -> object:
+        return VBAInt(self._scrolled(1), "Long")
+
+    @setter("ScrollColumn")
+    def _set_scroll_column(self, value: object) -> None:
+        self._scroll(1, value)
+
+    # -- panes
+
+    @member
+    def FreezePanes(self) -> object:
+        return self.view().state in _FROZEN
+
+    @setter("FreezePanes")
+    def _set_freeze_panes(self, value: object) -> None:
+        view = self.view()
+        if to_bool(value):
+            if view.state in _FROZEN:
+                return
+            if view.state == "split":
+                self._changing()
+                _freeze(view, "frozenSplit")
+                return
+            active = self.sheet().active_cell_range
+            row, column = (active.first.top, active.first.left) if active is not None else (1, 1)
+            rows, columns = row - view.top_left[0], column - view.top_left[1]
+            if rows < 0 or columns < 0 or not (rows or columns):
+                raise VBAUnsupportedError("freezing panes with the active cell out of view or at the window's top "
+                                          "left is not implemented: Excel then freezes the middle of a window whose "
+                                          "size the model does not have")
+            self._changing()
+            view.rows, view.columns = rows, columns
+            view.selections = {}
+            if columns:
+                view.selections["topRight"] = _selected(view.top_left[0], column)
+            if rows:
+                view.selections["bottomLeft"] = _selected(row, view.top_left[1])
+            _freeze(view, "frozen")
+        elif view.state == "frozen":
+            self._changing()
+            _unsplit(view)
+        elif view.state == "frozenSplit":
+            self._changing().state = "split"
+
+    @member
+    def Split(self) -> object:
+        return bool(self.view().state)
+
+    @setter("Split")
+    def _set_split(self, value: object) -> None:
+        view = self.view()
+        if to_bool(value):
+            if not view.state:
+                raise VBAUnsupportedError("splitting a window at the active cell is not implemented: Excel keeps the "
+                                          "split in twips of what the window shows")
+            return
+        if not view.state:
+            return
+        self._changing()
+        if view.state == "frozen":
+            view.state = "split"
+        else:
+            _unsplit(view)
+
+    def _split_count(self, axis: int) -> int:
+        view = self.view()
+        if view.split_xml:
+            raise VBAUnsupportedError("panes the model does not lay out, a split Excel kept in twips, are not counted "
+                                      "in rows and columns")
+        return view.rows if axis == 0 else view.columns
+
+    def _set_split_count(self, axis: int, value: object) -> None:
+        count = int(to_integer(value, "Long"))
+        if count < 0:
+            name = "SplitRow" if axis == 0 else "SplitColumn"
+            raise error(1004, f"Unable to set the {name} property of the Window class")
+        view = self.view()
+        if not view.state and not count:
+            return
+        self._changing()
+        if view.state in _FROZEN:
+            view.state = "split"
+        elif not view.state:
+            view.state, view.active_pane, view.selections = "split", "topLeft", {}
+        top, left = view.top_left
+        if axis == 0:
+            view.rows = count
+        else:
+            view.columns = count
+        # Each pane keeps the selection it opened with, in the order the panes were made.
+        for pane, there, cell in (("bottomLeft", view.rows, (top + view.rows, left)),
+                                  ("topRight", view.columns, (top, left + view.columns)),
+                                  ("bottomRight", view.rows and view.columns, (top + view.rows, left + view.columns))):
+            if not there:
+                view.selections.pop(pane, None)
+            elif pane not in view.selections:
+                view.selections[pane] = _selected(*cell)
+        view.pane_top_left = (top + view.rows, left + view.columns)
+        if not (view.rows or view.columns):
+            _unsplit(view)
+
+    @member
+    def SplitRow(self) -> object:
+        return VBAInt(self._split_count(0), "Long")
+
+    @setter("SplitRow")
+    def _set_split_row(self, value: object) -> None:
+        self._set_split_count(0, value)
+
+    @member
+    def SplitColumn(self) -> object:
+        return VBAInt(self._split_count(1), "Long")
+
+    @setter("SplitColumn")
+    def _set_split_column(self, value: object) -> None:
+        self._set_split_count(1, value)
+
+    def _split_points(self, axis: int) -> float:
+        """How far from the top or the left the split runs, in points: its rows' or columns' pixels at the zoom."""
+        sheet = self.sheet()
+        view = sheet.view
+        start, count = view.top_left[axis], self._split_count(axis)
+        size = sheet.row_height_points if axis == 0 else sheet.column_width_points
+        pixels = sum(int(round(size(one) / _dimensions.PIXEL) * view.zoom / 100 + 0.5)
+                     for one in range(start, start + count))
+        return pixels * _dimensions.PIXEL
+
+    @member
+    def SplitVertical(self) -> object:
+        return self._split_points(0)
+
+    @member
+    def SplitHorizontal(self) -> object:
+        return self._split_points(1)
+
+    @member
+    def Panes(self, Index: object = MISSING) -> object:
+        panes = Panes(self)
+        return panes if Index is MISSING else panes.vba_get("Item", [Index])
+
+    @member
+    def SheetViews(self) -> object:
+        return SheetViews(self)
+
+    @member
+    def ActiveSheetView(self) -> object:
+        return WorksheetView(self, self.sheet())
+
+    # -- the workbook's window
+
+    @member
+    def DisplayWorkbookTabs(self) -> object:
+        return self.book.view.tabs
+
+    @setter("DisplayWorkbookTabs")
+    def _set_tabs(self, value: object) -> None:
+        self._book_changing().tabs = to_bool(value)
+
+    @member
+    def TabRatio(self) -> object:
+        return self.book.view.tab_ratio
+
+    @setter("TabRatio")
+    def _set_tab_ratio(self, value: object) -> None:
+        """The size of a number: -0.1 is 0.1 and True is 1 (tests/fixtures/member_audit.json)."""
+        ratio = abs(float(to_number(value)))
+        if not 0 <= ratio <= 1:
+            raise error(1004, "Unable to set the TabRatio property of the Window class")
+        self._book_changing().tab_ratio = ratio
+
+    @member
+    def DisplayHorizontalScrollBar(self) -> object:
+        return self.book.view.horizontal_scroll
+
+    @setter("DisplayHorizontalScrollBar")
+    def _set_horizontal_scroll(self, value: object) -> None:
+        self._book_changing().horizontal_scroll = to_bool(value)
+
+    @member
+    def DisplayVerticalScrollBar(self) -> object:
+        return self.book.view.vertical_scroll
+
+    @setter("DisplayVerticalScrollBar")
+    def _set_vertical_scroll(self, value: object) -> None:
+        self._book_changing().vertical_scroll = to_bool(value)
+
+
+def _freeze(view: SheetViewState, state: str) -> None:
+    """Freeze the split in place: the pane past it becomes the active one, and the top left pane's selection is
+    the window's top left cell."""
+    top, left = view.top_left
+    view.selections = {"topLeft": _selected(top, left), **view.selections}
+    view.state = state
+    view.active_pane = "bottomRight" if view.rows and view.columns else "bottomLeft" if view.rows else "topRight"
+    view.pane_top_left = (top + view.rows, left + view.columns)
+
+
+def _unsplit(view: SheetViewState) -> None:
+    view.state, view.rows, view.columns, view.active_pane, view.selections = "", 0, 0, "topLeft", {}

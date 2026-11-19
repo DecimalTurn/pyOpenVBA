@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from pyopenvba import ExcelFile, PowerPointFile, WordFile
+from pyopenvba import AccessDatabase, ExcelFile, PowerPointFile, WordFile
 from pyopenvba.__main__ import main
 
 _ACCDB = (
@@ -43,13 +43,14 @@ class TestLs:
         assert main(["ls", str(tmp_path / "notes.txt")]) == 2
         assert "unsupported file type" in capsys.readouterr().err
 
-    def test_xltm_is_not_advertised(
-        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
-    ) -> None:
-        # .xltm was previously listed for disasm but rejected by ExcelFile;
-        # the suffix map now only carries extensions the facades accept.
-        assert main(["disasm", str(tmp_path / "t.xltm")]) == 2
-        assert "unsupported file type" in capsys.readouterr().err
+    def test_suffix_map_is_what_the_facades_accept(self) -> None:
+        # .xltm was once listed for disasm but rejected by ExcelFile; the
+        # map carries exactly the extensions each facade opens.
+        from pyopenvba.__main__ import _HOST_BY_SUFFIX  # pyright: ignore[reportPrivateUsage]
+
+        for host in (ExcelFile, WordFile, PowerPointFile):
+            accepted = getattr(host, "_zip_formats") | getattr(host, "_cfb_formats")
+            assert {s for s, h in _HOST_BY_SUFFIX.items() if h is host} == accepted
 
 
 class TestPullPush:
@@ -90,6 +91,20 @@ class TestPullPush:
         capsys.readouterr()
 
 
+class TestAccessLs:
+    def test_access_ls_lists_a_module_kept_inside_its_row(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """A stream this short sits in its storage row, where the old page
+        scan never looked (GitHub issue #33)."""
+        target = tmp_path / "db.accdb"
+        db = AccessDatabase.create_new(target)
+        db.add_module("Short", "' x")
+        db.save()
+        assert main(["access-ls", str(target)]) == 0
+        assert capsys.readouterr().out.split() == ["Module1", "Short"]
+
+
 @pytest.mark.skipif(not _ACCDB.exists(), reason="live .accdb fixture not present")
 class TestAccessPull:
     def test_access_pull_classifies_class_modules(
@@ -104,3 +119,63 @@ class TestAccessPull:
         # Classification comes from the dir-stream catalog: standard
         # modules as .bas, class modules as .cls.
         assert all(name.endswith((".bas", ".cls")) for name in written)
+
+
+class TestForms:
+    _NESTED = Path(__file__).parent / "live_excel_testing" / "nested_form.xlsm"
+    _LEGACY_PPT = (
+        Path(__file__).parent / "live_powerpoint_testing" / "legacy_macros.ppt"
+    )
+
+    @pytest.mark.skipif(not _NESTED.exists(), reason="nested form fixture not present")
+    def test_forms_prints_the_control_tree(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        assert main(["forms", "--mask", str(self._NESTED)]) == 0
+        out = capsys.readouterr().out
+        assert "FrmNested" in out
+        assert "MSForms.MultiPage" in out
+        # Nesting shows as indentation, so a child must be further in
+        # than the container that holds it.
+        indent = {
+            ln.strip().split()[0]: len(ln) - len(ln.lstrip())
+            for ln in out.splitlines()
+            if ln.strip() and "MSForms." in ln
+        }
+        assert indent["OptOne"] > indent["GroupBox"]
+        assert indent["PageOneCheck"] > indent["Page1"]
+
+    @pytest.mark.skipif(not _NESTED.exists(), reason="nested form fixture not present")
+    def test_forms_names_the_properties(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        assert main(["forms", str(self._NESTED)]) == 0
+        out = capsys.readouterr().out
+        assert "Caption = 'Close'" in out
+        assert "Font.FontName = 'Tahoma'" in out
+
+    @pytest.mark.skipif(not _NESTED.exists(), reason="nested form fixture not present")
+    def test_forms_mask_flag_reports_the_raw_mask(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        assert main(["forms", "--mask", str(self._NESTED)]) == 0
+        out = capsys.readouterr().out
+        # MorphData controls carry the wider mask, and the printed width
+        # is what tells a reader which bit index they are looking at.
+        assert "set=0x0000000080000101" in out   # InnerText, 8 bytes
+        assert "set=0x00000028" in out           # TopLabel, 4 bytes
+
+    @pytest.mark.skipif(
+        not _LEGACY_PPT.exists(), reason="legacy .ppt fixture not present"
+    )
+    def test_forms_says_so_when_a_project_has_none(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        assert main(["forms", str(self._LEGACY_PPT)]) == 0
+        assert "no UserForms" in capsys.readouterr().out
+
+    def test_forms_rejects_an_unsupported_suffix(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        assert main(["forms", str(tmp_path / "notes.txt")]) == 2
+        assert "unsupported file type" in capsys.readouterr().err

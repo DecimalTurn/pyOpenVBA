@@ -1,0 +1,11 @@
+{
+  "native.json": "1b0ed6b0f956eaf03b50c39520fbe8cfb325ba75ce62b8a97290117d9ca992aa",
+  "numeric-1900.xlsx": "88d8a3f8329676e4a3919d88d94b4c63945076e60f543047b5975516f932c068",
+  "numeric-1904.xlsx": "bf5313d2a60de34cef7cea7aa317839b1356cd83c6ca37b109894e2ca8f94a29",
+  "setting-coercion-protection.xlsx": "390838ecb8940e726ad3f52f2f1146264d480d9e1b9b1e1ad71b5b50dd3e7ed6",
+  "toggle-auto.xlsx": "f716547863f1ef43eb9adcd67b527063421b57f3b4178c41a671bbdecd782290",
+  "toggle-manual.xlsx": "c259daceef42a570c53c60c7848937aeb3365f6bbeb3ecc7aa381015d94603cc",
+  "two-books-isolation.xlsx": "700091be6ab93e22fdb8138d58710d47cd5d0c1a5ced003467519760734f30ab",
+  "typed-date-strings.xlsx": "398d459570d7b885ba1b55a626f181f2a34ae0147ac65ab6ae09caaa12f3998c",
+  "vba-date-writes.xlsx": "444ed9f1310504bfe266a9dd20898ce06456471f854f660352a094165d705b89"
+}

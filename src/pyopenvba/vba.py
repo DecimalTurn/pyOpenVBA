@@ -24,8 +24,11 @@ Critical implementation traps (guide section 31)
 
 from __future__ import annotations
 
+import codecs
 import struct
-from collections.abc import Iterable
+import unicodedata
+import warnings
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import TYPE_CHECKING
@@ -58,7 +61,9 @@ def copy_token_help(decompressed_current: int, decompressed_chunk_start: int) ->
     return length_mask, offset_mask, bit_count
 
 
-def decompress(data: bytes, *, stream_name: str = "<unknown>") -> bytes:
+def decompress(
+    data: bytes, *, stream_name: str = "<unknown>", max_bytes: int | None = None
+) -> bytes:
     """
     Decompress a VBA stream using the MS-OVBA compression algorithm.
 
@@ -81,6 +86,36 @@ def decompress(data: bytes, *, stream_name: str = "<unknown>") -> bytes:
     ``stream_name`` is purely contextual: it is embedded in any
     :class:`VBAProjectError` raised here so callers can identify which
     CFB stream a malformed chunk came from.
+
+    ``max_bytes``, when given, stops decompression at the first chunk
+    boundary at or beyond that many output bytes and returns the
+    chunk-aligned prefix.  Copy tokens never reference across chunk
+    boundaries (this decoder enforces it), so the prefix is
+    byte-identical to the same range of a full decompression.  Useful
+    for reading a module's ``Attribute VB_*`` header without paying for
+    the whole stream.
+    """
+    out, _ = _decompress(data, stream_name=stream_name, max_bytes=max_bytes)
+    return out
+
+
+def _decompress(
+    data: bytes, *, stream_name: str, max_bytes: int | None
+) -> tuple[bytes, bool]:
+    """Core decoder behind :func:`decompress`.
+
+    Returns ``(decompressed, consumed_all)`` where ``consumed_all`` is
+    True when the entire compressed input was processed — i.e. the
+    returned bytes are the complete decompression, not a prefix.
+
+    Performance shape (measured; see issue #5): output is produced with
+    slice operations wherever the spec allows — non-overlapping copy
+    tokens move as one slice, runs of literal tokens within a flag byte
+    extend once — and the copy-token masks are recomputed only when the
+    chunk-local output size crosses a power of two, since
+    :func:`copy_token_help` depends on nothing else.  Overlapping
+    copies (offset < length) keep the spec's byte-at-a-time semantics,
+    which are load-bearing there.
     """
 
     def _err(msg: str, offset: int) -> VBAProjectError:
@@ -92,13 +127,17 @@ def decompress(data: bytes, *, stream_name: str = "<unknown>") -> bytes:
         raise _err("Invalid compressed stream: missing 0x01 signature byte.", 0)
 
     pos = 1
+    n = len(data)
     out = bytearray()
 
-    while pos < len(data):
-        if pos + 2 > len(data):
+    while pos < n:
+        if max_bytes is not None and len(out) >= max_bytes:
+            return bytes(out), False
+
+        if pos + 2 > n:
             raise _err("Truncated compressed stream: missing chunk header.", pos)
 
-        header = int(struct.unpack_from("<H", data, pos)[0])
+        header = data[pos] | data[pos + 1] << 8
         chunk_data_size = (header & 0x0FFF) + 1   # data bytes after the header
         chunk_signature = (header >> 12) & 0x7
         chunk_flag = (header >> 15) & 0x1
@@ -113,10 +152,10 @@ def decompress(data: bytes, *, stream_name: str = "<unknown>") -> bytes:
             )
 
         chunk_end = pos + chunk_data_size
-        if chunk_end > len(data):
+        if chunk_end > n:
             raise _err(
                 f"Truncated chunk: header announces {chunk_data_size} bytes "
-                f"but only {len(data) - pos} remain.",
+                f"but only {n - pos} remain.",
                 header_offset,
             )
         decompressed_chunk_start = len(out)
@@ -129,32 +168,42 @@ def decompress(data: bytes, *, stream_name: str = "<unknown>") -> bytes:
                     f"got {chunk_data_size}.",
                     header_offset,
                 )
-            if pos + 4096 > len(data):
+            if pos + 4096 > n:
                 raise _err("Truncated raw chunk.", pos)
             out.extend(data[pos: pos + 4096])
             pos += 4096
         else:
-            # Token-compressed chunk.
+            # Token-compressed chunk.  Masks depend only on the
+            # chunk-local output offset; recompute at power-of-two
+            # crossings instead of per token.
+            length_mask, offset_mask, bit_count = copy_token_help(
+                len(out), decompressed_chunk_start
+            )
+            next_threshold = (1 << bit_count) + 1
+
             while pos < chunk_end:
-                if pos >= len(data):
+                if pos >= n:
                     break
-                flag_byte = int(data[pos])
+                flag_byte = data[pos]
                 pos += 1
 
-                for bit in range(8):
-                    if pos >= chunk_end or pos >= len(data):
+                bit = 0
+                while bit < 8:
+                    if pos >= chunk_end or pos >= n:
                         break
 
                     if (flag_byte >> bit) & 1:
                         # Copy token — back-reference into already-decompressed output.
-                        if pos + 2 > len(data):
+                        if pos + 2 > n:
                             raise _err("Truncated copy token.", pos)
-                        token = int(struct.unpack_from("<H", data, pos)[0])
+                        token = data[pos] | data[pos + 1] << 8
                         pos += 2
 
-                        length_mask, offset_mask, bit_count = copy_token_help(
-                            len(out), decompressed_chunk_start
-                        )
+                        if len(out) - decompressed_chunk_start >= next_threshold:
+                            length_mask, offset_mask, bit_count = copy_token_help(
+                                len(out), decompressed_chunk_start
+                            )
+                            next_threshold = (1 << bit_count) + 1
                         length = (token & length_mask) + 3
                         offset = ((token & offset_mask) >> (16 - bit_count)) + 1
 
@@ -171,21 +220,35 @@ def decompress(data: bytes, *, stream_name: str = "<unknown>") -> bytes:
                                 pos - 2,
                             )
 
-                        # Byte-by-byte copy; overlap is intentional and required by spec.
-                        for _ in range(length):
-                            out.append(out[copy_src])
-                            copy_src += 1
+                        if offset >= length:
+                            # Source range is fully materialized: one slice.
+                            out += out[copy_src: copy_src + length]
+                        else:
+                            # Overlapping copy; byte-at-a-time is required
+                            # by spec semantics (the pattern repeats).
+                            for _ in range(length):
+                                out.append(out[copy_src])
+                                copy_src += 1
+                        bit += 1
                     else:
-                        # Literal token.
-                        out.append(int(data[pos]))
-                        pos += 1
+                        # Run of literal tokens: consecutive clear bits in
+                        # this flag byte copy verbatim as one slice.
+                        run_start = pos
+                        while (bit < 8
+                               and not ((flag_byte >> bit) & 1)
+                               and pos < chunk_end
+                               and pos < n):
+                            pos += 1
+                            bit += 1
+                        out += data[run_start:pos]
 
-    return bytes(out)
+    return bytes(out), True
 
 
 def compress(data: bytes) -> bytes:
     """
-    Compress data using the MS-OVBA compression algorithm.
+    Compress data using the MS-OVBA compression algorithm, choosing every
+    token as Office does (see :func:`_encode_lz`).
 
     [MS-OVBA] 2.4.1 — write path.
 
@@ -208,7 +271,7 @@ def compress(data: bytes) -> bytes:
         chunk = data[cursor: cursor + 4096]
         cursor += len(chunk)
 
-        encoded = _encode_token_chunk(chunk)
+        encoded = _encode_lz(chunk)
         if len(encoded) <= 4096:
             # header: flag=1, sig=0b011, size-1 = len(encoded)-1
             # 0x8000 | 0x3000 = 0xB000
@@ -234,61 +297,35 @@ def compress(data: bytes) -> bytes:
     return bytes(out)
 
 
-def _encode_token_chunk(chunk: bytes) -> bytes:
-    # Always run the greedy LZ encoder. Microsoft Access byte-validates
-    # the OVBA cache blob and rejects modules whose CompressedChunk bytes
-    # don't match what its own compressor would have produced -- even
-    # when the decompressed plaintext is identical. A literal-only
-    # fast-path (legal per [MS-OVBA] 2.4.1) emits valid-but-different
-    # bytes for short chunks (<= 3640 bytes) and trips Access's
-    # "Error accessing file. Network connection may have been lost."
-    # in the VBE. Empirically the greedy LZ encoder produces output
-    # that matches Access's encoding byte-for-byte on samples 010-051.
-    # If LZ encoding overflows 4096 bytes (adversarial high-entropy
-    # input), fall back to a raw chunk -- this only fires for inputs
-    # that cannot be represented as a token-compressed chunk at all.
-    encoded = _encode_lz(chunk)
-    if len(encoded) <= 4096:
-        return encoded
-    # Caller will see len > 4096 and emit a raw chunk if the chunk is
-    # exactly 4096 bytes. This branch is unreachable for realistic VBA
-    # source text.
-    return encoded
-
-
 def _encode_lz(chunk: bytes) -> bytes:
-    """Greedy LZ encoder for token-compressed chunks.
+    """Token-compress one chunk, choosing every token as Office does, so
+    that a stream the library writes is the one Office would have saved.
 
-    Byte-for-byte equivalent to the naive full-window scan (each
-    position considers every earlier position, ascending, keeping the
-    first candidate with a strictly greater capped match length -- so
-    ties go to the FARTHEST candidate), but replaces the O(window) scan
-    with a 3-gram position index.  The reduction is sound because:
+    Office chooses as the LZNT1 standard engine Windows ships in ntdll
+    (``RtlCompressBuffer``) does, with one difference at the end of a
+    chunk.  Measured against every module and dir stream Office wrote in
+    the fixtures, from Access, Excel, Word and PowerPoint, and against
+    ntdll on generated input:
 
-    * a copy token requires a match length of at least 3, so any
-      winning candidate shares its first three bytes with the target
-      and appears in the index bucket for that 3-gram;
-    * candidates outside the bucket match at most 2 bytes and can
-      neither win nor influence the strict-improvement tie-break;
-    * within a 4096-byte chunk ``copy_token_help``'s offset range
-      always covers the whole chunk-so-far, so bucket entries never
-      expire and ascending bucket order equals ascending scan order.
-
-    The byte-exactness matters: Access validates the OVBA cache blob
-    against its own compressor's output (see ``_encode_token_chunk``),
-    and ``test_compress_byte_exact_against_access_sample_040`` plus the
-    naive-oracle equivalence tests pin this property.
+    * Only a position where a token starts is remembered.  The bytes a
+      copy token covers are never candidates later.
+    * A position is remembered in one of 4096 buckets, picked by a hash
+      of the three bytes that start there, and a bucket holds two: the
+      newest position and the one before it.  Different three-byte runs
+      can share a bucket and push each other out.
+    * A lookup measures both remembered positions, each up to the
+      longest match a token at this position can express, and takes the
+      longer; the newer wins a tie.  A match under three bytes makes a
+      literal.  A position with fewer than three bytes left is a literal
+      and is not remembered.
+    * When a chunk's last token fills its flag byte, Office writes one
+      more flag byte, empty.  ntdll does not.
     """
     out = bytearray()
     pos = 0
     chunk_len = len(chunk)
-
-    # 3-gram index: int key (little-endian packed three bytes) -> list
-    # of positions in ascending order.  ``indexed_to`` marks how far the
-    # index has been populated; positions are added lazily as the
-    # encoder passes them, including positions inside copied regions.
-    index: dict[int, list[int]] = {}
-    indexed_to = 0
+    newest = [-1] * 4096
+    older = [-1] * 4096
 
     while pos < chunk_len:
         flag_bits = 0
@@ -299,36 +336,24 @@ def _encode_lz(chunk: bytes) -> bytes:
                 break
 
             length_mask, offset_mask, bit_count = copy_token_help(pos, 0)
-            max_length = length_mask + 3
-
             best_len = 0
             best_offset = 0
             if pos + 3 <= chunk_len:
-                while indexed_to < pos:
-                    if indexed_to + 3 <= chunk_len:
-                        key = (
-                            chunk[indexed_to]
-                            | chunk[indexed_to + 1] << 8
-                            | chunk[indexed_to + 2] << 16
-                        )
-                        index.setdefault(key, []).append(indexed_to)
-                    indexed_to += 1
-                limit = max_length
-                if chunk_len - pos < limit:
-                    limit = chunk_len - pos
-                target_key = chunk[pos] | chunk[pos + 1] << 8 | chunk[pos + 2] << 16
-                for candidate in index.get(target_key, ()):
-                    match_len = 3
+                run = (chunk[pos] << 8) ^ (chunk[pos + 1] << 4) ^ chunk[pos + 2]
+                bucket = ((40543 * run) >> 4) & 0xFFF
+                candidates = (newest[bucket], older[bucket])
+                newest[bucket], older[bucket] = pos, candidates[0]
+                limit = min(length_mask + 3, chunk_len - pos)
+                for candidate in candidates:
+                    if candidate < 0:
+                        continue
+                    match_len = 0
                     while (match_len < limit
                            and chunk[candidate + match_len] == chunk[pos + match_len]):
                         match_len += 1
                     if match_len > best_len:
                         best_len = match_len
                         best_offset = pos - candidate
-                        if best_len >= limit:
-                            # No later candidate can strictly improve on
-                            # the cap; the naive scan would keep this one.
-                            break
 
             if best_len >= 3:
                 flag_bits |= (1 << bit)
@@ -343,6 +368,8 @@ def _encode_lz(chunk: bytes) -> bytes:
         out.append(flag_bits)
         for tok in tokens:
             out.extend(tok)
+        if len(tokens) == 8 and pos >= chunk_len:
+            out.append(0)
 
     return bytes(out)
 
@@ -390,6 +417,46 @@ class VBAReference:
     kind: str = ""              # "registered" | "project" | "control" | "original"
     libid: str = ""             # primary libid (registry path / file path)
     libid_secondary: str = ""   # twiddled / relative libid where applicable
+
+    @property
+    def guid(self) -> str:
+        head = self.libid.split("#", 1)[0]
+        return head[3:] if head.startswith("*\\G") else ""
+
+    @property
+    def version(self) -> tuple[int, int]:
+        parts = self.libid.split("#")
+        try:
+            major, minor = parts[1].split(".", 1)
+            return int(major, 16), int(minor, 16)
+        except (IndexError, ValueError):
+            return (0, 0)
+
+    @property
+    def path(self) -> str:
+        parts = self.libid.split("#")
+        return parts[3] if len(parts) > 3 else ""
+
+    @property
+    def description(self) -> str:
+        parts = self.libid.split("#")
+        return parts[4] if len(parts) > 4 else ""
+
+
+def _prefer_unicode(ansi: str, unicode_value: str) -> str:
+    """Return the authoritative value of an ANSI / UTF-16 dir record pair.
+
+    The UTF-16 partner record is lossless by construction, while the ANSI
+    record is limited to the project's code page.  When the two disagree
+    the ANSI side is the damaged one -- either its bytes were undecodable
+    (U+FFFD) or the writer had already substituted ``?`` for characters
+    outside the page -- so the Unicode record wins (GitHub issue #12).
+    Well-formed files carry identical values and are unaffected.
+    """
+    cleaned = unicode_value.rstrip("\x00")
+    if cleaned and cleaned != ansi:
+        return cleaned
+    return ansi
 
 
 def _parse_dir_stream(raw: bytes) -> tuple[_DirInfo, list[_ModuleInfo]]:
@@ -604,16 +671,28 @@ def _parse_dir_stream(raw: bytes) -> tuple[_DirInfo, list[_ModuleInfo]]:
             # Do not commit: REFERENCEORIGINAL is always followed by REFERENCECONTROL.
 
         # ------------- MODULE records -----------------------------
+        # Each MBCS record is followed by its UTF-16 partner.  When the
+        # MBCS decode was lossy -- the project's code page could not
+        # represent the name, or the file declares a page we could not
+        # resolve -- the Unicode record is the authoritative lossless
+        # value, so prefer it (GitHub issue #12).
         elif record_id == 0x0047 and current is not None: # MODULENAMEUNICODE
             current.name_unicode = data.decode("utf-16-le", errors="replace")
+            current.name = _prefer_unicode(current.name, current.name_unicode)
         elif record_id == 0x001A and current is not None: # MODULESTREAMNAME
             current.stream_name = data.decode(_enc(), errors="replace")
         elif record_id == 0x0032 and current is not None: # MODULESTREAMNAME unicode
             current.stream_name_unicode = data.decode("utf-16-le", errors="replace")
+            current.stream_name = _prefer_unicode(
+                current.stream_name, current.stream_name_unicode
+            )
         elif record_id == 0x001C and current is not None: # MODULEDOCSTRING (MBCS)
             current.doc_string = data.decode(_enc(), errors="replace")
         elif record_id == 0x0048 and current is not None: # MODULEDOCSTRINGUNICODE
             current.doc_string_unicode = data.decode("utf-16-le", errors="replace")
+            current.doc_string = _prefer_unicode(
+                current.doc_string, current.doc_string_unicode
+            )
         elif record_id == 0x0031 and current is not None: # MODULEOFFSET
             if len(data) >= 4:
                 current.text_offset = int(struct.unpack_from("<I", data, 0)[0])
@@ -678,35 +757,101 @@ class _DirInfo:
 # Public data model
 # ---------------------------------------------------------------------------
 
-@dataclass
 class VBAModule:
-    """A parsed VBA module with its source code."""
-    name: str
-    stream_name: str
-    source: str
-    kind: VBAModuleKind = VBAModuleKind.standard
-    text_offset: int = 0
-    is_read_only: bool = False
-    is_private: bool = False
-    # Dir-stream sub-records preserved for round-trip serialization.
-    name_unicode: str = ""
-    stream_name_unicode: str = ""
-    doc_string: str = ""
-    doc_string_unicode: str = ""
-    help_context: int = 0
-    cookie: int = 0
-    # Original bytes 0..text_offset of the module stream (performance cache
-    # / version-dependent prefix).  Preserved across write-back so that
-    # Office's cache invalidation logic operates the same way as it would
-    # for an untouched stream.
-    prefix_bytes: bytes = field(default=b"", repr=False)
-    # Whether the source has been edited and needs to be recompressed on save.
-    dirty: bool = field(default=False, repr=False)
-    # Cached attribute header captured at parse time so a body-only source
-    # replacement (the VBE-style edit surface) can re-prepend the required
-    # ``Attribute VB_*`` / ``VERSION ... CLASS`` block.  Re-derived on demand
-    # when missing via ``split_attribute_header(self.source)``.
-    attribute_header: str = field(default="", repr=False)
+    """A parsed VBA module with its source code.
+
+    ``source`` may be materialized lazily: modules produced by
+    :func:`parse_vba_project` defer the MS-OVBA decompression of their
+    stream until the first ``.source`` access (issue #5 — decompression
+    is 88-96% of the cost of opening a project, and callers that only
+    want names, kinds, or one module out of many should not pay for all
+    of it).  Constructing a module with an explicit ``source`` string is
+    fully eager and behaves exactly as before.  One consequence of
+    laziness: a corrupt chunk past the first one raises
+    :class:`VBAProjectError` at first access rather than at parse time.
+    """
+
+    def __init__(
+        self,
+        name: str,
+        stream_name: str,
+        source: str = "",
+        kind: VBAModuleKind = VBAModuleKind.standard,
+        text_offset: int = 0,
+        is_read_only: bool = False,
+        is_private: bool = False,
+        # Dir-stream sub-records preserved for round-trip serialization.
+        name_unicode: str = "",
+        stream_name_unicode: str = "",
+        doc_string: str = "",
+        doc_string_unicode: str = "",
+        help_context: int = 0,
+        cookie: int = 0,
+        # Original bytes 0..text_offset of the module stream (performance
+        # cache / version-dependent prefix).  Preserved across write-back
+        # so that Office's cache invalidation logic operates the same way
+        # as it would for an untouched stream.
+        prefix_bytes: bytes = b"",
+        # Whether the source has been edited and needs recompression on save.
+        dirty: bool = False,
+        # Cached attribute header captured at parse time so a body-only
+        # source replacement (the VBE-style edit surface) can re-prepend
+        # the required ``Attribute VB_*`` block.  Re-derived on demand when
+        # missing via ``split_attribute_header(self.source)``.
+        attribute_header: str = "",
+        source_loader: Callable[[], str] | None = None,
+    ) -> None:
+        self.name = name
+        self.stream_name = stream_name
+        self.kind = kind
+        self.text_offset = text_offset
+        self.is_read_only = is_read_only
+        self.is_private = is_private
+        self.name_unicode = name_unicode
+        self.stream_name_unicode = stream_name_unicode
+        self.doc_string = doc_string
+        self.doc_string_unicode = doc_string_unicode
+        self.help_context = help_context
+        self.cookie = cookie
+        self.prefix_bytes = prefix_bytes
+        self.dirty = dirty
+        self.attribute_header = attribute_header
+        if source_loader is not None:
+            self._source: str | None = None
+            self._source_loader: Callable[[], str] | None = source_loader
+        else:
+            self._source = source
+            self._source_loader = None
+
+    def __repr__(self) -> str:
+        return (
+            f"VBAModule(name={self.name!r}, stream_name={self.stream_name!r}, "
+            f"kind={self.kind!r}, text_offset={self.text_offset}, "
+            f"source_loaded={self._source is not None})"
+        )
+
+    @property
+    def source_loaded(self) -> bool:
+        """True once the source text is materialized in memory."""
+        return self._source is not None
+
+    @property
+    def source(self) -> str:
+        """The module's full source text (header plus body).
+
+        Materializes lazily on first access for parsed modules.
+        """
+        if self._source is None:
+            loader = self._source_loader
+            assert loader is not None, "lazy module lost its loader"
+            self._source = loader()
+            self._source_loader = None
+        return self._source
+
+    @source.setter
+    def source(self, value: str) -> None:
+        self._source = value
+        self._source_loader = None
 
     @property
     def body(self) -> str:
@@ -747,6 +892,23 @@ class VBAModule:
         )
 
 
+#: Names the VBE will not give a module (VBComponents.Add fails with
+#: 0x800AC3D4), measured in 64-bit Excel 16.0 (issue #40), and refused by a
+#: rename too, which would make the same module.  A
+#: module so named still compiles, but code can never name it: ``Print.Hi``
+#: is a syntax error and ``Me.Hi`` an invalid use of Me.  Line, Width, Name,
+#: Err, Mid, Time, Error, Reset, Beep, Load and Unload are accepted.
+VBE_REFUSED_MODULE_NAMES = frozenset({
+    "circle", "pset", "scale", "print", "seek", "input", "get", "put", "open",
+    "tab", "spc", "debug", "me", "array", "lbound", "date", "stop",
+})
+
+
+def _check_module_name(name: str) -> None:
+    if name.casefold() in VBE_REFUSED_MODULE_NAMES:
+        raise ValueError(f"The VBE refuses {name!r} as a module name.")
+
+
 @dataclass
 class VBAProject:
     """Represents a parsed VBA project."""
@@ -775,6 +937,7 @@ class VBAProject:
     pending_deletes: set[str] = field(default_factory=lambda: set(), repr=False)
     # Set whenever the module list's identity changes (add/rename/delete).
     dir_structure_dirty: bool = field(default=False, repr=False)
+    dir_references_dirty: bool = field(default=False, repr=False)
 
     def get_module(self, name: str) -> VBAModule:
         needle = name.casefold()
@@ -817,8 +980,10 @@ class VBAProject:
         ``Attribute VB_Base`` ensured), so ``.cls`` files exported from
         the VBE are accepted as-is.  See :func:`normalize_class_source`.
 
-        Raises ``ValueError`` if a module with that name already exists.
+        Raises ``ValueError`` if a module with that name already exists, or
+        if the VBE refuses the name (see :data:`VBE_REFUSED_MODULE_NAMES`).
         """
+        _check_module_name(name)
         needle = name.casefold()
         if any(m.name.casefold() == needle for m in self.modules):
             raise ValueError(f"Module already exists: {name!r}")
@@ -884,6 +1049,7 @@ class VBAProject:
         module = self.get_module(old_name)
         if module.name == new_name:
             return module
+        _check_module_name(new_name)
         needle = new_name.casefold()
         if needle != module.name.casefold() and any(
             m.name.casefold() == needle for m in self.modules
@@ -997,13 +1163,146 @@ class VBAProject:
 # Write-back helpers
 # ---------------------------------------------------------------------------
 
-def _encoding_for_codepage(code_page: int) -> str:
+# Windows code-page identifiers whose portable Python codec is not
+# spelled ``cp<N>``.
+#
+# These aliases are not merely a convenience: on Windows, CPython falls
+# through to the operating system's code-page registry, so ``cp28592``
+# and friends resolve there but raise LookupError on Linux and macOS.
+# Relying on the ``cp<N>`` spelling therefore makes a project's text
+# decode correctly on one platform and turn into latin-1 mojibake on
+# another -- a platform-dependent data bug (caught by the cross-OS
+# language-matrix CI job on its first run; see GitHub issue #13).
+# Consulting this table first keeps behavior identical everywhere.
+#
+# Pages VBA hosts write that Python does spell ``cp<N>`` portably (874,
+# 932, 936, 949, 950, 1250-1258, 1361, 65001) are deliberately absent.
+_CODEPAGE_ALIASES: dict[int, str] = {
+    # Macintosh
+    10000: "mac_roman",
+    10004: "mac_arabic",
+    10006: "mac_greek",
+    10007: "mac_cyrillic",
+    10010: "mac_romanian",
+    10029: "mac_latin2",
+    10079: "mac_iceland",
+    10081: "mac_turkish",
+    10082: "mac_croatian",
+    # KOI8
+    20866: "koi8_r",
+    21866: "koi8_u",
+    # ISO 8859
+    28591: "iso8859_1",
+    28592: "iso8859_2",
+    28593: "iso8859_3",
+    28594: "iso8859_4",
+    28595: "iso8859_5",
+    28596: "iso8859_6",
+    28597: "iso8859_7",
+    28598: "iso8859_8",
+    28599: "iso8859_9",
+    28603: "iso8859_13",
+    28605: "iso8859_15",
+    # ISO 2022 / EUC / GB / misc
+    50220: "iso2022_jp",
+    50225: "iso2022_kr",
+    51932: "euc_jp",
+    51936: "gb2312",
+    51949: "euc_kr",
+    52936: "hz",
+    54936: "gb18030",
+    65000: "utf_7",
+}
+
+
+def encoding_for_codepage(code_page: int) -> str:
+    """Map a PROJECTCODEPAGE value to a Python codec name.
+
+    Falls back to ``latin-1`` for pages Python cannot resolve, warning
+    so the degradation is visible: silently decoding a foreign code page
+    as latin-1 produces mojibake that survives round-trip checks (see
+    GitHub issue #12).
+    """
+    alias = _CODEPAGE_ALIASES.get(code_page)
+    if alias is not None:
+        return alias
+    encoding = f"cp{code_page}"
     try:
-        encoding = f"cp{code_page}"
-        "".encode(encoding)
+        codecs.lookup(encoding)
     except LookupError:
-        encoding = "latin-1"
+        warnings.warn(
+            f"No Python codec for VBA code page {code_page}; falling back "
+            "to latin-1.  Text outside the Latin-1 range will be mojibake. "
+            "Please report this code page at "
+            "https://github.com/WilliamSmithEdward/pyOpenVBA/issues",
+            UserWarning,
+            stacklevel=3,
+        )
+        return "latin-1"
     return encoding
+
+
+def encode_mbcs(text: str, encoding: str) -> bytes:
+    """Encode ``text`` to an MBCS code page, salvaging composed characters.
+
+    Equivalent to ``text.encode(encoding, errors="replace")`` except for
+    characters the codec cannot represent directly but *can* represent as
+    a base character plus combining marks.  Python's charmap codecs do no
+    composition, so Vietnamese text destined for cp1258 loses every
+    stacked-diacritic character:
+
+        'Tiếng Việt'.encode('cp1258', errors='replace')
+        -> b'Ti?ng Vi?t'
+
+    cp1258 stores ``ệ`` as precomposed ``ê`` (0xEA) plus a combining
+    dot-below byte (0xF2), which is *not* the character's canonical
+    decomposition, so NFD alone does not help either.  For each
+    unmappable character this helper decomposes to NFD and tries folding
+    each combining mark back into the base in turn, keeping the first
+    combination the codec accepts and emitting the remaining marks as
+    combining bytes.  Decoding those bytes yields a canonically
+    equivalent (NFD-ish) string, so compare with NFC normalization.
+
+    Characters that remain unmappable become ``?``, matching
+    ``errors="replace"``.  Text that the codec already encodes directly
+    is returned byte-for-byte unchanged, so this never alters output for
+    projects that work today.
+    """
+    try:
+        return text.encode(encoding)
+    except UnicodeEncodeError:
+        pass
+    out = bytearray()
+    for ch in text:
+        try:
+            out += ch.encode(encoding)
+            continue
+        except UnicodeEncodeError:
+            pass
+        decomposed = unicodedata.normalize("NFD", ch)
+        if len(decomposed) > 1:
+            base, marks = decomposed[0], list(decomposed[1:])
+            folded: bytes | None = None
+            for i, mark in enumerate(marks):
+                combined = unicodedata.normalize("NFC", base + mark)
+                if len(combined) != 1:
+                    continue   # this mark does not compose with the base
+                rest = "".join(marks[:i] + marks[i + 1:])
+                try:
+                    folded = combined.encode(encoding) + rest.encode(encoding)
+                except UnicodeEncodeError:
+                    continue
+                break
+            if folded is not None:
+                out += folded
+                continue
+            try:
+                out += decomposed.encode(encoding)
+                continue
+            except UnicodeEncodeError:
+                pass
+        out += ch.encode(encoding, errors="replace")
+    return bytes(out)
 
 
 def split_attribute_header(source: str) -> tuple[str, str]:
@@ -1181,19 +1480,21 @@ def normalize_class_source(source: str, *, prior_header: str = "") -> str:
     return "".join(header_lines) + body
 
 
-def rebuild_module_stream(module: VBAModule, code_page: int) -> bytes:
-    """
-    Rebuild a module stream by preserving the original ``[0:text_offset]``
-    performance-cache prefix and replacing ``[text_offset:]`` with a freshly
-    compressed copy of ``module.source``.
+# Internal alias: this helper predates being needed outside this
+# module (access_read decodes Access identifiers and source text with
+# it), so the public name is the canonical one.
+_encoding_for_codepage = encoding_for_codepage
 
-    The replacement is byte-exact in the prefix region, so any cache-
-    invalidation logic that Office performs on the prefix remains valid.
+
+def rebuild_module_stream(module: VBAModule, code_page: int) -> bytes:
+    """Compress source without the old compiled performance cache.
+
+    A rewritten module starts at MODULEOFFSET 0. The caller must update
+    its metadata and the project's dir stream when replacing an old stream.
+    Keeping the old prefix would leave removed source text recoverable.
     """
     encoding = _encoding_for_codepage(code_page)
-    source_bytes = module.source.encode(encoding, errors="replace")
-    compressed = compress(source_bytes)
-    return module.prefix_bytes + compressed
+    return compress(encode_mbcs(module.source, encoding))
 
 
 def write_back_modules(cfb: CFB, project: VBAProject) -> None:
@@ -1206,6 +1507,10 @@ def write_back_modules(cfb: CFB, project: VBAProject) -> None:
             continue
         new_stream = rebuild_module_stream(m, project.code_page)
         cfb.write_stream_in_storage("VBA", m.stream_name, new_stream)
+        if m.text_offset:
+            project.dir_structure_dirty = True
+        m.text_offset = 0
+        m.prefix_bytes = b""
         m.dirty = False
 
 
@@ -1243,11 +1548,11 @@ def serialize_dir_modules_section(project: VBAProject) -> bytes:
         name_u = m.name_unicode or m.name
         stream = m.stream_name or m.name
         stream_u = m.stream_name_unicode or stream
-        out += _pack_record(0x0019, name.encode(enc, errors="replace"))
+        out += _pack_record(0x0019, encode_mbcs(name, enc))
         out += _pack_record(0x0047, name_u.encode("utf-16-le"))
-        out += _pack_record(0x001A, stream.encode(enc, errors="replace"))
+        out += _pack_record(0x001A, encode_mbcs(stream, enc))
         out += _pack_record(0x0032, stream_u.encode("utf-16-le"))
-        out += _pack_record(0x001C, m.doc_string.encode(enc, errors="replace"))
+        out += _pack_record(0x001C, encode_mbcs(m.doc_string, enc))
         out += _pack_record(0x0048, m.doc_string_unicode.encode("utf-16-le"))
         out += _pack_record(0x0031, struct.pack("<I", m.text_offset))
         out += _pack_record(0x001E, struct.pack("<I", m.help_context))
@@ -1301,12 +1606,17 @@ def serialize_dir_stream(project: VBAProject) -> bytes:
 # PROJECT-stream writer (Gate 6 persistence)
 # ---------------------------------------------------------------------------
 
+#: The package of the Microsoft Forms designer, which a PROJECT stream names once for its UserForms.
+_FORMS_PACKAGE = "{AC9F2F90-E877-11CE-9F68-00AA00574A4F}"
+
+
 def serialize_project_stream(
     raw: bytes,
     rename_map: dict[str, str],
     *,
     add_modules: list[tuple[str, str]] | None = None,
     delete_names: set[str] | None = None,
+    code_page: int = 1252,
 ) -> bytes:
     """
     Rewrite a PROJECT stream's plain-text body to apply pending mutations.
@@ -1317,19 +1627,34 @@ def serialize_project_stream(
         and keys inside ``[Workspace]``.
     ``add_modules``:
         Sequence of ``(name, declaration_key)`` pairs where ``declaration_key``
-        is either ``"Module"`` (standard) or ``"Class"`` (class / other).
-        Each pair is appended as ``"<key>=<name>"`` after the existing
-        declarations and a matching ``[Workspace]`` entry is appended.
+        is ``"Module"`` (standard), ``"Class"`` (class / other),
+        ``"BaseClass"`` (a form) or ``"Document"`` (a workbook, sheet or
+        document module).  Each pair is appended as ``"<key>=<name>"``,
+        a document as ``"Document=<name>/&H00000000"`` as Office writes
+        one, after the existing declarations, and a matching
+        ``[Workspace]`` entry is appended.
     ``delete_names``:
         Logical names to remove.  Any ``Module=NAME`` / ``Class=NAME`` /
         ``BaseClass=NAME`` / ``Document=NAME/...`` line with a matching name
         is dropped, as is any ``[Workspace]`` key with that name.
 
-    Everything else (``ID``, ``Name``, ``CMG``, ``DPB``, ``GC``,
-    ``[Host Extender Info]``) is preserved byte-for-byte except for the
-    targeted substitutions.
+    A form added to a stream with no Forms ``Package=`` line gets one
+    immediately before its ``BaseClass=`` line, as the editor writes it
+    with a project's first form; an existing one stays where it is, even
+    when no form is left (tests/fixtures/project_package.json).
 
-    Returns cp1252-encoded bytes with CRLF line endings.
+    Every line no substitution touches (``ID``, ``Name``, ``CMG``,
+    ``DPB``, ``GC``, ``[Host Extender Info]``, the untouched declarations
+    and ``[Workspace]`` entries) is preserved byte-for-byte, whitespace
+    included.
+
+    ``code_page``:
+        PROJECTCODEPAGE of the owning project.  The PROJECT stream is
+        code-page ANSI per [MS-OVBA] 2.3.1, so its ``Module=`` /
+        ``Document=`` declarations carry module names in that page.
+        Defaults to 1252 for callers that have no project handy.
+
+    Returns code-page-encoded bytes with CRLF line endings.
     """
     add_modules = add_modules or []
     delete_names = delete_names or set()
@@ -1337,10 +1662,8 @@ def serialize_project_stream(
     # callers may invoke this to run the dedup/normalization pass on a
     # PROJECT stream that was previously corrupted by buggy writes (e.g.
     # duplicate ``Module=NAME`` lines from a delete-then-readd flow).
-    try:
-        text = raw.decode("cp1252", errors="replace")
-    except LookupError:
-        text = raw.decode("latin-1", errors="replace")
+    encoding = _encoding_for_codepage(code_page)
+    text = raw.decode(encoding, errors="replace")
 
     rename_ci: dict[str, str] = {k.casefold(): v for k, v in rename_map.items()}
     delete_ci: set[str] = {n.casefold() for n in delete_names}
@@ -1362,6 +1685,8 @@ def serialize_project_stream(
     # Track where [Workspace] block sits so we can append new entries to it.
     workspace_idx = -1
     workspace_end_idx = -1
+
+    has_forms_package = False
 
     for line in text.splitlines():
         stripped = line.strip()
@@ -1389,7 +1714,9 @@ def serialize_project_stream(
             if ws_key in seen_workspace:
                 continue
             seen_workspace.add(ws_key)
-            out_lines.append(f"{new_key}={value.strip()}")
+            # The value is a code window's place and state, and Excel ends one with a space when the state is
+            # empty: kept as written, whatever the key becomes.
+            out_lines.append(line if new_key == key_s else f"{new_key}={line.partition('=')[2]}")
             continue
         if key_s in ("Module", "Class", "BaseClass"):
             v = value.strip()
@@ -1400,7 +1727,7 @@ def serialize_project_stream(
             if decl_key in seen_decls:
                 continue
             seen_decls.add(decl_key)
-            out_lines.append(f"{key_s}={new_val}")
+            out_lines.append(line if new_val == v else f"{key_s}={new_val}")
             last_decl_idx = len(out_lines) - 1
             continue
         if key_s == "Document":
@@ -1412,7 +1739,14 @@ def serialize_project_stream(
             if decl_key in seen_decls:
                 continue
             seen_decls.add(decl_key)
-            out_lines.append(f"Document={new_name}{sep}{id_part}")
+            out_lines.append(line if new_name == name_part else f"Document={new_name}{sep}{id_part}")
+            last_decl_idx = len(out_lines) - 1
+            continue
+        if key_s == "Package":
+            # A package is a project item as a module is: what the editor adds goes after it, even when it is
+            # left last with its forms removed (tests/fixtures/project_package.json).
+            has_forms_package = has_forms_package or value.strip().upper() == _FORMS_PACKAGE
+            out_lines.append(line)
             last_decl_idx = len(out_lines) - 1
             continue
         out_lines.append(line)
@@ -1429,7 +1763,12 @@ def serialize_project_stream(
     ]
     if fresh_adds:
         insert_at = last_decl_idx + 1 if last_decl_idx >= 0 else _project_section_end(out_lines)
-        new_decl_lines = [f"{decl_key}={name}" for name, decl_key in fresh_adds]
+        new_decl_lines: list[str] = []
+        for name, decl_key in fresh_adds:
+            if decl_key == "BaseClass" and not has_forms_package:
+                new_decl_lines.append(f"Package={_FORMS_PACKAGE}")
+                has_forms_package = True
+            new_decl_lines.append(f"Document={name}/&H00000000" if decl_key == "Document" else f"{decl_key}={name}")
         out_lines[insert_at:insert_at] = new_decl_lines
         for name, _ in fresh_adds:
             seen_decls.add(name.casefold())
@@ -1454,7 +1793,7 @@ def serialize_project_stream(
                 for name, _ in ws_new:
                     seen_workspace.add(name.casefold())
 
-    return ("\r\n".join(out_lines) + "\r\n").encode("cp1252", errors="replace")
+    return encode_mbcs("\r\n".join(out_lines) + "\r\n", encoding)
 
 
 def _project_section_end(lines: list[str]) -> int:
@@ -1470,12 +1809,31 @@ def _project_section_end(lines: list[str]) -> int:
 # Public factory
 # ---------------------------------------------------------------------------
 
+def _make_source_loader(
+    compressed: bytes, encoding: str, stream_name: str
+) -> Callable[[], str]:
+    """Build the deferred decompress-and-decode thunk for a lazy module."""
+    def _load() -> str:
+        return decompress(compressed, stream_name=stream_name).decode(
+            encoding, errors="replace"
+        )
+    return _load
+
+
 def parse_vba_project(cfb: CFB) -> VBAProject:
     """
-    Extract and decompress all VBA module sources from a parsed CFB.
+    Extract all VBA module metadata from a parsed CFB.
 
     The CFB must be the vbaProject.bin from an xlsm/xlsb, or the whole
     file for an xls workbook.
+
+    Module source text is loaded lazily: only the first compressed
+    chunk of each module stream is decompressed here (enough for the
+    ``Attribute VB_*`` header, and for single-chunk modules it is
+    already the whole source).  The remaining chunks decompress on the
+    first ``VBAModule.source`` access.  Stream lookup and MODULEOFFSET
+    bounds checks stay eager so structural corruption still surfaces at
+    parse time.
     """
     try:
         dir_compressed = cfb.get_stream_in_storage("VBA", "dir")
@@ -1510,17 +1868,47 @@ def parse_vba_project(cfb: CFB) -> VBAProject:
                 f"{len(stream_compressed)} for module {info.name!r}."
             )
 
-        compressed_source = stream_compressed[info.text_offset:]
-        source_bytes = decompress(
-            compressed_source, stream_name=f"VBA/{stream_name}"
+        compressed_source = bytes(stream_compressed[info.text_offset:])
+        ovba_name = f"VBA/{stream_name}"
+
+        # Decompress just the first chunk.  For single-chunk modules
+        # (decompressed size <= 4096) this is the complete source and
+        # the module is materialized eagerly with zero extra work.
+        prefix_raw, consumed_all = _decompress(
+            compressed_source, stream_name=ovba_name, max_bytes=1
         )
-        source = source_bytes.decode(encoding, errors="replace")
-        header, _ = split_attribute_header(source)
+        prefix_text = prefix_raw.decode(encoding, errors="replace")
+
+        source: str | None
+        loader: Callable[[], str] | None
+        if consumed_all:
+            source = prefix_text
+            header, _ = split_attribute_header(prefix_text)
+            loader = None
+        else:
+            header, body_prefix = split_attribute_header(prefix_text)
+            if header and body_prefix:
+                # Header fits inside the first chunk (the normal case);
+                # defer the rest of the stream.
+                source = None
+                loader = _make_source_loader(
+                    compressed_source, encoding, ovba_name
+                )
+            else:
+                # Either no attribute header at all, or the header runs
+                # to the chunk boundary and may be truncated.  Both are
+                # abnormal; fall back to eager full decompression so
+                # attribute_header is always derived from complete text.
+                source = decompress(
+                    compressed_source, stream_name=ovba_name
+                ).decode(encoding, errors="replace")
+                header, _ = split_attribute_header(source)
+                loader = None
 
         modules.append(VBAModule(
             name=info.name,
             stream_name=stream_name,
-            source=source,
+            source=source if source is not None else "",
             kind=info.module_kind,
             text_offset=info.text_offset,
             is_read_only=info.is_read_only,
@@ -1531,8 +1919,9 @@ def parse_vba_project(cfb: CFB) -> VBAProject:
             doc_string_unicode=info.doc_string_unicode,
             help_context=info.help_context,
             cookie=info.cookie,
-            prefix_bytes=stream_compressed[: info.text_offset],
+            prefix_bytes=bytes(stream_compressed[: info.text_offset]),
             attribute_header=header,
+            source_loader=loader,
         ))
 
     project = VBAProject(modules=modules, code_page=code_page)
@@ -1550,7 +1939,7 @@ def parse_vba_project(cfb: CFB) -> VBAProject:
         project_stream_raw = None
     if project_stream_raw is not None:
         try:
-            ps = parse_project_stream(project_stream_raw)
+            ps = parse_project_stream(project_stream_raw, code_page=code_page)
             project.protection = ps.protection
         except VBAProjectError:
             pass
@@ -1592,17 +1981,16 @@ class ProjectStream:
     host_extender_info: list[str] = field(default_factory=lambda: [])
 
 
-def parse_project_stream(raw: bytes) -> ProjectStream:
+def parse_project_stream(raw: bytes, *, code_page: int = 1252) -> ProjectStream:
     """Parse the plain-text PROJECT stream.
 
-    The PROJECT stream is Windows-1252 encoded key=value text terminated
-    by CRLF.  Empty lines separate the project information block, the
-    ``[Host Extender Info]`` block, and the ``[Workspace]`` block.
+    The PROJECT stream is code-page ANSI key=value text terminated by
+    CRLF ([MS-OVBA] 2.3.1); pass the project's PROJECTCODEPAGE as
+    ``code_page`` so non-Latin module names decode correctly.  Empty
+    lines separate the project information block, the ``[Host Extender
+    Info]`` block, and the ``[Workspace]`` block.
     """
-    try:
-        text = raw.decode("cp1252", errors="replace")
-    except LookupError:
-        text = raw.decode("latin-1", errors="replace")
+    text = raw.decode(_encoding_for_codepage(code_page), errors="replace")
 
     out = ProjectStream()
     section = "project"  # "project" | "host_extender" | "workspace"
@@ -1671,8 +2059,14 @@ def parse_project_stream(raw: bytes) -> ProjectStream:
 # PROJECTwm stream parser ([MS-OVBA] 2.3.4.4)
 # ---------------------------------------------------------------------------
 
-def parse_projectwm(raw: bytes) -> list[tuple[str, str]]:
+def parse_projectwm(
+    raw: bytes, *, code_page: int = 1252
+) -> list[tuple[str, str]]:
     """Parse the PROJECTwm stream into (mbcs_name, unicode_name) pairs.
+
+    ``code_page`` selects the MBCS codec for the first name in each pair;
+    pass the project's PROJECTCODEPAGE so non-Latin names decode
+    correctly.
 
     Format:
         loop:
@@ -1701,10 +2095,9 @@ def parse_projectwm(raw: bytes) -> list[tuple[str, str]]:
             pos += 2
         unicode_name = raw[start:pos].decode("utf-16-le", errors="replace")
         pos += 2   # skip the u16=0 terminator
-        try:
-            mbcs_name = mbcs.decode("cp1252", errors="replace")
-        except LookupError:
-            mbcs_name = mbcs.decode("latin-1", errors="replace")
+        mbcs_name = mbcs.decode(
+            _encoding_for_codepage(code_page), errors="replace"
+        )
         out.append((mbcs_name, unicode_name))
     return out
 
@@ -1728,7 +2121,7 @@ def serialize_projectwm(
         if not mbcs:
             # An empty MBCS name would terminate the stream prematurely.
             continue
-        buf += mbcs.encode(enc, errors="replace")
+        buf += encode_mbcs(mbcs, enc)
         buf += b"\x00"
         buf += unicode_name.encode("utf-16-le", errors="replace")
         buf += b"\x00\x00"
@@ -1856,9 +2249,16 @@ def compute_v3_content_hash(project: VBAProject) -> bytes:
 
 @dataclass
 class SignatureInfo:
-    """Summary of digital-signature streams found inside a VBA CFB."""
+    """A VBA project's digital signature: whether it has one, of which kinds, and where.
+
+    :func:`detect_signature` looks inside the project's CFB. A zip-based
+    file keeps its signature in parts beside the project instead, which
+    the host files' ``vba_signature()`` also reads, listing them in
+    ``parts``.
+    """
     present: bool = False
     kinds: list[str] = field(default_factory=lambda: [])   # "legacy" | "agile" | "v3"
+    parts: list[str] = field(default_factory=lambda: [])   # package parts holding it, in a zip-based file
 
 
 _SIGNATURE_STREAM_NAMES = {
@@ -1915,6 +2315,11 @@ def detect_signature(cfb: CFB) -> SignatureInfo:
     the three known signature streams are present inside the
     ``_VBA_PROJECT_CUR/VBA`` storage path (xlsm/xlsb) or the root
     (legacy xls embedding).
+
+    Excel, Word and PowerPoint do not sign a zip-based file this way:
+    they keep the signature in parts beside ``vbaProject.bin``, which a
+    CFB cannot show. ``ExcelFile.vba_signature()`` and its Word and
+    PowerPoint counterparts read both.
     """
     info = SignatureInfo()
     candidates: list[str] = []

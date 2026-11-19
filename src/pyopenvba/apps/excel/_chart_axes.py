@@ -1,0 +1,1240 @@
+"""Measured primary chart axes, with explicit manual scale configuration.
+
+Effective automatic scale values require native layout and are deliberately not
+invented. Imported chart contents remain protected by Chart.admit_change.
+"""
+
+from __future__ import annotations
+
+import math
+from collections.abc import Sequence
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
+
+from pyopenvba.exceptions import VBAUnsupportedError
+from pyopenvba.apps.excel._chart_title import TitleLook, TitleMembers
+from pyopenvba.apps.excel._chart_borders import INVALID_CALL, UNSPECIFIED, ElementProperties
+from pyopenvba.apps.excel._creator import Created, ItemDefault
+from pyopenvba.interpreter._objects import VBACollection, member, method, setter
+from pyopenvba.interpreter._values import (EMPTY, MISSING, NULL, VBAArray, VBAInt, error, to_bool, to_integer, to_number,
+                                           to_text)
+
+if TYPE_CHECKING:
+    from pyopenvba.apps.excel._charts import Chart, ChartState
+    from pyopenvba.apps.excel._model import Worksheet
+
+SUPPORTED = {51, 57, 4, 65, 1, -4169, 5, -4120, 52, 53, 58, 59, 63, 64, 66, 67, 76, 77}
+NO_AXES = {5, -4120}
+MAX_TITLE_TEXT = 32768
+
+
+@dataclass
+class TitleState:
+    text: str = "Axis Title"
+    #: False for Excel's automatic title, which the file holds with no text.
+    typed: bool = False
+    look: TitleLook = field(default_factory=TitleLook)
+
+
+@dataclass
+class AxisState:
+    kind: int
+    identifier: int
+    present: bool = True
+    numeric: bool = False
+    reverse: bool = False
+    minimum: float | None = None
+    maximum: float | None = None
+    major: float | None = None
+    title: TitleState | None = None
+    # The rest as the file spells them; None where an imported file spells them in a way the model does not read.
+    major_tick: str | None = "out"
+    minor_tick: str | None = "none"
+    label_position: str | None = "nextTo"
+    major_gridlines: bool = False
+    minor_gridlines: bool = False
+    #: TickLabels.NumberFormat once set, and whether the labels still follow their source; a label unlinked with no
+    #: format of its own writes no numFmt (tests/fixtures/chart_axis_parts.json).
+    number_format: str | None = None
+    format_linked: bool = True
+    #: Where the other axis crosses this one: autoZero, max, min, or custom at ``crosses_at``.
+    crosses: str | None = "autoZero"
+    crosses_at: float = 0.0
+    minor: float | None = None
+    #: None for a linear scale.
+    log_base: float | None = None
+    #: A DISPLAY_UNITS key, or None for none; DisplayUnitCustom's value; whether the unit is labelled.
+    display_unit: int | None = None
+    display_custom: float = 1.0
+    display_label: bool = False
+    #: AxisBetweenCategories once set; until then the chart's kind decides.
+    between: bool | None = None
+    label_skip: int | None = None
+    mark_skip: int | None = None
+    #: Which axes it belongs to; a secondary value axis crosses at the far side unless told otherwise, and reads that only
+    #: while its category axis shows (tests/fixtures/combo_charts.json).
+    group: int = 1
+    far_side: bool = False
+    #: A category axis's CategoryType (xlAutomaticScale, xlCategoryScale or xlTimeScale), its BaseUnit once set,
+    #: whether BaseUnitIsAuto still holds, and MajorUnitScale once set (tests/fixtures/chart_category_type.json).
+    category_type: int = -4105
+    base_unit: int | None = None
+    base_auto: bool = True
+    major_scale: int | None = None
+
+    @property
+    def tag(self) -> str:
+        """How the chart's looks and fonts name this axis's."""
+        return str(self.kind) if self.group == 1 else f'{self.kind}s'
+
+
+#: Axis.DisplayUnit and how the file spells it.
+DISPLAY_UNITS = {-2: "hundreds", -3: "thousands", -4: "tenThousands", -5: "hundredThousands", -6: "millions",
+                 -7: "tenMillions", -8: "hundredMillions", -9: "billions", -10: "trillions", -4114: "custom"}
+
+
+TICK_MARKS = {-4142: "none", 2: "in", 3: "out", 4: "cross"}
+LABEL_POSITIONS = {-4127: "high", -4134: "low", 4: "nextTo", -4142: "none"}
+CROSSINGS = {-4105: "autoZero", 2: "max", 4: "min", -4114: "custom"}
+
+
+def states(chart: Chart) -> dict[int, AxisState]:
+    chart.admit_read()
+    if not chart.state.axes_readable:
+        raise VBAUnsupportedError("Reading rich imported chart axis configuration is not implemented")
+    if chart.state.chart_type not in SUPPORTED:
+        raise VBAUnsupportedError("Primary axes for this chart type are not implemented")
+    if not chart.state.axes:
+        for kind, identifier in zip((1, 2), chart.state.axis_ids, strict=True):
+            chart.state.axes[kind] = AxisState(
+                kind,
+                identifier,
+                present=chart.state.chart_type not in NO_AXES,
+                numeric=kind == 2 or chart.state.chart_type == -4169,
+                major_gridlines=kind == 2,
+            )
+    return chart.state.axes
+
+
+def secondary_states(state: ChartState) -> dict[int, AxisState]:
+    """The axes a chart's first series on the secondary axes brings: a value axis showing and a category axis that does not."""
+    if not state.secondary_axes:
+        first, second = _random_ids(state)
+        state.secondary_axes = {1: AxisState(1, first, present=False, group=2, crosses='max'),
+                                2: AxisState(2, second, numeric=True, group=2, far_side=True)}
+    return state.secondary_axes
+
+
+def _random_ids(state: ChartState) -> tuple[int, int]:
+    from pyopenvba.apps.excel._chart_xml import axis_ids
+
+    while True:
+        first, second = axis_ids()
+        if not {first, second} & set(state.axis_ids):
+            return first, second
+
+
+def transition(chart: Chart, wanted: int) -> None:
+    if not chart.state.axes:
+        return
+    if wanted not in SUPPORTED:
+        raise VBAUnsupportedError("Changing a configured primary axis to this chart type is not implemented")
+    old = chart.state.chart_type
+    if old in NO_AXES and wanted not in NO_AXES:
+        for axis in chart.state.axes.values():
+            axis.minimum = axis.maximum = axis.major = None
+            axis.present = True
+    elif wanted in NO_AXES:
+        for axis in chart.state.axes.values():
+            axis.present = False
+    if wanted not in NO_AXES:
+        for axis in chart.state.axes.values():
+            axis.numeric = axis.kind == 2 or wanted == -4169
+
+
+def axis(chart: Chart, kind: object, group: object = MISSING) -> Axis:
+    kind_number = int(to_integer(kind, "Long"))
+    group_number = 1 if group is MISSING else int(to_integer(group, "Long"))
+    chart.admit_read()
+    if group_number == 2 and kind_number == 3 and chart.state.secondary_axes:
+        raise error(5, "Invalid procedure call or argument")
+    if group_number == 2 and kind_number in (1, 2) and chart.state.secondary_axes:
+        return Axis(chart, chart.state.secondary_axes[kind_number])
+    if kind_number not in (1, 2) or group_number != 1:
+        raise error(-2147467259, "Method 'Axes' of object '_Chart' failed")
+    return Axis(chart, states(chart)[kind_number], valid=chart.state.chart_type not in NO_AXES)
+
+
+class Axes(VBACollection, ItemDefault, Created):
+    vba_type_name = "Axes"
+
+    def __init__(self, chart: Chart) -> None:
+        self.chart = chart
+
+    def vba_items(self) -> list[object]:
+        primary = [Axis(self.chart, entry) for entry in states(self.chart).values() if entry.present]
+        state = self.chart.state
+        if not state.secondary_axes:
+            return list(primary)
+        # With secondary axes the value axis comes before the category axis of each (tests/fixtures/combo_charts.json).
+        return [*reversed(primary), *(Axis(self.chart, state.secondary_axes[kind]) for kind in (2, 1) if state.secondary_axes[kind].present)]
+
+    @member
+    def Application(self) -> object:
+        return self.chart.sheet.book.application
+
+    @member(default=True)
+    def Item(self, Type: object, AxisGroup: object = MISSING) -> object:  # noqa: N803 - native named arguments
+        return axis(self.chart, Type, AxisGroup)
+
+    @member
+    def Parent(self) -> object:
+        self.chart.admit_read()
+        return self.chart
+
+
+class Axis(ElementProperties, Created):
+    vba_type_name = "Axis"
+
+    def __init__(self, chart: Chart, entry: AxisState, *, valid: bool = True) -> None:
+        self.chart, self.entry, self.valid = chart, entry, valid
+
+    def read(self) -> None:
+        self.chart.admit_read()
+        if not self.valid:
+            # A chart without axes (tests/fixtures/chart_set_element.json).
+            raise error(-2147467261, "Automation error\nInvalid pointer")
+        held = self.chart.state.axes if self.entry.group == 1 else self.chart.state.secondary_axes
+        if held.get(self.entry.kind) is not self.entry:
+            raise error(440, "Automation error")
+
+    def change(self) -> None:
+        self.read()
+        if self.chart.state.original:
+            # What is built for a loaded chart goes through its own markup; the rest is refused where it would mark the chart changed.
+            from pyopenvba.apps.excel._chart_loaded import admit
+
+            admit(self.chart)
+        else:
+            self.chart.admit_change()
+
+    def scale(self, field: str = "") -> None:
+        self.read()
+        # A time-scale category axis takes a major unit as a value axis does (tests/fixtures/chart_category_type.json).
+        if not self.entry.numeric and not (field == "major" and self.timed()):
+            if self.entry.group == 2:
+                raise error(-2147467259, "Automation error\nUnspecified error")
+            raise error(440, "Automation error")
+
+    def timed(self) -> bool:
+        """Whether this is a category axis on a time scale: set to one, or automatic over dates."""
+        from pyopenvba.apps.excel._charts_file import dated_categories
+
+        if self.entry.numeric or self.chart.state.original:
+            return False
+        kind = self.entry.category_type
+        return kind == 3 or kind == -4105 and dated_categories(self.chart.sheet, self.chart.state)
+
+    def category(self) -> AxisState:
+        """The category axis these settings belong to; on a value axis Excel raises -2147467259."""
+        self.read()
+        if self.entry.numeric:
+            raise error(-2147467259, "Unspecified error")
+        if self.chart.state.original:
+            raise VBAUnsupportedError("Reading an imported chart's category scale is not implemented")
+        return self.entry
+
+    @member
+    def CategoryType(self) -> object:
+        return VBAInt(self.category().category_type, "Long")
+
+    @setter("CategoryType")
+    def _category_type(self, value: object) -> None:
+        entry = self.category()
+        self.change()
+        wanted = int(to_integer(value, "Long"))
+        if wanted not in (-4105, 2, 3):
+            raise error(1004, "Unable to set the CategoryType property of the Axis class")
+        self.chart.changed()
+        entry.category_type = wanted
+        entry.base_auto = False
+
+    @member
+    def BaseUnit(self) -> object:
+        return VBAInt(self.category().base_unit or 0, "Long")
+
+    @setter("BaseUnit")
+    def _base_unit(self, value: object) -> None:
+        entry = self.category()
+        self.change()
+        wanted = int(to_integer(value, "Long"))
+        if wanted not in (0, 1, 2):
+            raise error(-2147467259, "Unspecified error")
+        self.chart.changed()
+        entry.base_unit, entry.base_auto = wanted, False
+
+    @member
+    def BaseUnitIsAuto(self) -> object:
+        return self.category().base_auto
+
+    @setter("BaseUnitIsAuto")
+    def _base_unit_auto(self, value: object) -> None:
+        entry = self.category()
+        self.change()
+        wanted = to_bool(value)
+        if not wanted:
+            raise VBAUnsupportedError("Turning BaseUnitIsAuto off by itself is not implemented")
+        self.chart.changed()
+        entry.base_unit, entry.base_auto = None, True
+
+    @member
+    def MinorUnitScale(self) -> object:
+        """Reads 0 on a category axis over numbers, even with a time scale, and raises elsewhere
+        (tests/fixtures/trendline_members.json)."""
+        self.category_read()
+        return VBAInt(0, "Long")
+
+    @setter("MinorUnitScale")
+    def _minor_unit_scale(self, value: object) -> None:
+        raise error(-2147467259, "Automation error\nUnspecified error ")
+
+    def category_read(self) -> None:
+        self.read()
+        if self.entry.kind == 2 or self.chart.state.chart_type == -4169:
+            raise error(-2147467259, "Automation error\nUnspecified error ")
+
+    @member
+    def MajorUnitScale(self) -> object:
+        entry = self.category()
+        if entry.major_scale is None or entry.major is None:
+            # Left alone, Excel works the scale out from the chart's automatic scale.
+            raise VBAUnsupportedError("An automatic time scale's MajorUnitScale requires native layout")
+        return VBAInt(entry.major_scale, "Long")
+
+    @setter("MajorUnitScale")
+    def _major_unit_scale(self, value: object) -> None:
+        entry = self.category()
+        self.change()
+        wanted = int(to_integer(value, "Long"))
+        if wanted not in (0, 1, 2) or entry.major is None or not self.timed():
+            raise VBAUnsupportedError("MajorUnitScale without a major unit on a time axis is not implemented")
+        self.chart.changed()
+        entry.major_scale = wanted
+
+    @method
+    def Select(self) -> object:
+        from pyopenvba.apps.excel._charts import select_element
+
+        self.read()
+        return select_element(self.chart, self, True)
+
+    @member
+    def Parent(self) -> object:
+        self.chart.admit_read()
+        return self.chart
+
+    @member
+    def Application(self) -> object:
+        self.read()
+        return self.chart.sheet.book.application
+
+    @member
+    def CategorySortOrder(self) -> object:
+        # Only a pivot chart's category axis has a sort order (tests/fixtures/missing_reads.json).
+        self.read()
+        raise error(445, "Object doesn't support this action")
+
+    @member
+    def DisplayUnitLabel(self) -> object:
+        # An axis without a labelled display unit has no label to give (tests/fixtures/missing_reads.json).
+        self.read()
+        if self.entry.display_label:
+            raise VBAUnsupportedError("Axis.DisplayUnitLabel is not implemented")
+        raise error(1004, "Unable to get the DisplayUnitLabel property of the Axis class")
+
+    @member
+    def Type(self) -> object:
+        self.read()
+        return VBAInt(self.entry.kind, "Long")
+
+    @member
+    def AxisGroup(self) -> object:
+        self.read()
+        return VBAInt(self.entry.group, "Long")
+
+    @member
+    def HasTitle(self) -> object:
+        self.read()
+        return self.entry.title is not None
+
+    @setter("HasTitle")
+    def _title(self, value: object) -> None:
+        self.change()
+        wanted = to_bool(value)
+        self.change()
+        if self.chart.state.original:
+            from pyopenvba.apps.excel._chart_loaded import set_axis_title
+
+            try:
+                set_axis_title(self.chart, self.entry, wanted)
+            except VBAUnsupportedError:
+                # A new one on a chart with a style, as a new chart of its style takes it.
+                if not self.chart.whole_changed('Axis.HasTitle'):
+                    raise
+        else:
+            self.chart.keeps_look(f"title{self.entry.kind}", wanted)
+            self.chart.changed()
+        if wanted:
+            if self.entry.title is None:
+                self.entry.title = TitleState()
+        else:
+            self.entry.title = None
+
+    @member
+    def AxisTitle(self) -> object:
+        self.chart.admit_read()
+        if not self.valid or self.entry.title is None:
+            return AxisTitle(self, None)
+        return AxisTitle(self, self.entry.title)
+
+    @member
+    def ReversePlotOrder(self) -> object:
+        self.read()
+        return self.entry.reverse
+
+    @setter("ReversePlotOrder")
+    def _reverse(self, value: object) -> None:
+        self.change()
+        wanted = to_bool(value)
+        self.change()
+        self.chart.changed()
+        self.entry.reverse = wanted
+
+    def number(self, field: str) -> float:
+        self.scale(field)
+        value = getattr(self.entry, field)
+        if value is None:
+            raise VBAUnsupportedError("Effective automatic chart scales require native layout")
+        return value
+
+    def set_number(self, field: str, value: object) -> None:
+        self.scale(field)
+        self.change()
+        if value is NULL:
+            raise error(13)
+        wanted = float(to_number(value))
+        self.scale(field)
+        self.change()
+        if not math.isfinite(wanted):
+            raise VBAUnsupportedError("Nonfinite chart scales are not implemented")
+        if field == "major" and wanted <= 0:
+            raise error(440, "Automation error")
+        loaded = bool(self.chart.state.original) and field != "major"
+        if not loaded:
+            self.chart.changed()
+        setattr(self.entry, field, wanted)
+        if field == "minimum" and self.entry.maximum is not None and wanted >= self.entry.maximum:
+            self.entry.maximum = None
+        elif field == "maximum" and self.entry.minimum is not None and wanted <= self.entry.minimum:
+            self.entry.minimum = None
+        if loaded:
+            from pyopenvba.apps.excel._chart_loaded import rescale
+
+            rescale(self.chart, self.entry)
+
+    def automatic(self, field: str) -> bool:
+        self.scale()
+        return getattr(self.entry, field) is None
+
+    def set_automatic(self, field: str, value: object) -> None:
+        self.scale()
+        self.change()
+        wanted = to_bool(value)
+        self.scale()
+        self.change()
+        if not wanted and getattr(self.entry, field) is None:
+            raise VBAUnsupportedError("Freezing an effective automatic chart scale requires native layout")
+        loaded = bool(self.chart.state.original) and field != "major"
+        if not loaded:
+            self.chart.changed()
+        if wanted:
+            setattr(self.entry, field, None)
+        if loaded:
+            from pyopenvba.apps.excel._chart_loaded import rescale
+
+            rescale(self.chart, self.entry)
+
+    @member
+    def MinimumScale(self) -> object:
+        return self.number("minimum")
+
+    @setter("MinimumScale")
+    def _minimum(self, value: object) -> None:
+        self.set_number("minimum", value)
+
+    @member
+    def MaximumScale(self) -> object:
+        return self.number("maximum")
+
+    @setter("MaximumScale")
+    def _maximum(self, value: object) -> None:
+        self.set_number("maximum", value)
+
+    @member
+    def MajorUnit(self) -> object:
+        return self.number("major")
+
+    @setter("MajorUnit")
+    def _major(self, value: object) -> None:
+        self.set_number("major", value)
+
+    @member
+    def MinimumScaleIsAuto(self) -> object:
+        return self.automatic("minimum")
+
+    @setter("MinimumScaleIsAuto")
+    def _minimum_auto(self, value: object) -> None:
+        self.set_automatic("minimum", value)
+
+    @member
+    def MaximumScaleIsAuto(self) -> object:
+        return self.automatic("maximum")
+
+    @setter("MaximumScaleIsAuto")
+    def _maximum_auto(self, value: object) -> None:
+        self.set_automatic("maximum", value)
+
+    @member
+    def MajorUnitIsAuto(self) -> object:
+        return self.automatic("major")
+
+    @setter("MajorUnitIsAuto")
+    def _major_auto(self, value: object) -> None:
+        self.set_automatic("major", value)
+
+    def spelled(self, field: str, names: dict[int, str]) -> object:
+        self.read()
+        value = getattr(self.entry, field)
+        if value is None:
+            raise VBAUnsupportedError("Reading this imported chart axis setting is not implemented")
+        return VBAInt(next(number for number, name in names.items() if name == value), "Long")
+
+    def set_spelled(self, field: str, names: dict[int, str], value: object) -> None:
+        self.change()
+        wanted = names.get(int(to_integer(value, "Long")))
+        if wanted is None:
+            raise error(-2147467259, "Automation error\nUnspecified error")
+        self.chart.changed()
+        setattr(self.entry, field, wanted)
+
+    @member
+    def MajorTickMark(self) -> object:
+        if not self.valid:
+            # A chart without axes answers this one its own way (tests/fixtures/apply_layout.json).
+            raise error(-2147467259, "Automation error\nUnspecified error")
+        return self.spelled("major_tick", TICK_MARKS)
+
+    @setter("MajorTickMark")
+    def _major_tick(self, value: object) -> None:
+        self.set_spelled("major_tick", TICK_MARKS, value)
+
+    @member
+    def MinorTickMark(self) -> object:
+        return self.spelled("minor_tick", TICK_MARKS)
+
+    @setter("MinorTickMark")
+    def _minor_tick(self, value: object) -> None:
+        self.set_spelled("minor_tick", TICK_MARKS, value)
+
+    @member
+    def TickLabelPosition(self) -> object:
+        return self.spelled("label_position", LABEL_POSITIONS)
+
+    @setter("TickLabelPosition")
+    def _label_position(self, value: object) -> None:
+        self.set_spelled("label_position", LABEL_POSITIONS, value)
+
+    @member
+    def HasMajorGridlines(self) -> object:
+        self.read()
+        return self.entry.major_gridlines
+
+    @setter("HasMajorGridlines")
+    def _major_gridlines(self, value: object) -> None:
+        self.change()
+        wanted = to_bool(value)
+        if self.chart.state.original:
+            from pyopenvba.apps.excel._chart_loaded import set_gridlines
+
+            try:
+                set_gridlines(self.chart, self.entry, True, wanted)
+            except VBAUnsupportedError:
+                # New ones on a chart with a style, as a new chart of its style takes them.
+                if not self.chart.whole_changed('Axis.HasMajorGridlines'):
+                    raise
+        else:
+            self.chart.keeps_look(f"grid{self.entry.tag}", wanted)
+            self.chart.changed()
+        self.entry.major_gridlines = wanted
+
+    @member
+    def HasMinorGridlines(self) -> object:
+        self.read()
+        return self.entry.minor_gridlines
+
+    @setter("HasMinorGridlines")
+    def _minor_gridlines(self, value: object) -> None:
+        self.change()
+        wanted = to_bool(value)
+        if self.chart.state.original:
+            from pyopenvba.apps.excel._chart_loaded import set_gridlines
+
+            try:
+                set_gridlines(self.chart, self.entry, False, wanted)
+            except VBAUnsupportedError:
+                # New ones on a chart with a style, as a new chart of its style takes them.
+                if not self.chart.whole_changed('Axis.HasMinorGridlines'):
+                    raise
+        else:
+            self.chart.changed()
+        self.entry.minor_gridlines = wanted
+
+    @member
+    def Format(self) -> object:
+        self.read()
+        return self.chart.format_of(self, f"axis{self.entry.tag}")
+
+    @member
+    def Border(self) -> object:
+        return self.chart.border_of(self, f"axis{self.entry.tag}")
+
+    @member
+    def MajorGridlines(self) -> object:
+        # Reaching the gridlines never fails; reading them once the axis has none does
+        # (tests/fixtures/chart_axis_parts.json).
+        self.read()
+        return Gridlines(self, major=True)
+
+    @member
+    def MinorGridlines(self) -> object:
+        self.read()
+        return Gridlines(self, major=False)
+
+    @member
+    def TickLabels(self) -> object:
+        self.read()
+        return TickLabels(self)
+
+    @member
+    def Crosses(self) -> object:
+        if self.entry.group == 2 and not self.entry.present:
+            self.read()
+            raise error(-2147467259, "Automation error\nUnspecified error")
+        if self.entry.far_side:
+            self.read()
+            return VBAInt(2 if self.chart.state.secondary_axes[1].present else -4105, "Long")
+        return self.spelled("crosses", CROSSINGS)
+
+    @setter("Crosses")
+    def _crosses(self, value: object) -> None:
+        if self.entry.group == 2 and not self.entry.present:
+            self.read()
+            raise error(-2147467259, "Automation error\nUnspecified error")
+        self.set_spelled("crosses", CROSSINGS, value)
+        self.entry.far_side = False
+        if self.entry.crosses == "autoZero":
+            self.entry.crosses_at = 0.0
+
+    @member
+    def CrossesAt(self) -> object:
+        self.read()
+        if self.entry.crosses in ("max", "min") or self.entry.crosses is None:
+            raise VBAUnsupportedError("Where an axis crosses at its drawn maximum or minimum requires native layout")
+        return self.entry.crosses_at
+
+    @setter("CrossesAt")
+    def _crosses_at(self, value: object) -> None:
+        self.change()
+        if value is NULL:
+            raise error(13)
+        wanted = float(to_number(value))
+        if not math.isfinite(wanted):
+            raise VBAUnsupportedError("Nonfinite chart axis crossings are not implemented")
+        if not self.entry.numeric and not wanted.is_integer():
+            raise VBAUnsupportedError("Crossing a category axis between categories is not implemented")
+        self.chart.changed()
+        self.entry.far_side = False
+        self.entry.crosses, self.entry.crosses_at = "custom", wanted
+
+    def kind_only(self, numeric: bool) -> AxisState:
+        """The axis, where the member belongs to its kind; Excel raises -2147467259 on the other kind of axis."""
+        self.read()
+        if self.entry.numeric != numeric:
+            raise error(-2147467259, "Automation error\nUnspecified error")
+        return self.entry
+
+    @member
+    def MinorUnit(self) -> object:
+        entry = self.kind_only(True)
+        if entry.minor is None:
+            raise VBAUnsupportedError("Effective automatic chart scales require native layout")
+        return entry.minor
+
+    @setter("MinorUnit")
+    def _minor(self, value: object) -> None:
+        entry = self.kind_only(True)
+        self.change()
+        if value is NULL:
+            raise error(13)
+        wanted = float(to_number(value))
+        if not math.isfinite(wanted):
+            raise VBAUnsupportedError("Nonfinite chart scales are not implemented")
+        if wanted <= 0:
+            raise error(-2147467259, "Automation error\nUnspecified error")
+        self.chart.changed()
+        entry.minor = wanted
+
+    @member
+    def MinorUnitIsAuto(self) -> object:
+        return self.kind_only(True).minor is None
+
+    @setter("MinorUnitIsAuto")
+    def _minor_auto(self, value: object) -> None:
+        entry = self.kind_only(True)
+        self.change()
+        wanted = to_bool(value)
+        if not wanted and entry.minor is None:
+            raise VBAUnsupportedError("Freezing an effective automatic chart scale requires native layout")
+        self.chart.changed()
+        if wanted:
+            entry.minor = None
+
+    @member
+    def ScaleType(self) -> object:
+        return VBAInt(-4132 if self.kind_only(True).log_base is None else -4133, "Long")
+
+    @setter("ScaleType")
+    def _scale_type(self, value: object) -> None:
+        entry = self.kind_only(True)
+        self.change()
+        wanted = int(to_integer(value, "Long"))
+        self.chart.changed()
+        # Anything but xlScaleLinear makes the scale logarithmic, in tens until LogBase says otherwise.
+        entry.log_base = None if wanted == -4132 else entry.log_base or 10.0
+
+    @member
+    def LogBase(self) -> object:
+        return self.kind_only(True).log_base or 10.0
+
+    @setter("LogBase")
+    def _log_base(self, value: object) -> None:
+        entry = self.kind_only(True)
+        self.change()
+        wanted = float(to_number(value))
+        if not 2 <= wanted <= 1000:
+            raise error(1004, "Unable to set the LogBase property of the Axis class")
+        self.chart.changed()
+        entry.log_base = wanted
+
+    @member
+    def DisplayUnit(self) -> object:
+        unit = self.kind_only(True).display_unit
+        return VBAInt(-4142 if unit is None else unit, "Long")
+
+    @setter("DisplayUnit")
+    def _display_unit(self, value: object) -> None:
+        entry = self.kind_only(True)
+        self.change()
+        wanted = int(to_integer(value, "Long"))
+        if wanted != -4142 and wanted not in DISPLAY_UNITS:
+            return  # Excel takes any other number and changes nothing.
+        self.chart.changed()
+        entry.display_unit = None if wanted == -4142 else wanted
+        entry.display_label = wanted != -4142
+
+    @member
+    def DisplayUnitCustom(self) -> object:
+        return self.kind_only(True).display_custom
+
+    @setter("DisplayUnitCustom")
+    def _display_custom(self, value: object) -> None:
+        entry = self.kind_only(True)
+        self.change()
+        wanted = float(to_number(value))
+        if not math.isfinite(wanted) or wanted <= 0:
+            raise VBAUnsupportedError("This custom chart display unit is not implemented")
+        self.chart.changed()
+        if entry.display_unit is None:
+            entry.display_label = True
+        entry.display_unit, entry.display_custom = -4114, wanted
+
+    @member
+    def HasDisplayUnitLabel(self) -> object:
+        return self.kind_only(True).display_label
+
+    @setter("HasDisplayUnitLabel")
+    def _display_label(self, value: object) -> None:
+        entry = self.kind_only(True)
+        self.change()
+        wanted = to_bool(value)
+        if entry.display_unit is not None:
+            # Without a display unit Excel has no label to show and keeps it off.
+            self.chart.changed()
+            entry.display_label = wanted
+
+    @member
+    def AxisBetweenCategories(self) -> object:
+        entry = self.kind_only(False)
+        from pyopenvba.apps.excel._charts import CHART_TYPES
+
+        return entry.between if entry.between is not None else CHART_TYPES.get(self.chart.state.chart_type) != 'area'
+
+    @setter("AxisBetweenCategories")
+    def _between(self, value: object) -> None:
+        entry = self.kind_only(False)
+        self.change()
+        wanted = to_bool(value)
+        self.chart.changed()
+        entry.between = wanted
+
+    def set_skip(self, field: str, value: object) -> None:
+        entry = self.kind_only(False)
+        self.change()
+        wanted = int(to_integer(value, "Long"))
+        if wanted < 1:
+            raise error(-2147467259, "Automation error\nUnspecified error")
+        self.chart.changed()
+        setattr(entry, field, wanted)
+
+    @member
+    def TickLabelSpacing(self) -> object:
+        return VBAInt(self.kind_only(False).label_skip or 1, "Long")
+
+    @setter("TickLabelSpacing")
+    def _label_skip(self, value: object) -> None:
+        self.set_skip("label_skip", value)
+
+    @member
+    def TickLabelSpacingIsAuto(self) -> object:
+        return self.kind_only(False).label_skip is None
+
+    @setter("TickLabelSpacingIsAuto")
+    def _label_skip_auto(self, value: object) -> None:
+        entry = self.kind_only(False)
+        self.change()
+        wanted = to_bool(value)
+        if not wanted and entry.label_skip is None:
+            raise VBAUnsupportedError("Freezing the automatic tick label spacing requires native layout")
+        self.chart.changed()
+        if wanted:
+            entry.label_skip = None
+
+    @member
+    def TickMarkSpacing(self) -> object:
+        return VBAInt(self.kind_only(False).mark_skip or 1, "Long")
+
+    @setter("TickMarkSpacing")
+    def _mark_skip(self, value: object) -> None:
+        self.set_skip("mark_skip", value)
+
+    @member
+    def CategoryNames(self) -> object:
+        from pyopenvba.apps.excel._charts import Series
+
+        self.kind_only(False)
+        if not self.chart.state.series:
+            raise error(1004, "Unable to get the CategoryNames property of the Axis class")
+        return Series(self.chart, self.chart.state.series[0]).XValues()
+
+    @setter("CategoryNames", objects=True)
+    def _category_names(self, value: object) -> None:
+        from pyopenvba.apps.excel._charts import series_input
+        from pyopenvba.apps.excel._model import Range
+
+        self.kind_only(False)
+        self.change()
+        if not isinstance(value, (VBAArray, Range)):
+            raise error(1004, "Unable to set the CategoryNames property of the Axis class")
+        reference, values = series_input(value, sheet=self.chart.sheet)
+        self.chart.changed()
+        # Every series takes the names, as Excel gives them all the same categories.
+        for entry in self.chart.state.series:
+            entry.category_reference, entry.categories = reference, list(values)
+
+    @method
+    def Delete(self) -> object:
+        self.read()
+        self.chart.vba_set("HasAxis", False, [VBAInt(self.entry.kind, "Long"), VBAInt(self.entry.group, "Long")])
+        return EMPTY
+
+
+class AxisTitle(ElementProperties, TitleMembers):
+    get_error = INVALID_CALL
+
+    vba_type_name = "AxisTitle"
+
+    def __init__(self, axis: Axis, entry: TitleState | None) -> None:
+        self.axis, self.entry = axis, entry
+
+    @member
+    def Name(self) -> object:
+        """Excel's name by axis, whatever the text says: the value axis 1, the category axis 2, the secondary value
+        axis 3 (tests/fixtures/unassessed_charts.json). Setting it is 450."""
+        self.read()
+        number = {(2, 1): 1, (1, 1): 2, (2, 2): 3}.get((self.axis.entry.kind, self.axis.entry.group))
+        if number is None:
+            raise VBAUnsupportedError("The name of this axis' title is not implemented")
+        return f"Text Axis {number}"
+
+    @setter('Name')
+    def _set_name(self, value: object) -> None:
+        raise error(450, 'Wrong number of arguments or invalid property assignment')
+
+    def read(self) -> None:
+        self.axis.chart.admit_read()
+        if self.entry is None:
+            raise error(424, "Object required")
+        self.axis.read()
+        if self.axis.entry.title is not self.entry:
+            raise error(-2147467261, "This object is no longer valid.")
+
+    def vba_call_by_name(
+        self, name: str, args: Sequence[object], *, assignment: bool = False, by_ref: bool = False
+    ) -> object:
+        self.axis.chart.admit_read()
+        if (
+            self.entry is not None
+            and self.axis.entry.title is not self.entry
+            and not (assignment and args and args[-1] is NULL)
+        ):
+            raise error(440, "Automation error")
+        return super().vba_call_by_name(name, args, assignment=assignment, by_ref=by_ref)
+
+    @method
+    def Select(self) -> object:
+        from pyopenvba.apps.excel._charts import select_element
+
+        self.read()
+        return select_element(self.axis.chart, self, True)
+
+    @member
+    def Parent(self) -> object:
+        self.read()
+        return self.axis
+
+    @member
+    def Application(self) -> object:
+        self.read()
+        return self.axis.chart.sheet.book.application
+
+    def title_look(self) -> TitleLook:
+        self.read()
+        assert self.entry is not None
+        return self.entry.look
+
+    def title_restyle(self) -> TitleLook:
+        self.read()
+        self.axis.change()
+        self.axis.chart.changed()
+        assert self.entry is not None
+        return self.entry.look
+
+    def title_sheet(self) -> Worksheet:
+        self.read()
+        self.axis.change()
+        return self.axis.chart.sheet
+
+    def title_link(self, formula: str) -> None:
+        self.axis.chart.changed()
+        assert self.entry is not None
+        self.entry.typed, self.entry.look.formula = False, formula
+
+    def title_angle(self) -> int:
+        # The title of an axis drawn upright reads upward until its orientation is set.
+        from pyopenvba.apps.excel._charts import CHART_TYPES
+
+        upright = (self.axis.entry.kind == 1) == (CHART_TYPES.get(self.axis.chart.state.chart_type) == 'bar')
+        return 90 if upright else 0
+
+    @member
+    def Text(self) -> object:
+        from pyopenvba.apps.excel._charts import linked_title
+
+        self.read()
+        assert self.entry is not None
+        if self.entry.look.formula:
+            return linked_title(self.axis.chart.sheet, self.entry.look.formula)
+        return self.entry.text
+
+    @setter("Text")
+    def _text(self, value: object) -> None:
+        if value is NULL:
+            raise error(13)
+        self.read()
+        self.axis.change()
+        wanted = to_text(value)
+        if len(wanted) > MAX_TITLE_TEXT:
+            raise VBAUnsupportedError("Axis titles exceed the supported text budget")
+        if any(
+            not (
+                ord(char) in (9, 10, 13)
+                or 32 <= ord(char) <= 0xD7FF
+                or 0xE000 <= ord(char) <= 0xFFFD
+                or 0x10000 <= ord(char) <= 0x10FFFF
+            )
+            for char in wanted
+        ):
+            raise VBAUnsupportedError("Axis title characters requiring Office literal escapes are not implemented")
+        self.read()
+        self.axis.change()
+        if self.axis.chart.state.original:
+            from pyopenvba.apps.excel._chart_loaded import type_axis_title
+
+            try:
+                type_axis_title(self.axis.chart, self.axis.entry, wanted)
+            except VBAUnsupportedError:
+                # A title on one line takes it as a new chart of its style does; one of several lines was not measured so.
+                if not wanted or '\r' in wanted or '\n' in wanted or not self.axis.chart.whole_changed('AxisTitle.Text'):
+                    raise
+        else:
+            self.axis.chart.keeps_look(f"title{self.axis.entry.kind}", bool(wanted))
+            self.axis.chart.changed()
+        if wanted:
+            assert self.entry is not None
+            self.entry.text, self.entry.typed, self.entry.look.formula = wanted, True, ""
+        else:
+            self.axis.entry.title = None
+
+    @member
+    def Caption(self) -> object:
+        return self.Text()
+
+    @setter("Caption")
+    def _caption(self, value: object) -> None:
+        self._text(value)
+
+    @member
+    def Format(self) -> object:
+        self.read()
+        return self.axis.chart.format_of(self, f"title{self.axis.entry.kind}")
+
+    @member
+    def Border(self) -> object:
+        self.read()
+        return self.axis.chart.border_of(self, f"title{self.axis.entry.kind}")
+
+    @member
+    def Font(self) -> object:
+        self.read()
+        return self.axis.chart.font_of(self, f"title{self.axis.entry.kind}", bold=True)
+
+    @method
+    def Delete(self) -> object:
+        self.read()
+        self.axis.chart.keeps_look(f"title{self.axis.entry.kind}")
+        self.axis.chart.changed()
+        self.axis.entry.title = None
+        return EMPTY
+
+
+def _plain(axis: Axis, *, loaded: bool = False) -> AxisState:
+    """The axis of a chart the model made, other than a scatter chart's, which is what
+    tests/fixtures/chart_axis_parts.json measured the parts' fixed answers and names on; ``loaded`` takes a loaded
+    chart's too, for what its file holds."""
+    axis.read()
+    if (axis.chart.state.original and not loaded) or axis.chart.state.chart_type == -4169 or not axis.entry.present:
+        raise VBAUnsupportedError("This part of an imported, scatter or deleted chart axis is not implemented")
+    return axis.entry
+
+
+class Gridlines(ElementProperties, Created):
+    set_error = UNSPECIFIED
+
+    """An axis's major or minor gridlines. Excel names the four of a chart in one order: the value axis's major and
+    minor, then the category axis's (tests/fixtures/chart_axis_parts.json)."""
+
+    vba_type_name = "Gridlines"
+
+    def __init__(self, axis: Axis, *, major: bool) -> None:
+        self.axis, self.major = axis, major
+
+    def shown(self) -> AxisState:
+        entry = _plain(self.axis, loaded=True)
+        if not (entry.major_gridlines if self.major else entry.minor_gridlines):
+            raise error(-2147467259, "Automation error\nUnspecified error")
+        return entry
+
+    @method
+    def Select(self) -> object:
+        from pyopenvba.apps.excel._charts import select_element
+
+        return select_element(self.axis.chart, self, True)
+
+    @member
+    def Parent(self) -> object:
+        self.axis.read()
+        return self.axis
+
+    @member
+    def Application(self) -> object:
+        self.axis.read()
+        return self.axis.chart.sheet.book.application
+
+    @member
+    def Name(self) -> object:
+        entry = self.shown()
+        return f"Gridline {(0 if entry.numeric else 2) + (1 if self.major else 2)}"
+
+    @member
+    def Format(self) -> object:
+        self.shown()
+        if not self.major:
+            raise VBAUnsupportedError("The look of minor gridlines is not implemented")
+        return self.axis.chart.format_of(self, f"grid{self.axis.entry.tag}")
+
+    @member
+    def Border(self) -> object:
+        return self.axis.chart.border_of(self, f"grid{self.axis.entry.tag}")
+
+    @method
+    def Delete(self) -> object:
+        """The gridlines gone, as HasMajorGridlines or HasMinorGridlines set False leaves them."""
+        self.shown()
+        self.axis.vba_set("HasMajorGridlines" if self.major else "HasMinorGridlines", False)
+        return EMPTY
+
+
+class TickLabels(Created):
+    """An axis's labels: their number format, linked to the source cells until one is set, and what a new chart's
+    labels read (tests/fixtures/chart_axis_parts.json)."""
+
+    vba_type_name = "TickLabels"
+
+    def __init__(self, axis: Axis) -> None:
+        self.axis = axis
+
+    @member
+    def Parent(self) -> object:
+        self.axis.read()
+        return self.axis
+
+    @member
+    def Application(self) -> object:
+        self.axis.read()
+        return self.axis.chart.sheet.book.application
+
+    @member
+    def Name(self) -> object:
+        return "Axis 1" if _plain(self.axis).numeric else "Axis 2"
+
+    @member
+    def Font(self) -> object:
+        self.axis.read()
+        return self.axis.chart.font_of(self, f"tick{self.axis.entry.tag}")
+
+    @member
+    def Format(self) -> object:
+        """The axis's own look, which the labels share in the file (tests/fixtures/chart_group_looks.json)."""
+        self.axis.read()
+        return self.axis.chart.format_of(self, f"axis{self.axis.entry.tag}")
+
+    @method
+    def Select(self) -> object:
+        self.axis.read()
+        raise error(438, "Object doesn't support this property or method")
+
+    @method
+    def Delete(self) -> object:
+        """Takes the axis with them, which still answers (tests/fixtures/chart_group_looks.json)."""
+        return self.axis.Delete()
+
+    @member
+    def NumberFormat(self) -> object:
+        from pyopenvba.apps.excel._charts_file import linked_formats
+
+        entry = _plain(self.axis, loaded=True)
+        if entry.number_format is not None:
+            return entry.number_format
+        if not entry.format_linked:
+            return "General"
+        return linked_formats(self.axis.chart)[1 if entry.numeric else 0]
+
+    @setter("NumberFormat")
+    def _number_format(self, value: object) -> None:
+        from pyopenvba.apps.excel._number_format import normalized
+
+        entry = _plain(self.axis)
+        code = normalized(to_text(value))
+        self.axis.change()
+        self.axis.chart.changed()
+        entry.number_format, entry.format_linked = code, False
+
+    @member
+    def NumberFormatLocal(self) -> object:
+        from pyopenvba.apps.excel._number_format import to_local
+
+        return to_local(to_text(self.NumberFormat()), self.axis.chart.sheet.book.application.locale)
+
+    @setter("NumberFormatLocal")
+    def _number_format_local(self, value: object) -> None:
+        from pyopenvba.apps.excel._number_format import from_local
+
+        self._number_format(from_local(to_text(value), self.axis.chart.sheet.book.application.locale))
+
+    @member
+    def NumberFormatLinked(self) -> object:
+        return _plain(self.axis, loaded=True).format_linked
+
+    @setter("NumberFormatLinked")
+    def _number_format_linked(self, value: object) -> None:
+        # Linking the labels again drops their own format; unlinking them keeps it, and with none writes no numFmt.
+        entry = _plain(self.axis)
+        wanted = to_bool(value)
+        self.axis.change()
+        self.axis.chart.changed()
+        entry.format_linked = wanted
+        if wanted:
+            entry.number_format = None
+
+    @member
+    def Orientation(self) -> object:
+        _plain(self.axis)
+        return VBAInt(-4105, "Long")
+
+    @member
+    def Offset(self) -> object:
+        _plain(self.axis)
+        return VBAInt(100, "Long")
+
+    @member
+    def ReadingOrder(self) -> object:
+        _plain(self.axis)
+        return VBAInt(-5002, "Long")
+
+    def category_only(self) -> AxisState:
+        entry = _plain(self.axis)
+        if entry.numeric:
+            raise error(-2147467259, "Automation error\nUnspecified error")
+        return entry
+
+    @member
+    def Alignment(self) -> object:
+        self.category_only()
+        return VBAInt(-4108, "Long")
+
+    @member
+    def MultiLevel(self) -> object:
+        self.category_only()
+        return True
+
+    @member
+    def Depth(self) -> object:
+        from pyopenvba.apps.excel._charts import category_levels
+
+        entry = _plain(self.axis)
+        if entry.numeric:
+            return VBAInt(0, "Long")
+        series = self.axis.chart.state.series
+        if series and category_levels(self.axis.chart.sheet, series[0]):
+            raise VBAUnsupportedError("TickLabels.Depth over categories of several levels is not implemented")
+        return VBAInt(1, "Long")

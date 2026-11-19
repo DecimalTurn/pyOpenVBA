@@ -1,0 +1,30 @@
+{
+  "fresh_native_record_sha256": "61c5eff622e905f92d439bd6d633bb4915273955fa941cdf0c6ed651b892ee63",
+  "fresh_source": "conditional-sheet-copy-proxy-diagnostics.json",
+  "fresh_excel_version_build": "Not captured in the original eight-control session.",
+  "loaded_source": "conditional-sheet-copy-loaded.json",
+  "loaded_input_packages": {
+    "../conditional_loaded/generic-stat-low-far-51.xlsx": "74ecdc3f4f23f867754775f823678edd737ec5f792a1dcabf6ca0c4e7e2f9b88",
+    "../conditional_loaded/generic-stat-low-far-52.xlsm": "cf25dec51d6fa5eb790a9c20aab786f42d60c0c1db37b39788d65afdbc9e5c51",
+    "../conditional_loaded/same-complete-statistical-population-51.xlsx": "cfcb30e339040b2f052b857d0f134ad7ab9f68892eee82fadb1c53f6db2e15f1",
+    "../conditional_loaded/same-complete-statistical-population-52.xlsm": "b617f41b3e0fbee8e2989601c69f4c12e5bd707230a2235b8cd4c58e34e7466e"
+  },
+  "known_initial_snapshot_gaps": [
+    "deleted-leading-snapshot-first",
+    "deleted-middle-genuine-snapshot-first"
+  ],
+  "additional_loaded_initial_context_gap": "shared-52: initial snapshot before explicit Copied.Activate differs from the activated child-position lookup; raw record retained.",
+  "unique_input_package": {
+    "file": "unique-shared-input.xlsm",
+    "sha256": "0d68a9137f561f54b79b8656e4f906109affe4df3a5d7a7df278699061c53917",
+    "module_inventory": "unique_modules.json"
+  },
+  "additional_raw_evidence": {
+    "post_delete_observation.json": "e2a2c6a1aafdbcbb3fd807f38e4cf37ac392f280caaa325ecd2c5a8c90767080",
+    "post_delete_diagnostic_partials.json": "fc76367526e98667e4200cc1156571be7f025f9fa41f1bb297328e1e3a524e00",
+    "unique.json": "e9ea219fa8365fbfbed22e0820c4acaed44ff5534a25ec7106d870ae5307ee5c",
+    "unique_modules.json": "f73371a24cadcd82e0cc5fb1d832bc9fe0e0c888bb278d82852d964b114960c4",
+    "fresh_admission.json": "d15a5e2f7083fbaa5320b83bcab2766d2cd98d4d9089b192bf5274796ae05249",
+    "fresh_same_population_diagnostic.json": "070f15433156b8e43399e78fdf6896176b57de821b4b5d802279fdf6e471667a"
+  }
+}

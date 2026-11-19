@@ -1,0 +1,643 @@
+# One probe per line: VBA statements, then ``;;``, then the expression
+# whose answer is recorded.  Each probe gets a freshly added worksheet,
+# so the grid starts empty and nothing leaks from the probe before it.
+#
+# Measured in live Excel by ``python scripts/measure_vba_semantics.py
+# excel`` and replayed against the in-memory model by
+# tests/test_excel_model.py.
+
+# --- addresses ---
+Range("A1").Address
+Range("a1").Address
+Range("A1:B2").Address
+Range("B2:A1").Address
+Range("$A$1").Address
+Range("A1").Address(False, False)
+Range("A1:B2").Address(False, True)
+Cells(3, 4).Address
+Rows(3).Address
+Columns(2).Address
+Columns("C").Address
+Range("A:B").Address
+Range("2:4").Address
+Range("A1").Offset(1, 2).Address
+Range("A1:B2").Offset(1, 1).Address
+Range("B2").Offset(-1, -1).Address
+Range("A1").Resize(3, 2).Address
+Range("A1:C3").Resize(1, 1).Address
+Range("B2").EntireRow.Address
+Range("B2").EntireColumn.Address
+Range("A1", "C3").Address
+Range("A1:B2").Cells(2, 2).Address
+Range("B2:D4").Cells(1).Address
+Range("B2:D4").Cells(4).Address
+Range("A1:B3").Rows(2).Address
+Range("A1:C1").Columns(3).Address
+Application.Union(Range("A1"), Range("C3")).Address
+Application.Union(Range("A1"), Range("C3")).Areas.Count
+Application.Intersect(Range("A1:C3"), Range("B2:D4")).Address
+Range("A1:B2").Row
+Range("B3:D5").Column
+Range("A1:B3").Count
+Range("A1:B3").Rows.Count
+Range("A1:B3").Columns.Count
+Range("A:A").Count
+Range("A1").Worksheet.Name = ActiveSheet.Name
+Right(Range("A1").Address(External:=True), Len(ActiveSheet.Name) + 6) = ActiveSheet.Name & "!$A$1"
+Left(Range("A1").Address(External:=True), 1)
+
+# --- what lands in a cell ---
+Range("A1").Value = 5 ;; Range("A1").Value
+Range("A1").Value = 5 ;; TypeName(Range("A1").Value)
+Range("A1").Value = 5.5 ;; TypeName(Range("A1").Value)
+Range("A1").Value = "5" ;; TypeName(Range("A1").Value)
+Range("A1").Value = "5" ;; Range("A1").Value
+Range("A1").Value = "abc" ;; TypeName(Range("A1").Value)
+Range("A1").Value = True ;; TypeName(Range("A1").Value)
+Range("A1").Value = #1/2/2020# ;; TypeName(Range("A1").Value)
+Range("A1").Value = #1/2/2020# ;; CDbl(Range("A1").Value)
+Range("A1").Value = "1/2/2020" ;; TypeName(Range("A1").Value)
+Range("A1").Value = Empty ;; TypeName(Range("A1").Value)
+Range("A1").Value = "" ;; TypeName(Range("A1").Value)
+Range("A1").Value = "" ;; IsEmpty(Range("A1").Value)
+;; TypeName(Range("Z99").Value)
+;; IsEmpty(Range("Z99").Value)
+;; Range("Z99").Value = 0
+Range("A1").Value = 5 ;; Range("A1").Formula
+Range("A1").Value = 5 ;; TypeName(Range("A1").Formula)
+Range("A1").Value = "abc" ;; Range("A1").Formula
+Range("A1").Value = 5 ;; Range("A1").Text
+Range("A1").Value = 1234.5: Range("A1").NumberFormat = "#,##0.00" ;; Range("A1").Text
+Range("A1").Value = 0.5: Range("A1").NumberFormat = "0%" ;; Range("A1").Text
+Range("A1").Value = 5 ;; Range("A1").NumberFormat
+Range("A1:B2").Value = 3 ;; Range("B2").Value
+Range("A1:A3").Value = 1 ;; Application.WorksheetFunction.Sum(Range("A1:A3"))
+Range("A1").Value = 1: Range("A2").Value = 2 ;; TypeName(Range("A1:A2").Value)
+Range("A1").Value = 1: Range("A2").Value = 2 ;; UBound(Range("A1:A2").Value, 1)
+Range("A1").Value = 1: Range("A2").Value = 2 ;; UBound(Range("A1:A2").Value, 2)
+Range("A1").Value = 1: Range("A2").Value = 2 ;; LBound(Range("A1:A2").Value, 1)
+Range("A1:B2").Value = Array(7, 8) ;; Range("B1").Value
+Range("A1:B2").Value = Array(7, 8) ;; Range("A2").Value
+Range("A1").Value = 5: Range("A1").ClearContents ;; TypeName(Range("A1").Value)
+Range("A1").Value = 5: Range("A1").Clear ;; TypeName(Range("A1").Value)
+
+# --- the grid ---
+Range("A1").Value = 1 ;; ActiveSheet.UsedRange.Address
+Range("C3").Value = 1 ;; ActiveSheet.UsedRange.Address
+Range("A1").Value = 1: Range("C3").Value = 2 ;; ActiveSheet.UsedRange.Address
+;; ActiveSheet.UsedRange.Address
+Range("A1").Value = 1: Range("A2").Value = 2 ;; Range("A1").End(xlDown).Address
+Range("A1").Value = 1 ;; Range("A1").End(xlDown).Address
+Range("A1").Value = 1: Range("A5").Value = 2 ;; Range("A1").End(xlDown).Address
+Range("A1").Value = 1: Range("A5").Value = 2 ;; Range("A5").End(xlUp).Address
+Range("A1").Value = 1: Range("C1").Value = 2 ;; Range("A1").End(xlToRight).Address
+;; Range("A1").End(xlDown).Address
+;; Range("D4").End(xlUp).Address
+Range("A1:A3").Value = 1: Range("A2").Delete ;; Range("A2").Value
+Range("A1:A3").Value = 1: Range("A1").Insert ;; TypeName(Range("A1").Value)
+Range("A1").Value = 9: Range("A1").Copy Range("C3") ;; Range("C3").Value
+
+# --- the book and its sheets ---
+Dim s As Worksheet: Set s = ActiveWorkbook.Worksheets.Add ;; s.Index - ActiveSheet.Index
+Dim s As Worksheet: Set s = ActiveWorkbook.Worksheets.Add(After:=ActiveSheet) ;; s.Index
+Dim s As Worksheet: Set s = ActiveWorkbook.Worksheets.Add ;; TypeName(s)
+;; TypeName(ActiveSheet)
+;; TypeName(ActiveWorkbook)
+;; TypeName(Application)
+;; ActiveSheet.Index = ActiveWorkbook.Worksheets(ActiveSheet.Name).Index
+;; Worksheets(ActiveSheet.Name).Name = ActiveSheet.Name
+;; TypeName(Worksheets)
+;; TypeName(Range("A1"))
+;; TypeName(Range("A1").Font)
+;; TypeName(Range("A1").Interior)
+;; Range("A1").Font.Bold
+Range("A1").Font.Bold = True ;; Range("A1").Font.Bold
+Range("A1").Font.Size = 14 ;; Range("A1").Font.Size
+;; Len(Range("A1").Font.Name) > 0
+Range("A1").Interior.Color = RGB(255, 255, 0) ;; Range("A1").Interior.Color
+;; Application.Name
+;; TypeName(Application.WorksheetFunction)
+Application.ScreenUpdating = False ;; Application.ScreenUpdating
+;; ActiveWorkbook.Names.Count
+ActiveWorkbook.Names.Add "Probe", Range("A1:B2") ;; Left(ActiveWorkbook.Names("Probe").RefersTo, 1) & Right(ActiveWorkbook.Names("Probe").RefersTo, 11)
+ActiveWorkbook.Names.Add "Probe", Range("A1:B2") ;; Range("Probe").Address
+ActiveWorkbook.Names.Add "Probe", Range("A1:B2"): Range("Probe").Value = 3 ;; Range("B2").Value
+
+# --- worksheet functions ---
+Range("A1:A3").Value = 2 ;; Application.WorksheetFunction.Sum(Range("A1:A3"))
+Range("A1:A3").Value = 2 ;; Application.WorksheetFunction.Average(Range("A1:A3"))
+Range("A1").Value = 1: Range("A2").Value = 5 ;; Application.WorksheetFunction.Max(Range("A1:A2"))
+Range("A1").Value = 1: Range("A2").Value = "x" ;; Application.WorksheetFunction.Count(Range("A1:A2"))
+Range("A1").Value = 1: Range("A2").Value = "x" ;; Application.WorksheetFunction.CountA(Range("A1:A2"))
+;; Application.WorksheetFunction.Sum(1, 2, 3)
+;; TypeName(Application.WorksheetFunction.Sum(1, 2))
+;; Application.WorksheetFunction.Trim("  a   b  ")
+
+# --- shapes ---
+;; ActiveSheet.Shapes.Count
+;; TypeName(ActiveSheet.Shapes)
+;; ActiveSheet.Shapes.AddShape(1, 10, 20, 100, 50).Name
+;; ActiveSheet.Shapes.AddShape(5, 10, 20, 100, 50).Name
+;; ActiveSheet.Shapes.AddShape(9, 10, 20, 100, 50).Name
+;; ActiveSheet.Shapes.AddTextbox(1, 10, 20, 100, 50).Name
+;; ActiveSheet.Shapes.AddLine(10, 20, 100, 50).Name
+;; ActiveSheet.Shapes.AddFormControl(0, 10, 20, 100, 50).Name
+ActiveSheet.Shapes.AddShape 1, 10, 20, 100, 50 ;; ActiveSheet.Shapes.AddShape(1, 0, 0, 10, 10).Name
+ActiveSheet.Shapes.AddShape 1, 10, 20, 100, 50 ;; ActiveSheet.Shapes.Count
+ActiveSheet.Shapes.AddShape 1, 10, 20, 100, 50 ;; TypeName(ActiveSheet.Shapes(1))
+ActiveSheet.Shapes.AddShape 1, 10, 20, 100, 50 ;; ActiveSheet.Shapes(1).Type
+ActiveSheet.Shapes.AddTextbox 1, 10, 20, 100, 50 ;; ActiveSheet.Shapes(1).Type
+ActiveSheet.Shapes.AddLine 10, 20, 100, 50 ;; ActiveSheet.Shapes(1).Type
+ActiveSheet.Shapes.AddFormControl 0, 10, 20, 100, 50 ;; ActiveSheet.Shapes(1).Type
+ActiveSheet.Shapes.AddShape 1, 10, 20, 100, 50 ;; ActiveSheet.Shapes(1).Left
+ActiveSheet.Shapes.AddShape 1, 10, 20, 100, 50 ;; ActiveSheet.Shapes(1).Top
+ActiveSheet.Shapes.AddShape 1, 10, 20, 100, 50 ;; ActiveSheet.Shapes(1).Width
+ActiveSheet.Shapes.AddShape 1, 10, 20, 100, 50 ;; ActiveSheet.Shapes(1).Height
+ActiveSheet.Shapes.AddShape 1, 10, 20, 100, 50 ;; ActiveSheet.Shapes(1).OnAction
+ActiveSheet.Shapes.AddShape 1, 10, 20, 100, 50 ;; ActiveSheet.Shapes(1).TopLeftCell.Address
+ActiveSheet.Shapes.AddShape 1, 10, 20, 100, 50 ;; ActiveSheet.Shapes(1).BottomRightCell.Address
+ActiveSheet.Shapes.AddShape 1, 10, 20, 100, 50 ;; ActiveSheet.Shapes(1).ZOrderPosition
+ActiveSheet.Shapes.AddShape(1, 10, 20, 100, 50).Name = "Box" ;; ActiveSheet.Shapes("Box").Left
+ActiveSheet.Shapes.AddShape(1, 10, 20, 100, 50).OnAction = "Go" ;; ActiveSheet.Shapes(1).OnAction
+ActiveSheet.Shapes.AddShape(1, 10, 20, 100, 50).TextFrame.Characters.Text = "Hi" ;; ActiveSheet.Shapes(1).TextFrame.Characters.Text
+ActiveSheet.Shapes.AddShape(1, 10, 20, 100, 50).Left = 40 ;; ActiveSheet.Shapes(1).Left
+ActiveSheet.Shapes.AddShape 1, 10, 20, 100, 50: ActiveSheet.Shapes(1).Delete ;; ActiveSheet.Shapes.Count
+ActiveSheet.Shapes.AddShape 1, 10, 20, 100, 50 ;; ActiveSheet.Shapes("NoSuchShape").Name
+ActiveSheet.Shapes.AddShape 1, 10, 20, 100, 50 ;; ActiveSheet.Shapes(2).Name
+ActiveSheet.Shapes.AddShape 1, 10, 20, 100, 50 ;; ActiveSheet.Shapes.Range(1).Count
+ActiveSheet.Shapes.AddShape 1, 10, 20, 100, 50 ;; ActiveSheet.DrawingObjects.Count
+ActiveSheet.Shapes.AddShape 1, 10, 20, 100, 50 ;; ActiveSheet.Shapes(1).Visible
+ActiveSheet.Shapes.AddShape 1, 10, 20, 100, 50 ;; ActiveSheet.Shapes(1).Placement
+ActiveSheet.Shapes.AddShape 1, 10, 20, 100, 50 ;; ActiveSheet.Shapes(1).AutoShapeType
+ActiveSheet.Shapes.AddTextbox 1, 10, 20, 100, 50 ;; ActiveSheet.Shapes(1).AutoShapeType
+;; ActiveSheet.Shapes.AddShape(1, 10.4, 20.6, 100, 50).Left
+ActiveSheet.Shapes.AddShape 1, 10, 20, 100, 50 ;; ActiveSheet.Shapes(1).Name
+
+# --- a value assigned to a member that answers an object goes to its default member ---
+Range("A1") = 5 ;; Range("A1").Value
+Cells(2, 2) = 7 ;; Range("B2").Value
+ActiveSheet.Range("C3") = 8 ;; Range("C3").Value
+ActiveSheet.Cells(4, 3) = "x" ;; Range("C4").Value
+Range("E1:E2") = 4 ;; Range("E2").Value
+Range("A1:B2").Cells(2, 2) = 6 ;; Range("B2").Value
+
+# --- Evaluate: an array constant ---
+;; Evaluate("{11,12;21,22}")(2, 1)
+;; UBound(Evaluate("{11,12;21,22}"), 2)
+;; Evaluate("{7,8}")(2)
+;; LBound(Evaluate("{7,8}"))
+;; Evaluate("{1;2;3}")(3, 1)
+;; Evaluate("{""a"",""b""}")(2)
+;; Evaluate("{TRUE,FALSE}")(1)
+;; Evaluate("{7,8}")
+
+# --- a formula cut to another sheet ---
+ActiveSheet.Name = "CutAway1": Range("E2").Formula = "=D1+B2": Worksheets.Add: Worksheets("CutAway1").Range("E2").Cut ActiveSheet.Range("A1") ;; ActiveSheet.Range("A1").Formula
+ActiveSheet.Name = "CutAway2": Range("B2").Value = 1: Range("C2").Formula = "=B2*2": Worksheets.Add: Worksheets("CutAway2").Range("B2:C2").Cut ActiveSheet.Range("A1") ;; ActiveSheet.Range("B1").Formula
+
+# --- errors the model has to raise with the same number ---
+Range("A1").Offset(-1, 0).Address
+Range("zz").Address
+Worksheets("NoSuchSheet").Name
+Range("A1").Resize(0, 1).Address
+ActiveWorkbook.Names("NoSuchName").RefersTo
+
+# --- the type an enum constant has ---
+TypeName(xlUp)
+TypeName(xlCalculationManual)
+TypeName(xlNone)
+TypeName(msoTrue)
+TypeName(xlWorksheet)
+
+# --- Count of whole rows and columns, which counts the lines ---
+Rows.Count
+Columns.Count
+Rows(3).Count
+Columns(2).Count
+Columns("B:C").Count
+Rows("2:5").Count
+Cells.Count
+Range("A3").EntireRow.Count
+Range("B1").EntireColumn.Count
+Cells(Rows.Count, 1).Address
+Cells(1, Columns.Count).Address
+Rows.CountLarge
+Range("A1").Value = 1: Range("A5").Value = 2 ;; Cells(Rows.Count, 1).End(xlUp).Row
+
+# --- CountLarge, Next and Previous, and the Local spellings ---
+Range("A1:B3").CountLarge
+TypeName(Range("A1:B3").CountLarge)
+Cells.CountLarge
+TypeName(Cells.CountLarge)
+Columns(2).CountLarge
+Range("B2").Next.Address
+Range("B2").Previous.Address
+Range("A2").Previous.Address
+Range("XFD2").Next.Address
+Range("B2:C3").Next.Address
+Range("B2:C3").Previous.Address
+TypeName(Worksheets(Worksheets.Count).Next)
+TypeName(Worksheets(1).Previous)
+Worksheets.Add After:=Worksheets(Worksheets.Count) ;; Worksheets(2).Previous.Name = Worksheets(1).Name
+Worksheets.Add After:=Worksheets(Worksheets.Count) ;; Worksheets(1).Next.Name = Worksheets(2).Name
+Range("A1").AddressLocal
+Range("A1:B2").AddressLocal(False, False)
+Range("A1").AddressLocal(ReferenceStyle:=xlR1C1)
+Range("A1:B2").Address(ReferenceStyle:=xlR1C1)
+Rows(2).Address(ReferenceStyle:=xlR1C1)
+Rows("2:3").Address(ReferenceStyle:=xlR1C1)
+Columns("B:C").Address(ReferenceStyle:=xlR1C1)
+Range("A1,B3:C4").Address(ReferenceStyle:=xlR1C1)
+Range("B2").Address(False, False, xlR1C1, , Range("A1"))
+Range("B2").Address(True, False, xlR1C1, , Range("C3"))
+Range("B2:C3").Address(False, True, xlR1C1, , Range("D4"))
+Range("B2").Address(False, False, xlR1C1)
+Range("C3").Select ;; Range("B2").Address(False, False, xlR1C1)
+Range("B2").Address(False, False, xlA1, , Range("D4"))
+Range("A1").Formula = "=SUM(B1:B2)" ;; Range("A1").FormulaLocal
+Range("A1").Formula = "=SUM(B1:B2)" ;; Range("A1").FormulaR1C1Local
+Range("A1").Value = 5 ;; Range("A1").FormulaLocal
+Range("A1").NumberFormat = "0.00%" ;; Range("A1").NumberFormatLocal
+Range("A1").FormulaLocal = "=1+2" ;; Range("A1").Value
+Range("A1").FormulaR1C1Local = "=R1C2*2": Range("B1").Value = 4 ;; Range("A1").Formula
+Range("A1").NumberFormatLocal = "0.0" ;; Range("A1").NumberFormat
+TypeName(Range("A1").Calculate)
+Range("B2").Formula2 = "=SEQUENCE(2)" ;; Range("B2").Formula2Local
+Range("B2").Formula2 = "=A5:A7" ;; Range("B2").Formula2R1C1Local
+Range("B2").Formula = "=A5:A7" ;; Range("B2").Formula2Local
+Range("B2").Formula2Local = "=@A5:A7" ;; Range("B2").Formula
+Range("B2").Formula2R1C1Local = "=R5C1:R7C1" ;; Range("B2").Formula2
+Range("B2").Formula2Local = "=SEQUENCE(2)" ;; Range("B3").Value
+
+# --- Range.Range: a reference read from the range's first cell, as recorded macros use it ---
+Range("B2:D5").Range("A1").Address
+Range("B2:D5").Range("B2:C3").Address
+Range("B2:D5").Range("$A$1").Address
+Range("B2:D5").Range("a1").Address
+Range("B2").Range("A1:A3").Address
+Range("B2:D5").Range("E6").Address
+Range("B2").Range("B1:A2").Address
+Range("B2").Range("A:A").Address
+Range("B2").Range("1:2").Address
+Range("B2").Range("A1", "B2").Address
+Range("B2").Range("A1:B2 B2:C3").Address
+Range("B2").Range("A1,C3").Address
+Range("B2:C3,E5").Range("A1").Address
+Range("E5,B2:C3").Range("A1").Address
+Rows(3).Range("A1").Address
+Columns(2).Range("A1").Address
+Range("XFD1").Range("B1").Address
+Range("A1048576").Range("A2").Address
+Range("B2").Range("").Address
+Range("B2").Range("A0").Address
+Range("B2").Range("R1C1").Address
+Range("B2").Range(Range("A1")).Address
+Range("B2").Range(Range("A1"), Range("B2")).Address
+Range("B2").Range("A1").Range("B1").Address
+TypeName(Range("B2").Range("A1"))
+Range("B2").Range("A1").Count
+Range("C3").Select ;; ActiveCell.Offset(1, 0).Range("A1").Address
+Range("B2").Range("A1").Value = 7 ;; Range("B2").Value
+ActiveWorkbook.Names.Add "Spot", "=$A$1" ;; Range("B2").Range("Spot").Address
+Range("A1:B2 B2:C3").Address
+Range("A1 C3").Address
+Range("A1:C3 B2:D4,E5").Address
+Range("A1:C3  B2:D4").Address
+Range("A:C 2:3").Address
+
+# --- the number format a formula takes from what it refers to ---
+# A1 holds a date, A2 a plain number; C1 gets the formula. Each answer is
+# C1's NumberFormat and the type its Value arrives as.
+Range("A1").Value = DateSerial(2020, 1, 15): Range("A2").Value = 5: Range("C1").Formula = "=A1" ;; Range("C1").NumberFormat & "|" & TypeName(Range("C1").Value)
+Range("A1").Value = DateSerial(2020, 1, 15): Range("A2").Value = 5: Range("C1").Formula = "=A1+1" ;; Range("C1").NumberFormat & "|" & TypeName(Range("C1").Value)
+Range("A1").Value = DateSerial(2020, 1, 15): Range("A2").Value = 5: Range("C1").Formula = "=1+A1" ;; Range("C1").NumberFormat & "|" & TypeName(Range("C1").Value)
+Range("A1").Value = DateSerial(2020, 1, 15): Range("A2").Value = 5: Range("C1").Formula = "=A1-1" ;; Range("C1").NumberFormat & "|" & TypeName(Range("C1").Value)
+Range("A1").Value = DateSerial(2020, 1, 15): Range("A2").Value = 5: Range("C1").Formula = "=A1*1" ;; Range("C1").NumberFormat & "|" & TypeName(Range("C1").Value)
+Range("A1").Value = DateSerial(2020, 1, 15): Range("A2").Value = 5: Range("C1").Formula = "=A1/1" ;; Range("C1").NumberFormat & "|" & TypeName(Range("C1").Value)
+Range("A1").Value = DateSerial(2020, 1, 15): Range("A2").Value = 5: Range("C1").Formula = "=A1-A1" ;; Range("C1").NumberFormat & "|" & TypeName(Range("C1").Value)
+Range("A1").Value = DateSerial(2020, 1, 15): Range("A2").Value = 5: Range("C1").Formula = "=A1+A1" ;; Range("C1").NumberFormat & "|" & TypeName(Range("C1").Value)
+Range("A1").Value = DateSerial(2020, 1, 15): Range("A2").Value = 5: Range("C1").Formula = "=A2+A1" ;; Range("C1").NumberFormat & "|" & TypeName(Range("C1").Value)
+Range("A1").Value = DateSerial(2020, 1, 15): Range("A2").Value = 5: Range("C1").Formula = "=A1+A2" ;; Range("C1").NumberFormat & "|" & TypeName(Range("C1").Value)
+Range("A1").Value = DateSerial(2020, 1, 15): Range("A2").Value = 5: Range("C1").Formula = "=-A1" ;; Range("C1").NumberFormat & "|" & TypeName(Range("C1").Value)
+Range("A1").Value = DateSerial(2020, 1, 15): Range("A2").Value = 5: Range("C1").Formula = "=(A1)+1" ;; Range("C1").NumberFormat & "|" & TypeName(Range("C1").Value)
+Range("A1").Value = DateSerial(2020, 1, 15): Range("A2").Value = 5: Range("C1").Formula = "=A1+0.5" ;; Range("C1").NumberFormat & "|" & TypeName(Range("C1").Value)
+Range("A1").Value = DateSerial(2020, 1, 15): Range("A2").Value = 5: Range("C1").Formula = "=SUM(A1)" ;; Range("C1").NumberFormat & "|" & TypeName(Range("C1").Value)
+Range("A1").Value = DateSerial(2020, 1, 15): Range("A2").Value = 5: Range("C1").Formula = "=SUM(A1:A2)" ;; Range("C1").NumberFormat & "|" & TypeName(Range("C1").Value)
+Range("A1").Value = DateSerial(2020, 1, 15): Range("A2").Value = 5: Range("C1").Formula = "=SUM(A2,A1)" ;; Range("C1").NumberFormat & "|" & TypeName(Range("C1").Value)
+Range("A1").Value = DateSerial(2020, 1, 15): Range("A2").Value = 5: Range("C1").Formula = "=MAX(A1:A2)" ;; Range("C1").NumberFormat & "|" & TypeName(Range("C1").Value)
+Range("A1").Value = DateSerial(2020, 1, 15): Range("A2").Value = 5: Range("C1").Formula = "=MIN(A1)" ;; Range("C1").NumberFormat & "|" & TypeName(Range("C1").Value)
+Range("A1").Value = DateSerial(2020, 1, 15): Range("A2").Value = 5: Range("C1").Formula = "=AVERAGE(A1,A1)" ;; Range("C1").NumberFormat & "|" & TypeName(Range("C1").Value)
+Range("A1").Value = DateSerial(2020, 1, 15): Range("A2").Value = 5: Range("C1").Formula = "=IF(TRUE,A1,0)" ;; Range("C1").NumberFormat & "|" & TypeName(Range("C1").Value)
+Range("A1").Value = DateSerial(2020, 1, 15): Range("A2").Value = 5: Range("C1").Formula = "=CHOOSE(1,A1,A2)" ;; Range("C1").NumberFormat & "|" & TypeName(Range("C1").Value)
+Range("A1").Value = DateSerial(2020, 1, 15): Range("A2").Value = 5: Range("C1").Formula = "=INDEX(A1:A2,1)" ;; Range("C1").NumberFormat & "|" & TypeName(Range("C1").Value)
+Range("A1").Value = DateSerial(2020, 1, 15): Range("A2").Value = 5: Range("C1").Formula = "=A1&""""" ;; Range("C1").NumberFormat & "|" & TypeName(Range("C1").Value)
+Range("A1").Value = DateSerial(2020, 1, 15): Range("A2").Value = 5: Range("C1").Formula = "=INT(A1)" ;; Range("C1").NumberFormat & "|" & TypeName(Range("C1").Value)
+Range("A1").Value = DateSerial(2020, 1, 15): Range("A2").Value = 5: Range("C1").Formula = "=ROUND(A1,0)" ;; Range("C1").NumberFormat & "|" & TypeName(Range("C1").Value)
+Range("A1").Value = DateSerial(2020, 1, 15): Range("A2").Value = 5: Range("C1").Formula = "=YEAR(A1)" ;; Range("C1").NumberFormat & "|" & TypeName(Range("C1").Value)
+Range("A1").Value = DateSerial(2020, 1, 15): Range("A2").Value = 5: Range("C1").Formula = "=EDATE(A1,1)" ;; Range("C1").NumberFormat & "|" & TypeName(Range("C1").Value)
+Range("A1").Value = DateSerial(2020, 1, 15): Range("A2").Value = 5: Range("C1").Formula = "=EOMONTH(A1,0)" ;; Range("C1").NumberFormat & "|" & TypeName(Range("C1").Value)
+Range("A1").Value = DateSerial(2020, 1, 15): Range("A2").Value = 5: Range("C1").Formula = "=A1:A2" ;; Range("C1").NumberFormat & "|" & TypeName(Range("C1").Value)
+Range("A1").Value = DateSerial(2020, 1, 15): Range("A2").Value = 5: Range("C1").Formula = "=A1+1": Range("A1").NumberFormat = "0.00" ;; Range("C1").NumberFormat & "|" & TypeName(Range("C1").Value)
+Range("A1").Value = DateSerial(2020, 1, 15): Range("A2").Value = 5: Range("C1").Formula = "=A1+1": Range("C1").Formula = "=A2+1" ;; Range("C1").NumberFormat & "|" & TypeName(Range("C1").Value)
+Range("A1").Value = DateSerial(2020, 1, 15): Range("A2").Value = 5: Range("C1").Formula = "=A1+1": Range("C1").Value = 7 ;; Range("C1").NumberFormat & "|" & TypeName(Range("C1").Value)
+Range("A1").Value = DateSerial(2020, 1, 15): Range("A2").Value = 5: Range("C1").NumberFormat = "0.0": Range("C1").Formula = "=A1+1" ;; Range("C1").NumberFormat & "|" & TypeName(Range("C1").Value)
+Range("A1").Value = DateSerial(2020, 1, 15): Range("A2").Value = 5: Range("C1").Value = "=A1+1" ;; Range("C1").NumberFormat & "|" & TypeName(Range("C1").Value)
+Range("A1").Value = DateSerial(2020, 1, 15): Range("A2").Value = 5: Range("C1").FormulaR1C1 = "=R1C1+1" ;; Range("C1").NumberFormat & "|" & TypeName(Range("C1").Value)
+Range("A1").Value = DateSerial(2020, 1, 15): Range("A2").Value = 5: Range("C1:C2").Formula = "=A1+1" ;; Range("C1").NumberFormat & "|" & Range("C2").NumberFormat
+Range("A1").Value = DateSerial(2020, 1, 15): Range("A2").Value = 5: Range("C1").Formula = "=" & ActiveSheet.Name & "!A1+1" ;; Range("C1").NumberFormat & "|" & TypeName(Range("C1").Value)
+Range("A1").NumberFormat = "m/d/yyyy": Range("C1").Formula = "=A1+1" ;; Range("C1").NumberFormat & "|" & TypeName(Range("C1").Value)
+Range("C1").Formula = "=DATE(2020,1,1)+1" ;; Range("C1").NumberFormat & "|" & TypeName(Range("C1").Value)
+Range("C1").Formula = "=1+DATE(2020,1,1)" ;; Range("C1").NumberFormat & "|" & TypeName(Range("C1").Value)
+Range("C1").Formula = "=DATE(2020,1,1)-DATE(2019,1,1)" ;; Range("C1").NumberFormat & "|" & TypeName(Range("C1").Value)
+Range("C1").Formula = "=SUM(DATE(2020,1,1),1)" ;; Range("C1").NumberFormat & "|" & TypeName(Range("C1").Value)
+Range("C1").Formula = "=ROUND(DATE(2020,1,1),0)" ;; Range("C1").NumberFormat & "|" & TypeName(Range("C1").Value)
+Range("C1").Formula = "=TODAY()+1" ;; Range("C1").NumberFormat & "|" & TypeName(Range("C1").Value)
+Range("C1").Formula = "=NOW()+1" ;; Range("C1").NumberFormat & "|" & TypeName(Range("C1").Value)
+Range("C1").Formula = "=TIME(1,30,0)+1" ;; Range("C1").NumberFormat & "|" & TypeName(Range("C1").Value)
+Range("A1").Value = 0.1: Range("A1").NumberFormat = "0%": Range("C1").Formula = "=A1*2" ;; Range("C1").NumberFormat & "|" & TypeName(Range("C1").Value)
+Range("A1").Value = 5: Range("A1").NumberFormat = "$#,##0.00": Range("C1").Formula = "=A1*2" ;; Range("C1").NumberFormat & "|" & TypeName(Range("C1").Value)
+Range("A1").Value = 5: Range("A1").NumberFormat = "0.00": Range("C1").Formula = "=A1+1" ;; Range("C1").NumberFormat & "|" & TypeName(Range("C1").Value)
+Range("A1").Value = 5: Range("A1").NumberFormat = "#,##0": Range("C1").Formula = "=A1+1" ;; Range("C1").NumberFormat & "|" & TypeName(Range("C1").Value)
+Range("A1").Value = 5: Range("A1").NumberFormat = "0.00E+00": Range("C1").Formula = "=A1+1" ;; Range("C1").NumberFormat & "|" & TypeName(Range("C1").Value)
+Range("A1").Value = 5.5: Range("A1").NumberFormat = "# ?/?": Range("C1").Formula = "=A1+1" ;; Range("C1").NumberFormat & "|" & TypeName(Range("C1").Value)
+Range("A1").NumberFormat = "@": Range("A1").Value = "5": Range("C1").Formula = "=A1+1" ;; Range("C1").NumberFormat & "|" & TypeName(Range("C1").Value)
+Range("A1").Value = 5: Range("A1").NumberFormat = "yyyy-mm-dd": Range("C1").Formula = "=A1+1" ;; Range("C1").NumberFormat & "|" & TypeName(Range("C1").Value)
+Range("A1").Value = TimeSerial(1, 30, 0): Range("C1").Formula = "=A1+A1" ;; Range("A1").NumberFormat & "|" & Range("C1").NumberFormat & "|" & TypeName(Range("C1").Value)
+Range("A1").Value = 0.5: Range("A1").NumberFormat = "[h]:mm": Range("C1").Formula = "=A1*2" ;; Range("C1").NumberFormat & "|" & TypeName(Range("C1").Value)
+Range("A1").Value = 0.1: Range("A1").NumberFormat = "0%": Range("A2").Value = 5: Range("A2").NumberFormat = "$#,##0.00": Range("C1").Formula = "=A1+A2" ;; Range("C1").NumberFormat & "|" & TypeName(Range("C1").Value)
+Range("A1").Value = 0.1: Range("A1").NumberFormat = "0%": Range("A2").Value = 5: Range("A2").NumberFormat = "$#,##0.00": Range("C1").Formula = "=A2+A1" ;; Range("C1").NumberFormat & "|" & TypeName(Range("C1").Value)
+Range("A1").Value = 5: Range("A1").NumberFormat = "$#,##0.00": Range("C1").Formula = "=SUM(A1:A2)" ;; Range("C1").NumberFormat & "|" & TypeName(Range("C1").Value)
+Range("A1").Value = 5: Range("C1").Formula = "=A1+1": Range("A1").Value = DateSerial(2020, 1, 15) ;; Range("C1").NumberFormat & "|" & TypeName(Range("C1").Value)
+Range("A2").Value = 5: Range("A3").Value = DateSerial(2020, 1, 15): Range("C1").Formula = "=SUM(A2:A3)" ;; Range("C1").NumberFormat & "|" & TypeName(Range("C1").Value)
+Range("A1").Value = 5: Range("A2").Value = DateSerial(2020, 1, 15): Range("C1:C2").Formula = "=A1+1" ;; Range("C1").NumberFormat & "|" & Range("C2").NumberFormat
+Range("A1").Value = DateSerial(2020, 1, 15): Range("A2").Value = TimeSerial(6, 0, 0): Range("C1").Formula = "=A1+A2" ;; Range("C1").NumberFormat & "|" & TypeName(Range("C1").Value)
+Range("A1").Value = DateSerial(2020, 1, 15): Range("A2").Value = TimeSerial(6, 0, 0): Range("C1").Formula = "=A2+A1" ;; Range("C1").NumberFormat & "|" & TypeName(Range("C1").Value)
+Range("A1").Value = TimeSerial(6, 0, 0): Range("A2").Value = TimeSerial(1, 0, 0): Range("C1").Formula = "=A1-A2" ;; Range("C1").NumberFormat & "|" & TypeName(Range("C1").Value)
+Range("A1").Value = 0.1: Range("A1").NumberFormat = "0%": Range("C1").Formula = "=A1+1" ;; Range("C1").NumberFormat & "|" & TypeName(Range("C1").Value)
+Range("A1").Value = 0.1: Range("A1").NumberFormat = "0%": Range("C1").Formula = "=A1-A1" ;; Range("C1").NumberFormat & "|" & TypeName(Range("C1").Value)
+Range("A1").Value = 5: Range("A1").NumberFormat = "$#,##0.00": Range("C1").Formula = "=A1+A1" ;; Range("C1").NumberFormat & "|" & TypeName(Range("C1").Value)
+Range("A1").Value = 5: Range("A1").NumberFormat = "0.00": Range("A2").Value = 5: Range("A2").NumberFormat = "#,##0": Range("C1").Formula = "=A1+A2" ;; Range("C1").NumberFormat & "|" & TypeName(Range("C1").Value)
+Range("A1").Value = 0.1: Range("A1").NumberFormat = "0%": Range("A2").Value = 5: Range("C1").Formula = "=A2+A1" ;; Range("C1").NumberFormat & "|" & TypeName(Range("C1").Value)
+Range("A1").Value = DateSerial(2020, 1, 15): Range("A2").Value = 5: Range("C1").Formula = "=1-A1" ;; Range("C1").NumberFormat & "|" & TypeName(Range("C1").Value)
+Range("A1").Value = DateSerial(2020, 1, 15): Range("A2").Value = 5: Range("C1").Formula = "=SUM(A1)+1" ;; Range("C1").NumberFormat & "|" & TypeName(Range("C1").Value)
+Range("A1").Value = DateSerial(2020, 1, 15): Range("A2").Value = 5: Range("C1").Formula = "=(A1+1)*2" ;; Range("C1").NumberFormat & "|" & TypeName(Range("C1").Value)
+Range("A1").Value = DateSerial(2020, 1, 15): Range("A2").Value = 5: Range("C1").Formula = "=1+A1*2" ;; Range("C1").NumberFormat & "|" & TypeName(Range("C1").Value)
+Range("A1").Value = DateSerial(2020, 1, 15): Range("A2").Value = 5: Range("C1").Formula = "=A1^1" ;; Range("C1").NumberFormat & "|" & TypeName(Range("C1").Value)
+Range("A1").Value = DateSerial(2020, 1, 15): Range("A2").Value = 5: Range("C1").Formula = "=A1>0" ;; Range("C1").NumberFormat & "|" & TypeName(Range("C1").Value)
+Range("A1").Value = DateSerial(2020, 1, 15): Range("A2").Value = 5: Range("C1").Formula = "=ABS(A1)" ;; Range("C1").NumberFormat & "|" & TypeName(Range("C1").Value)
+Range("A1").Value = DateSerial(2020, 1, 15): Range("A2").Value = 5: Range("C1").Formula = "=TRUNC(A1)" ;; Range("C1").NumberFormat & "|" & TypeName(Range("C1").Value)
+Range("A1").Value = DateSerial(2020, 1, 15): Range("A2").Value = 5: Range("C1").Formula = "=ROUNDDOWN(A1,0)" ;; Range("C1").NumberFormat & "|" & TypeName(Range("C1").Value)
+Range("A1").Value = DateSerial(2020, 1, 15): Range("A2").Value = 5: Range("C1").Formula = "=ROUNDUP(A1,0)" ;; Range("C1").NumberFormat & "|" & TypeName(Range("C1").Value)
+Range("A1").Value = DateSerial(2020, 1, 15): Range("A2").Value = 5: Range("C1").Formula = "=CEILING(A1,1)" ;; Range("C1").NumberFormat & "|" & TypeName(Range("C1").Value)
+Range("A1").Value = DateSerial(2020, 1, 15): Range("A2").Value = 5: Range("C1").Formula = "=FLOOR(A1,1)" ;; Range("C1").NumberFormat & "|" & TypeName(Range("C1").Value)
+Range("A1").Value = DateSerial(2020, 1, 15): Range("A2").Value = 5: Range("C1").Formula = "=MROUND(A1,1)" ;; Range("C1").NumberFormat & "|" & TypeName(Range("C1").Value)
+Range("A1").Value = DateSerial(2020, 1, 15): Range("A2").Value = 5: Range("C1").Formula = "=MOD(A1,7)" ;; Range("C1").NumberFormat & "|" & TypeName(Range("C1").Value)
+Range("A1").Value = DateSerial(2020, 1, 15): Range("A2").Value = 5: Range("C1").Formula = "=MEDIAN(A1,A1)" ;; Range("C1").NumberFormat & "|" & TypeName(Range("C1").Value)
+Range("A1").Value = DateSerial(2020, 1, 15): Range("A2").Value = 5: Range("C1").Formula = "=LARGE(A1:A2,1)" ;; Range("C1").NumberFormat & "|" & TypeName(Range("C1").Value)
+Range("A1").Value = DateSerial(2020, 1, 15): Range("A2").Value = 5: Range("C1").Formula = "=SMALL(A1:A2,2)" ;; Range("C1").NumberFormat & "|" & TypeName(Range("C1").Value)
+Range("A1").Value = DateSerial(2020, 1, 15): Range("A2").Value = 5: Range("C1").Formula = "=PRODUCT(A1)" ;; Range("C1").NumberFormat & "|" & TypeName(Range("C1").Value)
+Range("A1").Value = DateSerial(2020, 1, 15): Range("A2").Value = 5: Range("C1").Formula = "=SUMIF(A1:A2,"">0"")" ;; Range("C1").NumberFormat & "|" & TypeName(Range("C1").Value)
+Range("A1").Value = DateSerial(2020, 1, 15): Range("A2").Value = 5: Range("C1").Formula = "=SUMPRODUCT(A1:A2)" ;; Range("C1").NumberFormat & "|" & TypeName(Range("C1").Value)
+Range("A1").Value = DateSerial(2020, 1, 15): Range("A2").Value = 5: Range("C1").Formula = "=SUBTOTAL(9,A1:A2)" ;; Range("C1").NumberFormat & "|" & TypeName(Range("C1").Value)
+Range("A1").Value = DateSerial(2020, 1, 15): Range("A2").Value = 5: Range("C1").Formula = "=VLOOKUP(A1,A1:A2,1,FALSE)" ;; Range("C1").NumberFormat & "|" & TypeName(Range("C1").Value)
+Range("A1").Value = DateSerial(2020, 1, 15): Range("A2").Value = 5: Range("C1").Formula = "=INDIRECT(""A1"")" ;; Range("C1").NumberFormat & "|" & TypeName(Range("C1").Value)
+Range("A1").Value = DateSerial(2020, 1, 15): Range("A2").Value = 5: Range("C1").Formula = "=OFFSET(A1,0,0)" ;; Range("C1").NumberFormat & "|" & TypeName(Range("C1").Value)
+Range("A1").Value = DateSerial(2020, 1, 15): Range("A2").Value = 5: Range("C1").Formula = "=N(A1)" ;; Range("C1").NumberFormat & "|" & TypeName(Range("C1").Value)
+Range("A1").Value = DateSerial(2020, 1, 15): Range("A2").Value = 5: Range("C1").Formula = "=MAX(A2,A1)" ;; Range("C1").NumberFormat & "|" & TypeName(Range("C1").Value)
+Range("A1").Value = DateSerial(2020, 1, 15): Range("A2").Value = 5: Range("C1").Formula = "=SUM(1,A1)" ;; Range("C1").NumberFormat & "|" & TypeName(Range("C1").Value)
+Range("A1").Value = DateSerial(2020, 1, 15): Range("A2").Value = 5: Range("C1").Formula = "=AVERAGEIF(A1:A2,"">0"")" ;; Range("C1").NumberFormat & "|" & TypeName(Range("C1").Value)
+Range("A1").Value = DateSerial(2020, 1, 15): Range("A2").Value = 5: Range("C1").Formula = "=COUNT(A1)" ;; Range("C1").NumberFormat & "|" & TypeName(Range("C1").Value)
+Range("A1").Value = DateSerial(2020, 1, 15): Range("A2").Value = 5: Range("C1").Formula = "=STDEV(A1,A2)" ;; Range("C1").NumberFormat & "|" & TypeName(Range("C1").Value)
+Range("A1").Value = DateSerial(2020, 1, 15): Range("A2").Value = 5: Range("C1").Formula = "=ROUND(A1*1,0)" ;; Range("C1").NumberFormat & "|" & TypeName(Range("C1").Value)
+Range("A1").Value = DateSerial(2020, 1, 15): Range("A2").Value = 5: Range("C1").Formula = "=SUM(A1*1)" ;; Range("C1").NumberFormat & "|" & TypeName(Range("C1").Value)
+Range("A1").Value = DateSerial(2020, 1, 15): Range("A2").Value = 5: Range("C1").Formula = "=A1": Range("D1").Formula = "=C1+1" ;; Range("D1").NumberFormat & "|" & TypeName(Range("D1").Value)
+Range("C1").Formula = "=DATEVALUE(""1/1/2020"")" ;; Range("C1").NumberFormat & "|" & TypeName(Range("C1").Value)
+Range("C1").Formula = "=TIME(1,30,0)" ;; Range("C1").NumberFormat & "|" & TypeName(Range("C1").Value)
+Range("C1").Formula = "=EDATE(DATE(2020,1,1),1)" ;; Range("C1").NumberFormat & "|" & TypeName(Range("C1").Value)
+Range("C1").Formula = "=DATE(2020,1,1)*1" ;; Range("C1").NumberFormat & "|" & TypeName(Range("C1").Value)
+Range("C1").Formula = "=INT(NOW())" ;; Range("C1").NumberFormat & "|" & TypeName(Range("C1").Value)
+Range("C1").Formula = "=NOW()-TODAY()" ;; Range("C1").NumberFormat & "|" & TypeName(Range("C1").Value)
+Range("C1").Formula = "=TODAY()" ;; Range("C1").NumberFormat & "|" & TypeName(Range("C1").Value)
+Range("C1").Formula = "=NOW()" ;; Range("C1").NumberFormat & "|" & TypeName(Range("C1").Value)
+
+# --- array formulas ---
+# A1:A3 hold 1, 2 and 3. An array formula is worked out once, as an array,
+# and each cell of its range shows its item.
+Range("A1:A3").Value = Application.Transpose(Array(1, 2, 3)): Range("C1").FormulaArray = "=SUM(A1:A3*2)" ;; Range("C1").Value
+Range("A1:A3").Value = Application.Transpose(Array(1, 2, 3)): Range("C1").FormulaArray = "=SUM(A1:A3*2)" ;; Range("C1").Formula
+Range("A1:A3").Value = Application.Transpose(Array(1, 2, 3)): Range("C1").FormulaArray = "=SUM(A1:A3*2)" ;; Range("C1").FormulaArray
+Range("A1:A3").Value = Application.Transpose(Array(1, 2, 3)): Range("C1").FormulaArray = "=SUM(A1:A3*2)" ;; Range("C1").HasArray
+Range("A1:A3").Value = Application.Transpose(Array(1, 2, 3)): Range("C1").FormulaArray = "=SUM(A1:A3*2)" ;; Range("C1").HasFormula
+Range("A1:A3").Value = Application.Transpose(Array(1, 2, 3)): Range("C1").FormulaArray = "=SUM(A1:A3*2)" ;; Range("C1").CurrentArray.Address
+Range("A1:A3").Value = Application.Transpose(Array(1, 2, 3)): Range("C1:C3").FormulaArray = "=A1:A3*10" ;; Range("C2").Value
+Range("A1:A3").Value = Application.Transpose(Array(1, 2, 3)): Range("C1:C3").FormulaArray = "=A1:A3*10" ;; Range("C2").Formula
+Range("A1:A3").Value = Application.Transpose(Array(1, 2, 3)): Range("C1:C3").FormulaArray = "=A1:A3*10" ;; Range("C2").FormulaArray
+Range("A1:A3").Value = Application.Transpose(Array(1, 2, 3)): Range("C1:C3").FormulaArray = "=A1:A3*10" ;; Range("C2").HasArray
+Range("A1:A3").Value = Application.Transpose(Array(1, 2, 3)): Range("C1:C3").FormulaArray = "=A1:A3*10" ;; Range("C2").HasFormula
+Range("A1:A3").Value = Application.Transpose(Array(1, 2, 3)): Range("C1:C3").FormulaArray = "=A1:A3*10" ;; Range("C2").CurrentArray.Address
+Range("A1:A3").Value = Application.Transpose(Array(1, 2, 3)): Range("C1:C3").FormulaArray = "=A1:A3*10" ;; Range("C1:C3").HasArray
+Range("A1:A3").Value = Application.Transpose(Array(1, 2, 3)): Range("C1:C3").FormulaArray = "=A1:A3*10" ;; Range("C1:D3").HasArray
+Range("A1:A3").Value = Application.Transpose(Array(1, 2, 3)): Range("C1:C3").FormulaArray = "=A1:A3*10" ;; Range("C1:C3").FormulaArray
+Range("A1:A3").Value = Application.Transpose(Array(1, 2, 3)): Range("C1:C3").FormulaArray = "=A1:A3*10" ;; Range("C1:D3").FormulaArray
+Range("A1:A3").Value = Application.Transpose(Array(1, 2, 3)): Range("C1:C3").FormulaArray = "=A1:A3*10" ;; Range("C1:C3").Formula(2, 1)
+Range("A1:A3").Value = Application.Transpose(Array(1, 2, 3)): Range("C1:C3").FormulaArray = "=A1:A3*10" ;; Range("C1:C3").HasFormula
+Range("A1:A3").Value = Application.Transpose(Array(1, 2, 3)): Range("C1:C3").FormulaArray = "=A1:A3*10" ;; Range("D1").HasArray
+Range("A1:A3").Value = Application.Transpose(Array(1, 2, 3)): Range("C1:C3").FormulaArray = "=A1:A3*10" ;; Range("D1").FormulaArray
+Range("A1:A3").Value = Application.Transpose(Array(1, 2, 3)) ;; Range("A1").FormulaArray
+Range("A1:A3").Value = Application.Transpose(Array(1, 2, 3)): Range("C1:C3").FormulaArray = "=A1:A3*10" ;; Range("D1").CurrentArray.Address
+Range("A1:A3").Value = Application.Transpose(Array(1, 2, 3)): Range("C1:C3").FormulaArray = "=A1:A3*10": Range("C2").Value = 5 ;; Range("C2").Value
+Range("A1:A3").Value = Application.Transpose(Array(1, 2, 3)): Range("C1:C3").FormulaArray = "=A1:A3*10": Range("C2").Formula = "=1" ;; Range("C2").Value
+Range("A1:A3").Value = Application.Transpose(Array(1, 2, 3)): Range("C1:C3").FormulaArray = "=A1:A3*10": Range("C2").ClearContents ;; Range("C2").Value
+Range("A1:A3").Value = Application.Transpose(Array(1, 2, 3)): Range("C1:C3").FormulaArray = "=A1:A3*10": Range("C1").FormulaArray = "=1" ;; Range("C1").Value
+Range("A1:A3").Value = Application.Transpose(Array(1, 2, 3)): Range("C1:C3").FormulaArray = "=A1:A3*10": Range("C2:C4").ClearContents ;; Range("C2").Value
+Range("A1:A3").Value = Application.Transpose(Array(1, 2, 3)): Range("C1:C3").FormulaArray = "=A1:A3*10": Range("C1:C3").ClearContents ;; Range("C2").HasArray & "|" & IsEmpty(Range("C2").Value)
+Range("A1:A3").Value = Application.Transpose(Array(1, 2, 3)): Range("C1:C3").FormulaArray = "=A1:A3*10": Range("C1:C4").ClearContents ;; Range("C2").HasArray & "|" & IsEmpty(Range("C2").Value)
+Range("A1:A3").Value = Application.Transpose(Array(1, 2, 3)): Range("C1:C3").FormulaArray = "=A1:A3*10": Range("C1:C3").Value = 5 ;; Range("C2").HasArray & "|" & Range("C2").Value
+Range("A1:A3").Value = Application.Transpose(Array(1, 2, 3)): Range("C1:C3").FormulaArray = "=A1:A3*10": Range("C1:C3").Formula = "=A1" ;; Range("C2").HasArray & "|" & Range("C2").Formula
+Range("A1:A3").Value = Application.Transpose(Array(1, 2, 3)): Range("C1:C3").FormulaArray = "=A1:A3*10": Range("C1:C3").FormulaArray = "=A1:A3*100" ;; Range("C2").Value
+Range("A1:A3").Value = Application.Transpose(Array(1, 2, 3)): Range("C1:C3").FormulaArray = "=A1:A3*10": Range("C1:C3").Clear ;; Range("C2").HasArray
+Range("A1:A3").Value = Application.Transpose(Array(1, 2, 3)): Range("C1:C3").FormulaArray = "=A1:A3*10": Rows(2).Delete ;; Range("C2").Value
+Range("A1:A3").Value = Application.Transpose(Array(1, 2, 3)): Range("C1:C3").FormulaArray = "=A1:A3*10": Rows(2).Insert ;; Range("C2").Value
+Range("A1:A3").Value = Application.Transpose(Array(1, 2, 3)): Range("C1:C3").FormulaArray = "=A1:A3*10": Rows(1).Insert ;; Range("C3").CurrentArray.Address & "|" & Range("C3").FormulaArray
+Range("A1:A3").Value = Application.Transpose(Array(1, 2, 3)): Range("C1:C3").FormulaArray = "=A1:A3*10": Rows(5).Insert ;; Range("C2").CurrentArray.Address
+Range("A1:A3").Value = Application.Transpose(Array(1, 2, 3)): Range("C1:C3").FormulaArray = "=A1:A3*10": Rows("1:3").Delete ;; IsEmpty(Range("C1").Value)
+Range("A1:A3").Value = Application.Transpose(Array(1, 2, 3)): Range("C1:C3").FormulaArray = "=A1:A3*10": Columns(3).Delete ;; Range("C2").HasArray
+Range("A1:A3").Value = Application.Transpose(Array(1, 2, 3)): Range("C1:C4").FormulaArray = "=A1:A3*10" ;; Range("C4").Text
+Range("A1:A3").Value = Application.Transpose(Array(1, 2, 3)): Range("C1:D2").FormulaArray = "={1,2}" ;; Range("C2").Value & "," & Range("D2").Value
+Range("A1:A3").Value = Application.Transpose(Array(1, 2, 3)): Range("C1:C2").FormulaArray = "=5" ;; Range("C2").Value
+Range("A1:A3").Value = Application.Transpose(Array(1, 2, 3)): Range("C1:E1").FormulaArray = "=A1:A3*10" ;; Range("D1").Value & "," & Range("E1").Value
+Range("A1:A3").Value = Application.Transpose(Array(1, 2, 3)): Range("C1").FormulaArray = "=A1:A3*10" ;; Range("C1").Value
+Range("A1:A3").Value = Application.Transpose(Array(1, 2, 3)): Range("C1:C3").FormulaArray = "=A1*2" ;; Range("C2").Value
+Range("A1:A3").Value = Application.Transpose(Array(1, 2, 3)): Range("H5").FormulaArray = "=SUM(IF(A1:A3>1,A1:A3))" ;; Range("H5").Value
+Range("A1:A3").Value = Application.Transpose(Array("x", "yy", "zzz")): Range("H5").FormulaArray = "=SUM(LEN(A1:A3))" ;; Range("H5").Value
+Range("A1:A3").Value = Application.Transpose(Array(1, 2, 3)): Range("C1:C3").FormulaArray = "=A1:A3*10": Range("A2").Value = 20 ;; Range("C2").Value
+Range("A1:A3").Value = Application.Transpose(Array(1, 2, 3)): Range("C1:C3").FormulaArray = "=A1:A3*10": Range("D2").Formula = "=C2+1" ;; Range("D2").Value
+Range("A1:A3").Value = Application.Transpose(Array(1, 2, 3)): Range("C1:C3").FormulaArray = "=A1:A3*10": Range("D2").Formula = "=C2+1": Range("A2").Value = 7 ;; Range("D2").Value
+Range("A1:A3").Value = Application.Transpose(Array(1, 2, 3)): Range("C1").FormulaArray = "=SUM(R1C1:R3C1)" ;; Range("C1").Formula
+Range("A1:A3").Value = Application.Transpose(Array(1, 2, 3)): Range("C1").FormulaArray = "=" & Replace(Space(130), " ", "1+") & "1" ;; Range("C1").Value
+Range("A1:A3").Value = Application.Transpose(Array(1, 2, 3)): Range("C1").FormulaArray = "=" & Replace(Space(126), " ", "1+") & "1" ;; Range("C1").Value
+Range("A1:A3").Value = Application.Transpose(Array(1, 2, 3)): Range("C1:C3").FormulaArray = "=A1:A3*10": Range("C1").Value = 5 ;; Range("C1").Value & "|" & Range("C1").HasArray
+Range("A1:A3").Value = Application.Transpose(Array(1, 2, 3)): Range("C1:C3").FormulaArray = "=A1:A3*10": Range("C1").FormulaArray = "=1" ;; Range("C2").Value & "|" & Range("C2").HasArray & "|" & Range("C1").CurrentArray.Address
+Range("A1:A3").Value = Application.Transpose(Array(1, 2, 3)): Range("C1:C3").FormulaArray = "=A1:A3*10": Range("C2").FormulaArray = "=7" ;; Range("C1").Value & "|" & Range("C2").Value & "|" & Range("C2").CurrentArray.Address
+Range("A1:A3").Value = Application.Transpose(Array(1, 2, 3)): Range("C1:C3").FormulaArray = "=A1:A3*10": Range("C2:C3").FormulaArray = "=5" ;; Range("C1").Value & "|" & Range("C2").Value
+Range("A1:A3").Value = Application.Transpose(Array(1, 2, 3)): Range("C1:C3").FormulaArray = "=A1:A3*10": Range("C1:C4").FormulaArray = "=5" ;; Range("C4").Value & "|" & Range("C2").CurrentArray.Address
+Range("A1:A3").Value = Application.Transpose(Array(1, 2, 3)): Range("C1:C3").FormulaArray = "=A1:A3*10" ;; Range("B1:C3").HasArray
+Range("A1:A3").Value = Application.Transpose(Array(1, 2, 3)): Range("C1:C3").FormulaArray = "=A1:A3*10" ;; Range("B1:C3").FormulaArray
+Range("A1:A3").Value = Application.Transpose(Array(1, 2, 3)): Range("C1:C3").FormulaArray = "=A1:A3*10" ;; Range("C2:D3").HasArray
+Range("A1:A3").Value = Application.Transpose(Array(1, 2, 3)): Range("C1:C3").FormulaArray = "=A1:A3*10" ;; Range("C3:C4").HasArray
+Range("A1:A3").Value = Application.Transpose(Array(1, 2, 3)): Range("C1:C3").FormulaArray = "=A1:A3*10" ;; Range("A1:C1").HasArray
+Range("A1:A3").Value = Application.Transpose(Array(1, 2, 3)): Range("C1:C3").FormulaArray = "=A1:A3*10" ;; Range("D1:D3").HasArray
+Range("A1:A3").Value = Application.Transpose(Array(1, 2, 3)): Range("C1:C3").FormulaArray = "=A1:A3*10" ;; Range("D1:D3").FormulaArray
+Range("A1:A3").Value = Application.Transpose(Array(1, 2, 3)): Range("C1:C3").FormulaArray = "=A1:A3*10" ;; Range("A1:A3").FormulaArray
+Range("A1:A3").Value = Application.Transpose(Array(1, 2, 3)): Range("C1:C3").FormulaArray = "=A1:A3*10" ;; Range("C1:C3,E1").HasArray
+Range("A1:A3").Value = Application.Transpose(Array(1, 2, 3)): Range("C1:C3").FormulaArray = "=A1:A3*10": Range("E1").FormulaArray = "=1" ;; Range("C1:E3").HasArray
+Range("A1:A3").Value = Application.Transpose(Array(1, 2, 3)): Range("C1:C3").FormulaArray = "=A1:A3*10": Range("E1").FormulaArray = "=1" ;; Range("C1:E3").FormulaArray
+Range("A1:A3").Value = Application.Transpose(Array(1, 2, 3)): Range("C1:C3").FormulaArray = "=A1:A3*10" ;; Range("C1:C3").CurrentArray.Address
+Range("A1:A3").Value = Application.Transpose(Array(1, 2, 3)): Range("C1:C3").FormulaArray = "=A1:A3*10" ;; Range("C1:D3").CurrentArray.Address
+Range("A1:A3").Value = Application.Transpose(Array(1, 2, 3)): Range("C1:C3").FormulaArray = "=A1:A3*10" ;; Range("B1:C3").CurrentArray.Address
+Range("A1:A3").Value = Application.Transpose(Array(1, 2, 3)): Range("C1:C3").FormulaArray = "=A1:A3*10": Range("C1:C3").FormulaR1C1 = "=RC1" ;; Range("C2").HasArray & "|" & Range("C2").Value
+Range("A1:A3").Value = Application.Transpose(Array(1, 2, 3)): Range("C1:C3").FormulaArray = "=A1:A3*10": Range("C2").FormulaR1C1 = "=1" ;; Range("C2").Value
+Range("A1:A3").Value = Application.Transpose(Array(1, 2, 3)): Range("C1:C3").FormulaArray = "=A1:A3*10": Range("C2:D2").Value = 5 ;; Range("C2").Value & "|" & Range("D2").Value
+Range("A1:A3").Value = Application.Transpose(Array(1, 2, 3)): Range("C1").FormulaArray = "=A1:A3" ;; Range("C1").NumberFormat
+Range("A1:A3").Value = Application.Transpose(Array(1, 2, 3)): Range("C1:C3").FormulaArray = "=A1:A3*10": Range("C1:C3").Copy Range("E1") ;; Range("E2").HasArray & "|" & Range("E2").Value
+Range("A1:A3").Value = Application.Transpose(Array(1, 2, 3)): Range("C1:C3").FormulaArray = "=A1:A3*10": Range("C2").Copy Range("E1") ;; Range("E1").HasArray & "|" & Range("E1").Formula
+
+# --- CallByName: a member named at run time ---
+Range("A1").Value = 5 ;; CallByName(Range("A1"), "Value", VbGet)
+Range("A1").Value = 5 ;; CallByName(Range("A1"), "vALUE", VbGet)
+CallByName Range("A1"), "Value", VbLet, 42 ;; Range("A1").Value
+;; CallByName(Range("A1"), "Offset", VbGet, 1, 2).Address
+;; CallByName(ActiveSheet, "Range", VbGet, "B2").Address
+;; CallByName(ActiveSheet, "Range", VbMethod, "B2:C3").Address
+;; CallByName(Range("A1"), "Nope", VbGet)
+;; CallByName(Range("A1"), "Value", 3)
+;; CallByName(Range("A1"), "Value", 16)
+;; CallByName(Nothing, "Value", VbGet)
+;; CallByName(5, "Value", VbGet)
+;; CallByName("text", "Len", VbGet)
+CallByName Range("A1").Font, "Bold", VbLet, True ;; Range("A1").Font.Bold
+Range("A1").Value = 5: CallByName Range("A1"), "ClearContents", VbMethod ;; IsEmpty(Range("A1").Value)
+;; TypeName(CallByName(Range("A1"), "ClearContents", VbMethod))
+Dim c As New Collection: CallByName c, "Add", VbMethod, "x": CallByName c, "Add", VbMethod, "y" ;; c.Count & "|" & CallByName(c, "Item", VbMethod, 2)
+;; CallByName(Range("A1:B2"), "Count", VbGet)
+;; TypeName(CallByName(Range("A1"), "Font", VbGet))
+;; CallByName(Range("A1"), "Value", VbSet, 1)
+;; CallByName(Application, "Name", VbGet)
+;; CallByName(Range("A1"), "Address", VbGet, False, False)
+Range("A1").Value = 5 ;; CallByName(Range("A1"), "Value", VbMethod)
+;; CallByName(Range("A1"), "Offset", VbGet)
+
+# --- the errors a cell holds by CVErr's number, the newer ones too ---
+Range("A1").Value = CVErr(2042) ;; Range("A1").Formula & "|" & CStr(Range("A1").Value)
+Range("A1").Value = CVErr(2043) ;; Range("A1").Formula & "|" & CStr(Range("A1").Value)
+Range("A1").Value = CVErr(2045) ;; Range("A1").Formula & "|" & CStr(Range("A1").Value)
+Range("A1").Value = CVErr(2046) ;; Range("A1").Formula & "|" & CStr(Range("A1").Value)
+Range("A1").Value = CVErr(2047) ;; Range("A1").Formula & "|" & CStr(Range("A1").Value)
+Range("A1").Value = CVErr(2048) ;; Range("A1").Formula & "|" & CStr(Range("A1").Value)
+Range("A1").Value = CVErr(2049) ;; Range("A1").Formula & "|" & CStr(Range("A1").Value)
+Range("A1").Value = CVErr(2050) ;; Range("A1").Formula & "|" & CStr(Range("A1").Value)
+Range("A1").Value = CVErr(2044) ;; Range("A1").Formula
+Range("A1").Value = CVErr(2051) ;; Range("A1").Formula
+Range("A1").Value = CVErr(2001) ;; Range("A1").Formula
+Range("A1").Value = CVErr(1) ;; Range("A1").Formula
+Range("A1").Formula = "=DROP(1,1)" ;; CStr(Range("A1").Value)
+Range("A1").Formula = "=DROP(1,1)" ;; IsError(Range("A1").Value)
+
+# --- notes, which VBA calls comments: AddComment, Comment, NoteText, Comments ---
+Range("B2").AddComment "Hello" ;; Range("B2").Comment.Text
+Range("B2").AddComment ;; Range("B2").Comment.Text
+Range("B2").AddComment "" ;; Range("B2").Comment.Text
+Range("B2").AddComment 5 ;; Range("B2").Comment.Text
+Range("B2").AddComment "Line1" & vbLf & "Line2" ;; Len(Range("B2").Comment.Text)
+Range("B2").AddComment "Line1" & vbCrLf & "Line2" ;; Len(Range("B2").Comment.Text)
+Range("B2").AddComment "Hello" ;; TypeName(Range("B2").Comment)
+;; TypeName(Range("B2").Comment)
+Range("B2").AddComment "Hello" ;; TypeName(Range("B2:C3").Comment)
+Range("C3").AddComment "Hello" ;; TypeName(Range("B2:C3").Comment)
+Range("B2").AddComment "Hello" ;; TypeName(Range("B2").AddComment("Again"))
+Range("B2:C3").AddComment "Hello" ;; ActiveSheet.Comments.Count
+Range("B2").AddComment "Hello" ;; Range("B2").Comment.Author = Application.UserName
+Range("B2").AddComment "Hello" ;; Range("B2").Comment.Visible
+Range("B2").AddComment "Hello": Range("B2").Comment.Visible = True ;; Range("B2").Comment.Visible
+Range("B2").AddComment "Hello" ;; Range("B2").Comment.Text("XY")
+Range("B2").AddComment "Hello": Range("B2").Comment.Text "Bye" ;; Range("B2").Comment.Text
+Range("B2").AddComment "Hello": Range("B2").Comment.Text "XY", 3 ;; Range("B2").Comment.Text
+Range("B2").AddComment "Hello": Range("B2").Comment.Text "XY", 3, False ;; Range("B2").Comment.Text
+Range("B2").AddComment "Hello": Range("B2").Comment.Text "XY", 3, True ;; Range("B2").Comment.Text
+Range("B2").AddComment "Hello": Range("B2").Comment.Text "XY", 10, False ;; Range("B2").Comment.Text
+Range("B2").AddComment "Hello": Range("B2").Comment.Text "XY", 0, False ;; Range("B2").Comment.Text
+Range("B2").AddComment "Hello": Range("B2").Comment.Text Start:=2 ;; Range("B2").Comment.Text
+Range("B2").AddComment "Hello" ;; Range("B2").Comment.Text(Start:=2)
+Range("B2").AddComment "Hello": Range("B2").Comment.Delete ;; TypeName(Range("B2").Comment)
+Range("B2").AddComment "Hello": Range("C3").AddComment "Bye" ;; ActiveSheet.Comments.Count
+Range("C3").AddComment "Bye": Range("B2").AddComment "Hello" ;; ActiveSheet.Comments(1).Text
+Range("B3").AddComment "Bye": Range("C2").AddComment "Hello" ;; ActiveSheet.Comments(1).Parent.Address
+Range("C2").AddComment "Bye": Range("B3").AddComment "Hello" ;; ActiveSheet.Comments(2).Parent.Address
+Range("B2").AddComment "Hello" ;; ActiveSheet.Comments(2).Text
+Range("B2").AddComment "Hello" ;; ActiveSheet.Comments(0).Text
+;; ActiveSheet.Comments.Count
+;; TypeName(ActiveSheet.Comments)
+Range("B2").AddComment "Hello": Range("C3").AddComment "Bye" ;; Range("B2").Comment.Next.Parent.Address
+Range("B2").AddComment "Hello": Range("C3").AddComment "Bye" ;; TypeName(Range("C3").Comment.Next)
+Range("B2").AddComment "Hello": Range("C3").AddComment "Bye" ;; Range("C3").Comment.Previous.Parent.Address
+Range("B2").AddComment "Hello" ;; TypeName(Range("B2").Comment.Previous)
+Range("B2").AddComment "Hello" ;; TypeName(Range("B2").Comment.Parent)
+Range("B2").AddComment "Hello" ;; Range("B2").Comment.Parent.Address
+Range("B2").AddComment "Hello" ;; Range("B2").Comment.Creator
+Range("B2").AddComment "Hello" ;; Range("B2").NoteText
+;; Range("B2").NoteText
+Range("B2").NoteText "Hello" ;; Range("B2").Comment.Text
+Range("B2").AddComment "Hello" ;; Range("B2").NoteText(Start:=2, Length:=3)
+Range("B2").AddComment "Hello" ;; Range("B2").NoteText(Start:=2)
+Range("B2").AddComment "Hello": Range("B2").NoteText "XY", 3 ;; Range("B2").NoteText
+Range("B2").AddComment "Hello": Range("B2").NoteText "XY", 3, 2 ;; Range("B2").NoteText
+Range("B2").AddComment "Hello": Range("B2").NoteText "" ;; TypeName(Range("B2").Comment)
+Range("B2").AddComment "Hello": Range("C3").AddComment "Bye" ;; Range("B2:C3").NoteText
+Range("B2").AddComment "Hello": Range("B2:C3").ClearComments ;; ActiveSheet.Comments.Count
+Range("B2").AddComment "Hello": Range("B2").ClearNotes ;; ActiveSheet.Comments.Count
+Range("B2").AddComment "Hello": Range("B2").ClearContents ;; TypeName(Range("B2").Comment)
+Range("B2").AddComment "Hello": Range("B2").ClearFormats ;; TypeName(Range("B2").Comment)
+Range("B2").AddComment "Hello": Range("B2").Clear ;; TypeName(Range("B2").Comment)
+Range("B2").AddComment "Hello": Range("B2").Value = 5 ;; TypeName(Range("B2").Comment)
+Range("B2").AddComment "Hello": Rows(1).Insert ;; Range("B3").Comment.Text
+Range("B2").AddComment "Hello": Columns(1).Insert ;; Range("C2").Comment.Text
+Range("B2").AddComment "Hello": Rows(2).Delete ;; ActiveSheet.Comments.Count
+Range("B2").AddComment "Hello": Rows(1).Delete ;; Range("B1").Comment.Text
+Range("B2").AddComment "Hello": Range("B1").Insert xlShiftDown ;; Range("B3").Comment.Text
+Range("B2").AddComment "Hello": Range("A2").Delete xlShiftToLeft ;; Range("A2").Comment.Text
+Range("B2").AddComment "Hello": Range("B2").Copy Range("D4") ;; Range("D4").Comment.Text
+Range("B2").AddComment "Hello": Range("B2").Copy Range("D4") ;; ActiveSheet.Comments.Count
+Range("B2").AddComment "Hello": Range("B2").Cut Range("D4") ;; Range("D4").Comment.Text & "|" & TypeName(Range("B2").Comment)
+Range("B2").AddComment "Hello": Range("D4").AddComment "Bye": Range("B2").Copy Range("D4") ;; Range("D4").Comment.Text
+Range("B2").AddComment "Hello": Range("D4").AddComment "Bye": Range("C3").Copy Range("D4") ;; TypeName(Range("D4").Comment)
+Range("B2").AddComment "Hello": Range("B2").Copy: Range("D4").PasteSpecial xlPasteValues ;; TypeName(Range("D4").Comment)
+Range("B2").AddComment "Hello": Range("B2").Copy: Range("D4").PasteSpecial xlPasteComments ;; Range("D4").Comment.Text
+Range("B2").AddComment "Hello": Range("B2").Copy: Range("D4").PasteSpecial xlPasteFormats ;; TypeName(Range("D4").Comment)
+Range("B2").AddComment "Hello": Range("B2").AutoFill Range("B2:B4") ;; TypeName(Range("B4").Comment)
+Range("B2").AddComment "Hello": Range("B2:C2").Merge ;; TypeName(Range("B2").Comment)
+Range("C2").AddComment "Hello": Range("B2:C2").Merge ;; TypeName(Range("B2").Comment) & "|" & ActiveSheet.Comments.Count
+Range("B2").AddComment "Hello" ;; Cells.SpecialCells(xlCellTypeComments).Address
+Range("B2").AddComment "Hello": Range("D4").AddComment "Bye" ;; Cells.SpecialCells(xlCellTypeComments).Address
+;; Cells.SpecialCells(xlCellTypeComments).Address
+Range("B2").AddComment "Hello" ;; ActiveSheet.Shapes.Count
+Range("B2").AddComment "Hello" ;; ActiveSheet.Shapes(1).Type
+Range("B2").AddComment "Hello" ;; ActiveSheet.Shapes(1).Name
+Range("B2").AddComment "Hello" ;; Range("B2").Comment.Shape.Name
+Range("B2").AddComment "Hello" ;; Range("B2").Comment.Shape.Width & "|" & Range("B2").Comment.Shape.Height
+Range("B2").AddComment "Hello" ;; Range("B2").Comment.Shape.Left & "|" & Range("B2").Comment.Shape.Top
+Range("A1").AddComment "Hello" ;; Range("A1").Comment.Shape.Left & "|" & Range("A1").Comment.Shape.Top
+Range("B2").AddComment "Hello": Range("C3").AddComment "Bye" ;; Range("C3").Comment.Shape.Name
+Range("B2").AddComment "Hello": Range("B2").Comment.Delete: Range("C3").AddComment "Bye" ;; Range("C3").Comment.Shape.Name
+Range("B2").AddComment "Hello" ;; Range("B2").Comment.Shape.Visible
+Range("B2").AddComment "Hello" ;; ActiveSheet.Comments(1).Shape.TextFrame.Characters.Text
+Range("B2").AddComment "Hello": Worksheets.Add ;; ActiveSheet.Comments.Count
+Range("B2").AddComment "Hello" ;; ActiveSheet.UsedRange.Address
+Range("B2").AddComment "Hello" ;; Range("B2").HasFormula
+Range("B2").AddComment "Hello" ;; IsEmpty(Range("B2").Value)
+
+# --- a sheet function WorksheetFunction does not carry ---
+;; WorksheetFunction.If(True, 1, 2)
+;; WorksheetFunction.Sin(1)
+;; WorksheetFunction.Address(1, 1)
+;; Application.If(True, 1, 2)
+;; Application.Sin(1)

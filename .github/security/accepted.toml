@@ -1,0 +1,154 @@
+# What the security scans are expected to report, and why each is accepted.
+#
+# scripts/security/security_report.py fails a scan on any finding, or any
+# warning a tool raises about the scan, that this file does not list, and
+# on any entry here that no longer matches. A finding is matched by tool,
+# rule, file and the text of the line it flags, so it follows code that
+# moves and comes back up for review when the line itself changes.
+#
+# Add an entry only with a reason a reviewer can check. Fixing the code
+# is the better answer wherever there is one.
+
+[[finding]]
+tool = "Semgrep"
+rule = "python.lang.security.use-defused-xml.use-defused-xml"
+where = [
+    { path = "src/pyopenvba/access/_themes.py", line = "from xml.etree import ElementTree" },
+    { path = "src/pyopenvba/apps/excel/_io.py", line = "from xml.etree import ElementTree as ET" },
+    { path = "src/pyopenvba/powerquery/_metadata.py", line = "from xml.etree import ElementTree" },
+    { path = "src/pyopenvba/powerquery/workbook.py", line = "from xml.etree import ElementTree" },
+]
+reason = """
+Four XML parts are parsed with the standard library's ElementTree: an
+Access database's theme, a workbook's workbook.xml, and Power Query's
+metadata and workbook parts. Outside the integrity checker and chart reader
+(accepted separately below), the rest of the library reads XML as text
+or with html.parser, and neither processes a DTD, so a file cannot
+declare an entity there. defusedxml would be the package's first
+dependency, against its promise of none. ElementTree loads no external
+entity and no external DTD, so a file cannot make it read other files
+or reach the network. Expat 2.4.1 and later limits how far entities may
+expand; CPython bundles it on Windows and macOS, and current Linux
+distributions ship it. A Python built against an older system expat is
+still open to a file whose entities expand without limit.
+"""
+
+[[finding]]
+tool = "Semgrep"
+rule = "python.lang.security.use-defused-xml.use-defused-xml"
+where = [
+    { path = "src/pyopenvba/integrity.py", line = "from xml.parsers import expat" },
+]
+reason = """
+The file integrity checker uses Expat for namespace-aware XML syntax and
+OPC attributes without adding a runtime dependency. Before Parse is called,
+StartDoctypeDeclHandler raises at the start of every DOCTYPE, before the
+internal subset; EntityDeclHandler and ExternalEntityRefHandler also raise,
+and parameter entity parsing is set to XML_PARAM_ENTITY_PARSING_NEVER.
+No external resolver or child parser is created. Thus DTDs, declared entity
+expansion, and external file/network access are refused, rather than relying
+on an Expat version's entity amplification limits. Encoded XML is passed as
+bytes, so UTF-16 DOCTYPE declarations reach the same rejecting handler.
+Tests cover internal entities, UTF-16 DTDs, and external DTD/entity references.
+XML payload sizes are bounded by the checker before parsing. Expat's other
+native-parser vulnerabilities still require an updated Python/Expat runtime;
+this acceptance addresses the rule's DTD/entity risk, not every parser bug.
+See https://docs.python.org/3/library/pyexpat.html#xmlparser.StartDoctypeDeclHandler
+and https://docs.python.org/3/library/pyexpat.html#xmlparser.SetParamEntityParsing.
+"""
+
+[[finding]]
+tool = "Semgrep"
+rule = "python.lang.security.use-defused-xml.use-defused-xml"
+where = [
+    { path = "src/pyopenvba/formula/_calc/xpath.py", line = "from xml.parsers import expat" },
+]
+reason = """
+FILTERXML parses text from a cell or a macro, which is untrusted, with Expat
+and no runtime dependency, as the integrity checker does. Before Parse is
+called, StartDoctypeDeclHandler raises at the start of every DOCTYPE, before
+the internal subset, which is also Excel's own answer: #VALUE!, measured in
+tests/fixtures/range_missing.json. EntityDeclHandler and
+ExternalEntityRefHandler also raise, and parameter entity parsing is set to
+XML_PARAM_ENTITY_PARSING_NEVER. No external resolver or child parser is
+created. Thus DTDs, declared entity expansion, and external file or network
+access are refused, rather than relying on an Expat version's amplification
+limits. tests/test_excel_range_missing.py covers internal entities, an
+entity bomb and an external DTD. A document so deep that it exhausts the
+recursion limit answers #VALUE!, also tested. Document size is not bounded,
+because the text comes from the macro running in the same process, which can
+already spend its own time. Expat's other native-parser vulnerabilities still
+require an updated Python/Expat runtime; this acceptance addresses the rule's
+DTD/entity risk, not every parser bug.
+"""
+
+[[finding]]
+tool = "Semgrep"
+rule = "python.lang.security.insecure-hash-algorithms.insecure-hash-algorithm-sha1"
+where = [
+    { path = "src/pyopenvba/vba.py", line = "h = hashlib.sha1()" },
+]
+reason = """
+compute_v3_content_hash() fingerprints a project's module source so a
+caller can tell whether it changed. Its docstring and docs/roadmap.md
+(gate 15) say it is not the VBE's signature hash. Nothing in pyOpenVBA
+signs, verifies or protects anything with it, so SHA-1's weakness to a
+chosen collision does not apply.
+"""
+
+[[finding]]
+tool = "Semgrep"
+rule = "python.lang.security.use-defused-xml.use-defused-xml"
+where = [
+    { path = "src/pyopenvba/apps/excel/_charts_file.py", line = "import xml.etree.ElementTree as ET" },
+    { path = "src/pyopenvba/apps/excel/_charts_file.py", line = "from xml.parsers import expat" },
+]
+reason = """
+The chart reader uses ElementTree only as a TreeBuilder, never as an XML
+parser. Tree readers call xml_tree; tree and byte-offset readers obtain their
+actual Expat parser from xml_parser, whose rejecting handlers are installed
+before it is returned. It raises from StartDoctypeDeclHandler before a DTD's internal subset,
+EntityDeclHandler and ExternalEntityRefHandler. Parameter entity parsing
+is XML_PARAM_ENTITY_PARSING_NEVER; no resolver or child parser is created.
+Thus declared entities, external DTDs and file/network entity resolution
+are refused rather than relying on an Expat version's expansion limits.
+Tests exercise internal/external/parameter entities and external DTDs in
+UTF-8 and UTF-16, plus valid namespaces and predefined entities. This is a
+narrow import-rule false positive after explicit parser hardening, not a
+claim to fix ZIP expansion limits or every native-parser vulnerability;
+an updated Python/Expat runtime is still required. This preserves the
+library's zero-runtime-dependency API without enabling DTD processing.
+"""
+
+[[finding]]
+tool = "Semgrep"
+rule = "python.lang.security.use-defused-xml.use-defused-xml"
+where = [
+    { path = "src/pyopenvba/_opc_xml.py", line = "from xml.parsers import expat" },
+]
+reason = """
+The OPC metadata editor installs rejecting StartDoctypeDeclHandler,
+EntityDeclHandler and ExternalEntityRefHandler callbacks before Parse.
+Parameter entity parsing is XML_PARAM_ENTITY_PARSING_NEVER; no resolver
+or child parser is created. Only UTF-8 metadata is edited, with NUL bytes
+and incompatible encoding declarations refused before insertion. Namespace
+and byte-offset parsing does not enable DTD or declared entity expansion.
+tests/test_opc_metadata.py covers declaration refusal and UTF-16 rejection,
+as well as qualified insertion and preservation of unrelated markup.
+This acceptance applies only to this guarded import; it does not cover
+other XML entry points or replace Python/Expat runtime updates.
+"""
+
+[[notice]]
+tool = "Semgrep"
+id = "Internal matching error"
+contains = "excel-macro-test.yml"
+reason = """
+Two of Semgrep's GitHub Actions rules, curl-eval and gha-curl-pipe-shell,
+read every run: block as Bash. The failure-screenshot step in
+excel-macro-test.yml is PowerShell, so they cannot parse it. Both look
+for a download piped into a shell, which that step does not do: it loads
+four scripts from the checkout and takes a screenshot.
+Semgrep 1.183.0 reports this as an internal matching error for each of
+the two rules, where earlier versions reported a syntax error.
+"""

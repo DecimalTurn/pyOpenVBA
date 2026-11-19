@@ -2,20 +2,28 @@
 
 from __future__ import annotations
 
+import ctypes
 import struct
+import sys
+import zipfile
 from pathlib import Path
+from typing import Any
 
 import pytest
 
+from pyopenvba import vba
+from pyopenvba.cfb import CFB
 from pyopenvba.exceptions import VBAProjectError
 from pyopenvba.vba import (
     CLASS_MODULE_CLSID,
+    VBAModule,
     VBAModuleKind,
     VBAProject,
     compress,
     copy_token_help,
     decompress,
     normalize_class_source,
+    parse_vba_project,
     split_attribute_header,
     synthesize_class_header,
 )
@@ -601,7 +609,7 @@ def test_compress_byte_exact_against_access_sample_040():
     the invariant that gates Access UI acceptance of rewritten
     modules (Phase 5g).
     """
-    from pyopenvba.access_read import AccessReader
+    from pyopenvba.access import AccessDatabase
 
     sample = (
         Path(__file__).resolve().parent
@@ -612,24 +620,14 @@ def test_compress_byte_exact_against_access_sample_040():
     )
     if not sample.exists():
         pytest.skip(f"RE corpus sample missing: {sample}")
-    db = AccessReader(sample)
-    for page, slot, row in db._iter_lval_rows():  # pyright: ignore[reportPrivateUsage]
-        for off in db._scan_ovba_signatures(row):  # pyright: ignore[reportPrivateUsage]
-            blob = bytes(row)[off:]
-            try:
-                plain = decompress(blob)
-            except Exception:
-                continue
-            if not plain.startswith(b'Attribute VB_Name = "M"'):
-                continue
-            recomp = compress(plain)
-            assert recomp == blob, (
-                f"compressor diverges from Access at (page={page}, "
-                f"slot={slot}, off={off}). orig={len(blob)}B "
-                f"ours={len(recomp)}B"
-            )
-            return
-    pytest.skip("module M not located in sample 040")
+    stream = next((s for s in AccessDatabase(sample).module_streams() if s.name == "M"), None)
+    if stream is None:
+        pytest.skip("module M not located in sample 040")
+    blob = stream.data[stream.offset :]
+    recomp = compress(decompress(blob))
+    assert recomp == blob, (
+        f"compressor diverges from Access: orig={len(blob)}B ours={len(recomp)}B"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -798,95 +796,462 @@ class TestAddModuleClassNormalization:
         assert CLASS_MODULE_CLSID not in module.source
 
 
-class TestEncodeLzOracleEquivalence:
-    """The optimized 3-gram-indexed LZ encoder must be byte-for-byte
-    equivalent to the naive full-window scan it replaced.  Access
-    byte-validates OVBA cache blobs against its own compressor, so any
-    output drift (including tie-break order) is a correctness bug, not
-    a quality regression."""
+#: Files Office saved itself: Access, Excel, Word and PowerPoint, driven
+#: by hand or through their COM objects.  A file the library has edited
+#: holds streams its own earlier encoders wrote, so none is listed.
+OFFICE_WRITTEN = [
+    "live_access_test/code_page_names.accdb",
+    "live_access_test/control_names.accdb",
+    "live_access_test/designs_every.accdb",
+    "live_access_test/first_module.accdb",
+    "live_access_test/folders_past_nine.accdb",
+    "live_access_test/form_with_code.accdb",
+    "live_access_test/form_with_controls.accdb",
+    "live_access_test/macros.accdb",
+    "live_access_test/module_spanning_pages.accdb",
+    "live_access_test/modules_added.accdb",
+    "live_access_test/New Microsoft Access Database.accdb",
+    "live_access_test/report.accdb",
+    "live_access_test/two_modules_one_page.accdb",
+    "fixtures/binary_project/document.doc",
+    "fixtures/binary_project/workbook.xls",
+    "fixtures/first_macro/excel_module.xlsm",
+    "fixtures/first_macro/powerpoint_module.pptm",
+    "fixtures/first_macro/word_module.docm",
+    "fixtures/shapes/all_controls.xlsm",
+    "fixtures/shapes/excel_shapes.xlsm",
+    "fixtures/shapes/powerpoint_shapes.pptm",
+    "fixtures/shapes/radios_moved.xlsm",
+    "fixtures/shapes/word_shapes.docm",
+    "fixtures/signature_parts/excel.xlsm",
+    "fixtures/signature_parts/powerpoint.pptm",
+    "fixtures/signature_parts/word.docm",
+    "fixtures/WordExcelInteropFixture.docm",
+    "live_excel_testing/freshly_touched.xlsm",
+    "live_excel_testing/large_vba_module.xlsm",
+    "live_excel_testing/sheet_only_module_test.xlsm",
+    "live_excel_testing/test_macro_workbook.xlsb",
+    "live_excel_testing/test_macro_workbook.xlsm",
+    "live_excel_testing/workbook_only_module_test.xlsm",
+    "live_excel_testing/workbook_with_password_protected_vba_modules.xlsm",
+    "live_excel_testing/xls_test.xls",
+    "live_powerpoint_testing/Presentation1.pptm",
+    "live_word_testing/Doc1.docm",
+]
 
-    @staticmethod
-    def _naive_encode_lz(chunk: bytes) -> bytes:
-        """Reference implementation: the original O(window) scan."""
-        out = bytearray()
-        pos = 0
-        chunk_len = len(chunk)
-        while pos < chunk_len:
-            flag_bits = 0
-            tokens: list[bytes] = []
-            for bit in range(8):
-                if pos >= chunk_len:
-                    break
-                length_mask, offset_mask, bit_count = copy_token_help(pos, 0)
-                max_length = length_mask + 3
-                max_offset = (offset_mask >> (16 - bit_count)) + 1
-                start = max(0, pos - max_offset)
-                best_len = 0
-                best_offset = 0
-                for candidate in range(start, pos):
-                    match_len = 0
-                    while (pos + match_len < chunk_len
-                           and chunk[candidate + match_len] == chunk[pos + match_len]
-                           and match_len < max_length):
-                        match_len += 1
-                    if match_len > best_len:
-                        best_len = match_len
-                        best_offset = pos - candidate
-                if best_len >= 3:
-                    flag_bits |= (1 << bit)
-                    offset_bits = ((best_offset - 1) << (16 - bit_count)) & offset_mask
-                    length_bits = (best_len - 3) & length_mask
-                    tokens.append(struct.pack("<H", offset_bits | length_bits))
-                    pos += best_len
-                else:
-                    tokens.append(bytes([chunk[pos]]))
-                    pos += 1
-            out.append(flag_bits)
-            for tok in tokens:
-                out.extend(tok)
-        return bytes(out)
 
-    def _assert_equivalent(self, chunk: bytes) -> None:
-        from pyopenvba import vba as _vba
+def _compressed_streams(path: Path) -> list[tuple[str, bytes]]:
+    """The file's dir stream and each module's compressed source."""
+    if path.suffix == ".accdb":
+        from pyopenvba.access import AccessDatabase
 
-        encode = getattr(_vba, "_encode_lz")
-        assert encode(chunk) == self._naive_encode_lz(chunk), (
-            f"encoder diverges from naive oracle for input of "
-            f"{len(chunk)} bytes"
-        )
+        db = AccessDatabase(path)
+        stored = {name: value for name, value, _home in db.project_streams()}
+        modules = [(s.name, s.data[s.offset :]) for s in db.module_streams()]
+        return [("dir", stored["dir"]), *modules]
+    if path.suffix in (".xls", ".doc"):
+        cfb = CFB.from_bytes(path.read_bytes())
+    else:
+        with zipfile.ZipFile(path) as package:
+            project = next(n for n in package.namelist() if n.endswith("vbaProject.bin"))
+            cfb = CFB.from_bytes(package.read(project))
+    streams = [("dir", cfb.get_stream_in_storage("VBA", "dir"))]
+    for module in parse_vba_project(cfb).modules:
+        stream = cfb.get_stream_in_storage("VBA", module.stream_name)
+        streams.append((module.name, stream[module.text_offset :]))
+    return streams
 
-    def test_boundary_sizes(self) -> None:
-        for chunk in (b"", b"A", b"AB", b"ABC", b"ABCA", b"AAAA"):
-            self._assert_equivalent(chunk)
 
-    def test_random_bytes(self) -> None:
+def _last_flag_byte_is_full(chunk: bytes) -> bool:
+    """Whether a token-compressed chunk's last flag byte heads 8 tokens."""
+    at = tokens = 0
+    while at < len(chunk):
+        flags, at, tokens = chunk[at], at + 1, 0
+        while tokens < 8 and at < len(chunk):
+            at += 2 if flags >> tokens & 1 else 1
+            tokens += 1
+    return tokens == 8
+
+
+#: ``ctypes`` seen as untyped: its Windows-only names (``WinDLL``) are not
+#: in the stubs off Windows, and the tests are type-checked everywhere.
+_windows: Any = ctypes
+
+
+def _windows_lznt1(data: bytes) -> list[bytes | None]:
+    """The chunks Windows' own LZNT1 compressor (ntdll's
+    ``RtlCompressBuffer``, standard engine) makes of ``data``: each one's
+    bytes after its header, or None where it stored the chunk raw."""
+    ntdll = _windows.WinDLL("ntdll")
+    lznt1 = ctypes.c_ushort(2)
+    workspace, fragment = ctypes.c_ulong(), ctypes.c_ulong()
+    status = ntdll.RtlGetCompressionWorkSpaceSize(lznt1, ctypes.byref(workspace), ctypes.byref(fragment))
+    assert status == 0
+    target = ctypes.create_string_buffer(2 * len(data) + 4096)
+    size = ctypes.c_ulong()
+    status = ntdll.RtlCompressBuffer(
+        lznt1, data, ctypes.c_ulong(len(data)), target, ctypes.c_ulong(len(target)),
+        ctypes.c_ulong(4096), ctypes.byref(size), ctypes.create_string_buffer(workspace.value),
+    )
+    assert status in (0, 0x117)  # 0x117 is STATUS_BUFFER_ALL_ZEROS, a success
+    stream = target.raw[: size.value]
+    chunks: list[bytes | None] = []
+    at = 0
+    while at < len(stream):
+        header = int.from_bytes(stream[at : at + 2], "little")
+        body = stream[at + 2 : at + 3 + (header & 0x0FFF)]
+        chunks.append(body if header & 0x8000 else None)
+        at += 3 + (header & 0x0FFF)
+    return chunks
+
+
+class TestCompressAsOfficeDoes:
+    """Office chooses every copy token as the LZNT1 standard engine in
+    Windows' ntdll does, and ends a chunk whose last flag byte is full
+    with an empty one (see ``pyopenvba.vba._encode_lz``)."""
+
+    @pytest.mark.parametrize("name", OFFICE_WRITTEN)
+    def test_every_stream_office_wrote_comes_back_byte_for_byte(self, name: str) -> None:
+        path = Path(__file__).resolve().parent / name
+        for stream_name, stream in _compressed_streams(path):
+            assert compress(decompress(stream)) == stream, f"{name}: {stream_name}"
+
+    def test_a_full_last_flag_byte_is_followed_by_an_empty_one(self) -> None:
+        assert compress(b"ABCDEFGH") == b"\x01\x09\xb0\x00ABCDEFGH\x00"
+        assert compress(b"ABCDEFG") == b"\x01\x07\xb0\x00ABCDEFG"
+        # Seven literals and a copy fill the flag byte too.
+        assert compress(b"ABCDEFGABC") == b"\x01\x0a\xb0\x80ABCDEFG\x00\x60\x00"
+
+    @pytest.mark.skipif(sys.platform != "win32", reason="ntdll is Windows'")
+    def test_tokens_are_the_ones_windows_lznt1_chooses(self) -> None:
         import random
 
-        rng = random.Random(20260722)
-        self._assert_equivalent(bytes(rng.randrange(256) for _ in range(4096)))
-        rng = random.Random(1)
-        self._assert_equivalent(bytes(rng.randrange(64) for _ in range(2048)))
+        rng = random.Random(20260927)
+        inputs = [b"\x00" * 9000, b"A" * 5000, bytes(range(16)) * 300]
+        for _ in range(60):
+            symbols = rng.sample(range(256), rng.choice((2, 3, 5, 16, 40, 100)))
+            inputs.append(bytes(rng.choice(symbols) for _ in range(rng.choice((20, 700, 4096, 6000)))))
+        for period in (1, 2, 3, 7, 13, 31):
+            unit = bytes(rng.randrange(256) for _ in range(period))
+            inputs.append(unit * (5000 // period))
+        encode = getattr(vba, "_encode_lz")
+        for data in inputs:
+            for index, expected in enumerate(_windows_lznt1(data)):
+                if expected is None:
+                    continue
+                if _last_flag_byte_is_full(expected):
+                    expected += b"\x00"
+                chunk = data[index * 4096 : (index + 1) * 4096]
+                assert encode(chunk) == expected, f"{len(data)}-byte input, chunk {index}"
 
-    def test_highly_repetitive(self) -> None:
-        self._assert_equivalent(b"A" * 512)
-        self._assert_equivalent(b"AB" * 256)
-        self._assert_equivalent(b"abc" * 170 + b"ab")
-        self._assert_equivalent(b"\x00" * 300 + b"\x00\x01" * 100)
 
-    def test_vba_like_text(self) -> None:
-        src = (
-            'Attribute VB_Name = "Module1"\r\n'
-            "Option Explicit\r\n\r\n"
-            + "".join(
-                f"Sub Proc{i}()\r\n"
-                f'    MsgBox "value {i}"\r\n'
-                "End Sub\r\n\r\n"
-                for i in range(30)
+class TestDecompressOracleEquivalence:
+    """The optimized decoder (slice copies for non-overlapping tokens,
+    literal-run batching, hoisted copy-token masks) must be byte-exact
+    against the original per-byte reference implementation, including
+    error positions on malformed input (issue #5)."""
+
+    @staticmethod
+    def _naive_decompress(data: bytes, *, stream_name: str = "<unknown>") -> bytes:
+        """Reference implementation: the original per-byte decoder."""
+        def _err(msg: str, offset: int) -> VBAProjectError:
+            return VBAProjectError(f"{msg} [stream={stream_name!r}, offset={offset}]")
+
+        if not data or data[0] != 0x01:
+            raise _err("Invalid compressed stream: missing 0x01 signature byte.", 0)
+        pos = 1
+        out = bytearray()
+        while pos < len(data):
+            if pos + 2 > len(data):
+                raise _err("Truncated compressed stream: missing chunk header.", pos)
+            header = int(struct.unpack_from("<H", data, pos)[0])
+            chunk_data_size = (header & 0x0FFF) + 1
+            chunk_signature = (header >> 12) & 0x7
+            chunk_flag = (header >> 15) & 0x1
+            header_offset = pos
+            pos += 2
+            if chunk_signature != 0b011:
+                raise _err(
+                    f"Bad compressed chunk signature: expected 0b011, "
+                    f"got {chunk_signature:#05b}.",
+                    header_offset,
+                )
+            chunk_end = pos + chunk_data_size
+            if chunk_end > len(data):
+                raise _err(
+                    f"Truncated chunk: header announces {chunk_data_size} bytes "
+                    f"but only {len(data) - pos} remain.",
+                    header_offset,
+                )
+            decompressed_chunk_start = len(out)
+            if chunk_flag == 0:
+                if chunk_data_size != 4096:
+                    raise _err(
+                        f"Raw chunk must have exactly 4096 data bytes; "
+                        f"got {chunk_data_size}.",
+                        header_offset,
+                    )
+                if pos + 4096 > len(data):
+                    raise _err("Truncated raw chunk.", pos)
+                out.extend(data[pos: pos + 4096])
+                pos += 4096
+            else:
+                while pos < chunk_end:
+                    if pos >= len(data):
+                        break
+                    flag_byte = int(data[pos])
+                    pos += 1
+                    for bit in range(8):
+                        if pos >= chunk_end or pos >= len(data):
+                            break
+                        if (flag_byte >> bit) & 1:
+                            if pos + 2 > len(data):
+                                raise _err("Truncated copy token.", pos)
+                            token = int(struct.unpack_from("<H", data, pos)[0])
+                            pos += 2
+                            length_mask, offset_mask, bit_count = copy_token_help(
+                                len(out), decompressed_chunk_start
+                            )
+                            length = (token & length_mask) + 3
+                            offset = ((token & offset_mask) >> (16 - bit_count)) + 1
+                            copy_src = len(out) - offset
+                            if copy_src < 0:
+                                raise _err(
+                                    "Copy token references before start of output.",
+                                    pos - 2,
+                                )
+                            if copy_src < decompressed_chunk_start:
+                                raise _err(
+                                    "Copy token references before the start of the "
+                                    "current chunk.",
+                                    pos - 2,
+                                )
+                            for _ in range(length):
+                                out.append(out[copy_src])
+                                copy_src += 1
+                        else:
+                            out.append(int(data[pos]))
+                            pos += 1
+        return bytes(out)
+
+    @staticmethod
+    def _live_fixture_streams() -> list[bytes]:
+        import zipfile
+
+        from pyopenvba.cfb import CFB
+        from pyopenvba.vba import parse_dir_stream
+
+        streams: list[bytes] = []
+        fixtures = [
+            ("tests/live_excel_testing/test_macro_workbook.xlsm", "xl/vbaProject.bin"),
+            ("tests/live_excel_testing/large_vba_module.xlsm", "xl/vbaProject.bin"),
+            ("tests/live_word_testing/Doc1.docm", "word/vbaProject.bin"),
+            ("tests/live_powerpoint_testing/Presentation1.pptm", "ppt/vbaProject.bin"),
+        ]
+        base = Path(__file__).parent.parent
+        for rel, entry in fixtures:
+            path = base / rel
+            if not path.exists():
+                continue
+            with zipfile.ZipFile(path) as zf:
+                cfb = CFB.from_bytes(zf.read(entry))
+            dir_comp = cfb.get_stream_in_storage("VBA", "dir")
+            streams.append(bytes(dir_comp))
+            _, mods = parse_dir_stream(decompress(dir_comp))
+            for m in mods:
+                try:
+                    raw = cfb.get_stream_in_storage("VBA", m.stream_name or m.name)
+                except KeyError:
+                    continue
+                streams.append(bytes(raw[m.text_offset:]))
+        return streams
+
+    def test_live_fixture_streams_byte_identical(self) -> None:
+        streams = self._live_fixture_streams()
+        if not streams:
+            pytest.skip("no live fixtures available")
+        for i, s in enumerate(streams):
+            assert decompress(s) == self._naive_decompress(s), f"stream {i} diverges"
+
+    def test_synthetic_round_trips_byte_identical(self) -> None:
+        import random
+
+        rng = random.Random(20260801)
+        inputs = [
+            b"",
+            b"A" * 9000,                      # overlap-heavy copy tokens
+            b"AB" * 5000,
+            bytes(range(16)) * 600,
+            bytes(rng.randrange(256) for _ in range(10000)),
+            (b"Sub Demo()\r\n    MsgBox 1\r\nEnd Sub\r\n" * 200),
+        ]
+        for i, plain in enumerate(inputs):
+            comp = compress(plain)
+            got = decompress(comp)
+            assert got == plain, f"input {i}: round trip broke"
+            assert got == self._naive_decompress(comp), f"input {i}: oracle diverges"
+
+    def test_malformed_inputs_raise_identical_errors(self) -> None:
+        comp = compress(b"Hello VBA world, hello again, hello hello.\r\n" * 40)
+        malformed = [
+            b"",
+            b"\x02",                    # wrong signature byte
+            comp[:1],                   # signature byte alone
+            comp[:5],                   # truncated mid-chunk
+            comp[: len(comp) // 2],     # truncated later
+            b"\x01" + b"\x00\x00",      # bad chunk signature bits
+        ]
+        for i, bad in enumerate(malformed):
+            new_msg = naive_msg = None
+            try:
+                decompress(bad)
+            except VBAProjectError as exc:
+                new_msg = str(exc)
+            try:
+                self._naive_decompress(bad)
+            except VBAProjectError as exc:
+                naive_msg = str(exc)
+            assert new_msg == naive_msg, f"case {i}: {new_msg!r} != {naive_msg!r}"
+
+
+class TestDecompressMaxBytes:
+    def test_prefix_is_chunk_aligned_and_byte_identical(self) -> None:
+        plain = (b"Sub P()\r\n    MsgBox 42\r\nEnd Sub\r\n" * 400)  # multi-chunk
+        comp = compress(plain)
+        full = decompress(comp)
+        assert full == plain
+        for limit in (1, 100, 4096, 4097, 8000, len(plain)):
+            prefix = decompress(comp, max_bytes=limit)
+            assert len(prefix) >= min(limit, len(plain))
+            assert len(prefix) % 4096 == 0 or len(prefix) == len(plain)
+            assert full.startswith(prefix)
+
+    def test_max_bytes_beyond_length_returns_full(self) -> None:
+        plain = b"Short module\r\n"
+        comp = compress(plain)
+        assert decompress(comp, max_bytes=10_000_000) == plain
+
+    def test_internal_consumed_flag(self) -> None:
+        from pyopenvba import vba as _vba
+
+        plain = b"X" * 10000  # 3 chunks
+        comp = compress(plain)
+        inner = getattr(_vba, "_decompress")
+        prefix, consumed = inner(comp, stream_name="t", max_bytes=1)
+        assert not consumed and len(prefix) == 4096
+        whole, consumed = inner(comp, stream_name="t", max_bytes=None)
+        assert consumed and whole == plain
+        # A limit the final chunk satisfies exactly still reports complete.
+        whole2, consumed2 = inner(comp, stream_name="t", max_bytes=len(plain))
+        assert consumed2 and whole2 == plain
+
+
+class TestLazyModuleSource:
+    """Module source materializes on first access (issue #5).  Single
+    chunk modules are eager (the header prefix already IS the source);
+    multi-chunk modules defer everything past chunk one."""
+
+    _LARGE = Path(__file__).parent / "live_excel_testing" / "large_vba_module.xlsm"
+
+    def _project_and_reference(self) -> tuple[VBAProject, str]:
+        import zipfile
+
+        from pyopenvba.cfb import CFB
+        from pyopenvba.vba import parse_dir_stream, parse_vba_project
+
+        if not self._LARGE.exists():
+            pytest.skip("large_vba_module.xlsm not present")
+        with zipfile.ZipFile(self._LARGE) as zf:
+            raw = zf.read("xl/vbaProject.bin")
+        cfb = CFB.from_bytes(raw)
+        # Reference source computed the pre-lazy way: full decompression.
+        dir_raw = decompress(cfb.get_stream_in_storage("VBA", "dir"))
+        info, mods = parse_dir_stream(dir_raw)
+        target = next(m for m in mods if m.name == "Large_Module_")
+        stream = cfb.get_stream_in_storage("VBA", target.stream_name or target.name)
+        reference = decompress(stream[target.text_offset:]).decode(
+            f"cp{info.code_page}", errors="replace"
+        )
+        assert len(reference) > 4096, "fixture module must span multiple chunks"
+        return parse_vba_project(cfb), reference
+
+    def test_multichunk_module_starts_unloaded(self) -> None:
+        project, _ = self._project_and_reference()
+        module = project.get_module("Large_Module_")
+        assert not module.source_loaded
+        # Names, kinds, and headers are available without materializing.
+        assert project.module_names()
+        assert module.attribute_header.startswith("Attribute VB_Name")
+        assert not module.source_loaded
+
+    def test_lazy_source_matches_eager_reference(self) -> None:
+        project, reference = self._project_and_reference()
+        module = project.get_module("Large_Module_")
+        assert module.source == reference
+        assert module.source_loaded
+
+    def test_attribute_header_matches_full_decompression(self) -> None:
+        project, reference = self._project_and_reference()
+        module = project.get_module("Large_Module_")
+        assert module.attribute_header == split_attribute_header(reference)[0]
+
+    def test_body_access_forces_and_matches(self) -> None:
+        project, reference = self._project_and_reference()
+        module = project.get_module("Large_Module_")
+        assert module.body == split_attribute_header(reference)[1]
+        assert module.source_loaded
+
+    def test_source_assignment_discards_loader(self) -> None:
+        project, _ = self._project_and_reference()
+        module = project.get_module("Large_Module_")
+        module.source = "Attribute VB_Name = \"Large_Module_\"\r\n\r\nSub S()\r\nEnd Sub\r\n"
+        assert module.source_loaded
+        assert "Sub S()" in module.source
+
+    def test_eager_constructor_unchanged(self) -> None:
+        module = VBAModule(name="M", stream_name="M", source="Sub A()\r\nEnd Sub\r\n")
+        assert module.source_loaded
+        assert module.source == "Sub A()\r\nEnd Sub\r\n"
+
+    def test_lazy_round_trips_through_full_pipeline(self, tmp_path: Path) -> None:
+        """A pyOpenVBA-authored multi-chunk module survives save, reopens
+        lazy, and materializes to exactly what was written."""
+        from pyopenvba import ExcelFile
+
+        body = "".join(
+            f"Sub Filler{i}()\r\n    Debug.Print {i}\r\n"
+            f"    ' padding line for chunk spill {i:04d}\r\nEnd Sub\r\n"
+            for i in range(120)
+        )
+        target = tmp_path / "big.xlsm"
+        with ExcelFile.create_new(target) as wb:
+            wb.vba_project().add_module("BigMod", body, kind=VBAModuleKind.standard)
+            wb.save()
+        with ExcelFile(target) as wb:
+            module = wb.vba_project().get_module("BigMod")
+            assert not module.source_loaded, "expected multi-chunk module to defer"
+            assert module.source.endswith("End Sub\r\n")
+            assert "chunk spill 0119" in module.source
+
+    def test_save_does_not_force_untouched_modules(self, tmp_path: Path) -> None:
+        """Editing one module and saving must not decompress the others."""
+        import shutil
+
+        from pyopenvba import ExcelFile
+
+        if not self._LARGE.exists():
+            pytest.skip("large_vba_module.xlsm not present")
+        work = tmp_path / "work.xlsm"
+        shutil.copy(self._LARGE, work)
+        with ExcelFile(work) as wb:
+            project = wb.vba_project()
+            victim = next(
+                m.name for m in project.modules if m.name != "Large_Module_"
             )
-        ).encode("cp1252")
-        self._assert_equivalent(src[:4096])
-
-    def test_repeating_grams_with_capped_matches(self) -> None:
-        # Many identical 3-grams whose matches hit the per-position
-        # length cap: exercises the early-exit tie-break path.
-        self._assert_equivalent(bytes(range(16)) * 128)
+            wb.set_module(victim, "Sub Edited()\r\nEnd Sub\r\n")
+            wb.save()
+            untouched = project.get_module("Large_Module_")
+            assert not untouched.source_loaded, (
+                "saving an unrelated edit forced decompression of an "
+                "untouched multi-chunk module"
+            )

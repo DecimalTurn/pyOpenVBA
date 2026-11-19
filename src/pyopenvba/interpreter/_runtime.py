@@ -1,0 +1,3604 @@
+"""The interpreter: a parsed module, executed against a host.
+
+Execution uses procedure-wide instructions with one frame per call.  Three things
+are worth stating, because they are where a VBA interpreter usually
+gets the semantics wrong:
+
+* ``On Error GoTo`` does not unwind.  The handler runs where the error
+  happened, so ``Resume Next`` can hand control back to the statement
+  after it even when that statement is inside a loop, which is how VBA
+  behaves and what a loop-and-skip macro depends on.
+* ``ByRef`` is the default.  An argument that is a plain variable is
+  passed as a slot the callee can write through; anything else, a
+  literal, an expression, or a parenthesised variable, is a copy.
+* An object used where a value is wanted gives up its default member,
+  so ``Range("A1") + 1`` adds to the cell's value without anyone
+  writing ``.Value``.
+"""
+
+from __future__ import annotations
+
+import re
+import sys
+from collections.abc import Iterator, Sequence
+from dataclasses import dataclass, field
+from decimal import Decimal
+from functools import lru_cache
+from typing import Any, Callable, Final
+from weakref import ReferenceType, ref
+
+from pyopenvba.exceptions import VBACompileError, VBADialogError, VBARuntimeError, VBASandboxError, VBAStepLimitError, VBAUnsupportedError
+from pyopenvba.interpreter import _ast as A
+from pyopenvba.interpreter import _flow as F
+from pyopenvba.interpreter import _locale
+from pyopenvba.interpreter._files import FileTable, Spaces, TabTo
+from pyopenvba.interpreter._http import Sessions
+from pyopenvba.interpreter._lex import default_type, strip_suffix
+from pyopenvba.interpreter._objects import BINDING, VBACollection, VBAObject, member, method, setter
+from pyopenvba.interpreter._parse import parse_module
+from pyopenvba.interpreter._type_library import (
+    UNDESCRIBED,
+    LibraryClass,
+    find_class,
+    kinds_of,
+    late_arguments,
+    late_index_error,
+    late_call_error,
+    late_error,
+    late_let_error,
+    late_number,
+    let_error,
+    reads_double_late,
+)
+from pyopenvba.interpreter._values import (
+    EMPTY,
+    ERR_INVALID_USE_OF_NULL,
+    ERR_MEMBER_NOT_FOUND,
+    ERR_OBJECT_VARIABLE_NOT_SET,
+    ERR_SUBSCRIPT_OUT_OF_RANGE,
+    ERR_TYPE_MISMATCH,
+    ERROR_TEXT,
+    MISSING,
+    NOTHING,
+    NULL,
+    NULL_STRING,
+    PRINT_CONTINUE,
+    PRINT_ZONE,
+    STORAGE_WIDTH,
+    NullString,
+    VBAArray,
+    VBAInt,
+    add,
+    coerce,
+    compare,
+    concat,
+    condition,
+    copy_value,
+    default_for,
+    divide,
+    error,
+    int_divide,
+    is_object,
+    like_match,
+    logical_and,
+    logical_eqv,
+    logical_imp,
+    logical_not,
+    logical_or,
+    logical_xor,
+    modulo,
+    multiply,
+    negate,
+    power,
+    release_in_order,
+    subtract,
+    text_bytes,
+    to_bool,
+    to_integer,
+    to_number,
+    to_text,
+    type_name,
+)
+
+#: How deep a call chain may go before this reports VBA's error 28.
+#: VBA's own limit is however much stack it has, so any number here is a
+#: choice; this one is deep enough for ordinary recursion and shallow
+#: enough to report the error rather than exhaust Python's stack.
+MAX_DEPTH: Final = 160
+
+
+# --- control-flow signals -----------------------------------------------------------
+
+
+class _Signal(Exception):
+    """Not an error: one of VBA's jumps, travelling up the Python stack."""
+
+
+class _ExitSignal(_Signal):
+    def __init__(self, what: str) -> None:
+        super().__init__(what)
+        self.what = what
+
+
+class _GotoSignal(_Signal):
+    def __init__(self, label: str) -> None:
+        super().__init__(label)
+        self.label = label
+
+
+class _ResumeSignal(_Signal):
+    def __init__(self, mode: str, label: str = "") -> None:
+        super().__init__(mode)
+        self.mode = mode
+        self.label = label
+
+
+class _EndSignal(_Signal):
+    """The End statement: stop everything, without an error."""
+
+
+# --- storage ------------------------------------------------------------------------
+
+
+@dataclass(slots=True)
+class Slot:
+    """One variable.  Passing the slot itself is what ByRef means."""
+
+    value: object = EMPTY
+    declared: str = "Variant"
+    #: The element type of a variable declared as a dynamic array (``Dim b() As Byte``), where
+    #: ``declared`` is Variant; empty for every other variable.
+    array_of: str = ""
+    #: Declared as an array of a fixed size, as distinct from a Variant that holds a copy of one.
+    fixed_array: bool = False
+
+    def get(self) -> object:
+        return self.value
+
+    def borrow_arrays(self) -> list[VBAArray]:
+        return []
+
+    def set(self, value: object) -> None:
+        if isinstance(self.value, UserTypeValue):
+            if not isinstance(value, UserTypeValue):
+                raise error(ERR_TYPE_MISMATCH)
+            self.value.copy_from(value)
+            return
+        if isinstance(self.value, VBAArray) and self.value.borrowed_elements:
+            raise error(10, "This array is fixed or temporarily locked")
+        if self.array_of == "Byte" and isinstance(value, str):
+            # A String assigned to a Byte array is its UTF-16LE bytes (native probe).
+            value = text_bytes(value)
+        elif isinstance(value, VBAObject) and not of_declared_class(value, self.declared):
+            # A variable of a class takes only an object of that class, and keeps what it held: Set c = Worksheets(1) with
+            # c As Collection is 13, as is Set ws = ws.Parent (tests/fixtures/typed_set.json).
+            raise error(ERR_TYPE_MISMATCH)
+        elif (isinstance(value, VBAArray) and self.array_of and value.element_type != self.array_of
+              and default_for(self.array_of) is not NOTHING):
+            # An array of another type does not go into a typed dynamic array: b() As Long
+            # = Array(1, 2) and b() As Variant = Split(...) are error 13, while
+            # a() As String = Split(...) fits (native probes).
+            raise error(ERR_TYPE_MISMATCH)
+        self.value = copy_value(coerce(as_declared(value, self.declared), self.declared))
+
+
+class ParamArrayValues(VBAArray):
+    """A ParamArray's array: an argument passed as a variable is that variable,
+    so ``xs(0) = xs(0) * 2`` changes the caller's; an expression, ``(a)``
+    included, is a copy (native probes)."""
+
+    __slots__ = ()
+
+    def get(self, subscripts: list[int]) -> object:
+        item = super().get(subscripts)
+        return item.get() if isinstance(item, Slot) else item
+
+    def set(self, subscripts: list[int], value: object) -> None:
+        item = self.items[self.offset(subscripts)]
+        if isinstance(item, Slot):
+            item.set(value)
+        else:
+            super().set(subscripts, value)
+
+    def elements(self) -> list[object]:
+        return [item.get() if isinstance(item, Slot) else item for item in self.items]
+
+
+class AutoNewSlot(Slot):
+    """A variable declared ``As New``: the object is made where the variable is
+    first used, not where it is declared, and made again after ``Set x = Nothing``,
+    so ``x Is Nothing`` is never True (native probes)."""
+
+    def __init__(self, declared: str, interpreter: Interpreter) -> None:
+        super().__init__(NOTHING, declared)
+        self.interpreter = interpreter
+
+    def get(self) -> object:
+        if self.value is NOTHING:
+            self.value = self.interpreter.create(self.declared)
+        return self.value
+
+
+class RecordFieldSlot(Slot):
+    """A field whose address can belong to an enclosing record array."""
+
+    def __init__(self, value: object, declared: str, array_of: str = "") -> None:
+        super().__init__(value, declared, array_of)
+        self.array_owner: ReferenceType[VBAArray] | None = None
+
+    def borrow_arrays(self) -> list[VBAArray]:
+        owner = self.array_owner() if self.array_owner is not None else None
+        return owner.borrow_arrays() if owner is not None else []
+
+
+class ArrayElementSlot(Slot):
+    """A ByRef alias to an array element, retaining its evaluated indices."""
+
+    def __init__(self, array: VBAArray, indices: list[int]) -> None:
+        self.array = array
+        self.indices = indices
+        super().__init__(array.get(indices), array.element_type)
+
+    def borrow_arrays(self) -> list[VBAArray]:
+        return self.array.borrow_arrays()
+
+    def get(self) -> object:
+        return self.array.get(self.indices)
+
+    def set(self, value: object) -> None:
+        self.array.set(self.indices, value)
+        self.value = self.array.get(self.indices)
+
+
+class EventSlot(Slot):
+    """A class's WithEvents variable; rebinding changes its subscription order."""
+
+    def __init__(self, owner: UserClassInstance, name: str, declared: str) -> None:
+        super().__init__(NOTHING, declared)
+        self.owner = ref(owner)
+        self.name = name
+
+    def set(self, value: object) -> None:
+        from pyopenvba.interpreter._com_hook import HostObject
+
+        if isinstance(value, HostObject):
+            raise VBAUnsupportedError(f"WithEvents on {value.vba_type_name}, an object the host supplies, is not implemented")
+        super().set(value)
+        owner = self.owner()
+        if owner is not None:
+            owner.interpreter.bind_event_sink(owner, self.name)
+        attached = getattr(value, "vba_sink_attached", None)
+        if callable(attached):
+            # A host object that does work lazily brings it up to date for its new listener.
+            attached()
+
+
+@dataclass(slots=True)
+class Frame:
+    """One call in progress."""
+
+    procedure: A.Procedure
+    module: ModuleRuntime
+    locals: dict[str, Slot] = field(default_factory=lambda: {})
+    me: object = None
+    with_stack: list[object] = field(default_factory=lambda: [])
+    program: F.Program | None = None
+    with_values: dict[int, object] = field(default_factory=lambda: {})
+    select_values: dict[int, object] = field(default_factory=lambda: {})
+    numeric_loops: dict[int, NumericLoop] = field(default_factory=lambda: {})
+    each_loops: dict[int, EachLoop] = field(default_factory=lambda: {})
+    gosub_returns: list[int] = field(default_factory=lambda: [])
+    handler: str = "none"
+    handler_label: str = ""
+    in_handler: bool = False
+    gosub_depth: int = 0
+    #: The last numbered line run in this procedure, which Erl reports for an error it handles.
+    line_number: int = 0
+    args_named: dict[str, Slot] = field(default_factory=lambda: {})
+    locked_arrays: list[VBAArray] = field(default_factory=lambda: [])
+
+    def slot(self, name: str) -> Slot | None:
+        return self.locals.get(name.lower())
+
+
+class ModuleRuntime:
+    """A parsed module together with the state it holds while running."""
+
+    def __init__(self, parsed: A.Module, interpreter: Interpreter) -> None:
+        self.parsed = parsed
+        self.interpreter = interpreter
+        self.name = parsed.name
+        self.variables: dict[str, Slot] = {}
+        self.constants: dict[str, object] = {}
+        self.statics: dict[str, dict[str, Slot]] = {}
+        self.procedures: dict[str, list[A.Procedure]] = {}
+        self.types: dict[str, A.TypeDef] = {}
+        self.enums: dict[str, dict[str, object]] = {}
+        self.enum_members: dict[str, object] = {}
+        self.declares: dict[str, A.DeclareDef] = {}
+        #: A document module's one instance, bound to the object it is the code of (see bind_document).
+        self.document: UserClassInstance | None = None
+        self._initialised = False
+        self.record_checks: dict[int, tuple[tuple[str, ReferenceType[ModuleRuntime]], ...]] = {}
+        self.numeric_checks: dict[int, tuple[tuple[str, ReferenceType[ModuleRuntime]], ...]] = {}
+        self.reference_checks: dict[int, tuple[tuple[str, ReferenceType[ModuleRuntime]], ...]] = {}
+        self.programs: dict[int, F.Program] = {}
+        self.program_errors: dict[int, tuple[str, str]] = {}
+        self.public_variables = {item.name.lower() for group in parsed.variables if group.scope in ('public', 'global') for item in group.decls}
+        self.public_constants = {name.lower() for group in parsed.constants if group.scope == 'public' for name, _, _ in group.names}
+        self.public_enum_members = {name.lower() for definition in parsed.enums if definition.scope == 'public' for name, _ in definition.members}
+        self.programs_compiled = False
+        self.program_scope: tuple[tuple[str, ReferenceType[ModuleRuntime]], ...] = ()
+        for procedure in parsed.procedures:
+            self.procedures.setdefault(procedure.name.lower(), []).append(procedure)
+        for defined in parsed.types:
+            self.types[defined.name.lower()] = defined
+
+    @property
+    def is_class(self) -> bool:
+        return self.parsed.kind in ("class", "document", "form")
+
+    def initialise(self) -> None:
+        """Give every module-level declaration its starting value."""
+        self.compile_programs()
+        if self._initialised:
+            return
+        self._initialised = True
+        interpreter = self.interpreter
+        for enum in self.parsed.enums:
+            values: dict[str, object] = {}
+            running = VBAInt(0, "Long")
+            for name, expression in enum.members:
+                if expression is not None:
+                    running = VBAInt(int(to_integer(interpreter.evaluate_constant(expression, self), "Long")), "Long")
+                values[name.lower()] = running
+                self.enum_members[name.lower()] = running
+                running = VBAInt(int(running) + 1, "Long")
+            self.enums[enum.name.lower()] = values
+        for declaration in self.parsed.constants:
+            for name, declared, expression in declaration.names:
+                self.constants[name.lower()] = coerce(
+                    interpreter.evaluate_constant(expression, self), declared
+                )
+        for group in self.parsed.variables:
+            for declaration in group.decls:
+                self.variables[declaration.name.lower()] = interpreter.make_slot(declaration, self)
+        for declare in self.parsed.declares:
+            self.declares[declare.name.lower()] = declare
+
+    def compile_programs(self) -> None:
+        """Validate the whole module before executable initialization."""
+        scope = tuple((key, ref(runtime)) for key, runtime in self.interpreter.modules.items())
+        if self.programs_compiled and self.program_scope == scope:
+            return
+        self.programs.clear()
+        self.program_errors.clear()
+        for procedure in self.parsed.procedures:
+            key = id(procedure)
+            try:
+                self.programs[key] = F.compile_program(procedure, f'{self.name}.{procedure.name}',
+                                                       self.flow_declarations(), self.flow_value_type, self.parsed.default_types)
+            except VBACompileError as failure:
+                # Native compile-on-demand permits valid calls beside an
+                # unused invalid procedure. Do not retain traceback frames.
+                self.program_errors[key] = (failure.message, failure.where)
+        self.programs_compiled = True
+        self.program_scope = scope
+
+    def program_for(self, procedure: A.Procedure) -> F.Program:
+        self.compile_programs()
+        key = id(procedure)
+        failure = self.program_errors.get(key)
+        if failure is not None:
+            raise VBACompileError(failure[0], where=failure[1])
+        program = self.programs.get(key)
+        if program is not None:
+            return program
+        # Synthetic procedures supplied by a host are not retained by the
+        # parsed module; do not leave their reusable ids in the cache.
+        return F.compile_program(procedure, f'{self.name}.{procedure.name}',
+                                 self.flow_declarations(), self.flow_value_type, self.parsed.default_types)
+
+    def flow_declarations(self) -> list[A.Dim]:
+        # Resolve project globals before treating ReDim as a local declaration.
+        return [group for runtime in self.interpreter.modules.values() if runtime is not self and not runtime.is_class
+                for group in runtime.parsed.variables if group.scope in ('public', 'global')] + self.parsed.variables
+
+    def flow_value_type(self, declared: str) -> bool:
+        if declared in ('', 'Variant', 'Object'):
+            return False
+        return (declared in STORAGE_WIDTH or declared in ('String', 'LongPtr', 'LongLong', 'Decimal')
+                or declared.startswith('String*') or self.interpreter.is_enum_type(declared, self)
+                or self.interpreter.record_type(declared, self) is not None)
+
+    def procedure(self, name: str, kind: str = "") -> A.Procedure | None:
+        found = self.procedures.get(name.lower())
+        if not found:
+            return None
+        if kind:
+            for candidate in found:
+                if candidate.kind == kind:
+                    return candidate
+            return None
+        for candidate in found:
+            if candidate.kind in ("sub", "function", "get"):
+                return candidate
+        return found[0]
+
+
+# --- the objects the language itself provides ---------------------------------------
+
+
+class ErrObject(VBAObject):
+    """VBA's ``Err``: what the last error was, and how to raise one."""
+
+    vba_type_name = "ErrObject"
+
+    def __init__(self) -> None:
+        self.number = 0
+        self.description = ""
+        self.source = ""
+        self.help_file = ""
+        self.help_context = 0
+        #: HelpFile and HelpContext an Err.Raise gave, for the error it raises.
+        self._raised_help: tuple[str, int] | None = None
+        #: What Erl reports: the last numbered line run in the procedure that
+        #: handled the error. Err.Clear keeps it (native probes).
+        self.erl = 0
+
+    @member
+    def Number(self) -> object:
+        return VBAInt(self.number, "Long")
+
+    @setter("Number")
+    def _set_number(self, value: object) -> None:
+        self.number = int(to_integer(value, "Long"))
+        if self.number == 0:
+            self.description = ""
+            self.source = ""
+
+    @member
+    def Description(self) -> object:
+        return self.description
+
+    @setter("Description")
+    def _set_description(self, value: object) -> None:
+        self.description = to_text(value)
+
+    @member
+    def Source(self) -> object:
+        return self.source
+
+    @setter("Source")
+    def _set_source(self, value: object) -> None:
+        self.source = to_text(value)
+
+    @member
+    def HelpFile(self) -> object:
+        return self.help_file
+
+    @member
+    def HelpContext(self) -> object:
+        return VBAInt(self.help_context, "Long")
+
+    @member
+    def LastDllError(self) -> object:
+        """No DLL is called here, so no DLL left an error: 0, a Long, as natively after none."""
+        return VBAInt(0, "Long")
+
+    @method
+    def Clear(self) -> object:
+        self.reset()
+        return EMPTY
+
+    def reset(self, *, clear_erl: bool = False) -> None:
+        """Clear Err; language-control transitions also clear Erl, unlike Err.Clear."""
+        self.number = 0
+        self.description = ""
+        self.source = ""
+        self.help_file = ""
+        self.help_context = 0
+        self._raised_help = None
+
+        if clear_erl:
+            self.erl = 0
+
+    @method
+    def Raise(
+        self,
+        Number: object = MISSING,
+        Source: object = MISSING,
+        Description: object = MISSING,
+        HelpFile: object = MISSING,
+        HelpContext: object = MISSING,
+    ) -> object:
+        if Number is MISSING:
+            raise error(449)
+        number = int(to_integer(Number, "Long"))
+        if number == 0 or number > 65535:
+            # 0 and numbers past 65535 are not error numbers: Err.Raise 70000 is error 5 (native probes).
+            raise error(5)
+        text = to_text(Description) if Description is not MISSING else ""
+        self._raised_help = (to_text(HelpFile) if HelpFile is not MISSING else "",
+                             int(to_integer(HelpContext, "Long")) if HelpContext is not MISSING else -1)
+        raise error(number, text, source=to_text(Source) if Source is not MISSING else "")
+
+    def capture(self, failure: VBARuntimeError) -> None:
+        self.number = failure.number
+        self.description = failure.description
+        self.source = failure.source
+        raised, self._raised_help = self._raised_help, None
+        # VBA's own errors carry a help topic of 1000000 and their number: Err.Raise 9
+        # leaves HelpContext 1000009 (native probes).
+        own = 1000000 + failure.number if failure.number <= 1000 and failure.number in ERROR_TEXT else 0
+        self.help_file = raised[0] if raised else ""
+        self.help_context = raised[1] if raised and raised[1] >= 0 else own
+
+    def describe(self, indent: str = "") -> str:
+        if not self.number:
+            return f"{indent}Err: no error"
+        return f"{indent}Err {self.number}: {self.description}"
+
+
+class DebugObject(VBAObject):
+    """``Debug``: Print goes to the console this interpreter collects."""
+
+    vba_type_name = "Debug"
+
+    def __init__(self, interpreter: Interpreter) -> None:
+        self.interpreter = interpreter
+
+    @method
+    def Print(self, *args: object) -> object:
+        self.interpreter.write_print(_print_text(args), holding=bool(args) and args[-1] is PRINT_CONTINUE)
+        return EMPTY
+
+    @method
+    def Assert(self, Condition: object = MISSING) -> object:
+        if Condition is not MISSING and not to_bool(Condition):
+            self.interpreter.assertions.append(self.interpreter.current_where())
+        return EMPTY
+
+
+#: How wide Print's comma zones are.
+PRINT_ZONE_WIDTH: Final = 14
+
+
+def _print_text(args: Sequence[object]) -> str:
+    """Print's own formatting.
+
+    A number is written with a leading space where it is not negative
+    and a trailing one always, a comma moves to the next 14-column
+    zone, and a trailing semicolon means the next Print continues this
+    line.
+    """
+    out = ""
+    for value in args:
+        if value is PRINT_ZONE:
+            out += " " * (PRINT_ZONE_WIDTH - len(out) % PRINT_ZONE_WIDTH)
+            continue
+        if value is PRINT_CONTINUE:
+            continue
+        if isinstance(value, bool) or not isinstance(value, (int, float, Decimal)):
+            out += to_text(value)
+            continue
+        text = to_text(value)
+        out += (text if text.startswith("-") else f" {text}") + " "
+    return out
+
+
+class Collection(VBACollection):
+    """VBA's intrinsic Collection, keys and all."""
+
+    vba_type_name = "Collection"
+
+    def __init__(self) -> None:
+        self._items: list[object] = []
+        self._keys: list[str | None] = []
+
+    def __del__(self) -> None:
+        # VBA releases a freed collection's items first to last, so their
+        # Class_Terminate runs in that order; Python's list would go last to first.
+        release_in_order(self._items)
+
+    def vba_items(self) -> list[object]:
+        return self._items
+
+    @method
+    def Add(
+        self,
+        Item: object = MISSING,
+        Key: object = MISSING,
+        Before: object = MISSING,
+        After: object = MISSING,
+    ) -> object:
+        if Item is MISSING:
+            raise error(449)
+        if isinstance(Item, NullString):  # a Collection keeps a new string
+            Item = ""
+        # A key that is not String text (a number, Date, Empty or Null) is error 13;
+        # Before and After together are error 5 (native probes).
+        if Key is not MISSING and not isinstance(Key, str):
+            raise error(13)
+        if Before is not MISSING and After is not MISSING:
+            raise error(5)
+        key = Key if isinstance(Key, str) else None
+        if key is not None and any(existing is not None and existing.lower() == key.lower() for existing in self._keys):
+            raise error(457)
+        at = len(self._items)
+        if Before is not MISSING:
+            at = self._position(Before) - 1
+        elif After is not MISSING:
+            at = self._position(After)
+        self._items.insert(at, Item)
+        self._keys.insert(at, key)
+        return EMPTY
+
+    @method
+    def Remove(self, Index: object = MISSING) -> object:
+        at = self._position(Index)
+        self._items.pop(at - 1)
+        self._keys.pop(at - 1)
+        return EMPTY
+
+    def _position(self, index: object) -> int:
+        if isinstance(index, str):
+            for at, key in enumerate(self._keys, start=1):
+                if key is not None and key.lower() == index.lower():
+                    return at
+            raise error(5)
+        at = int(to_integer(index, "Long"))
+        if not 1 <= at <= len(self._items):
+            # An empty collection reports any position as error 5, a filled one as 9 (native probes).
+            raise error(ERR_SUBSCRIPT_OUT_OF_RANGE if self._items else 5)
+        return at
+
+    def vba_lookup(self, index: object, items: list[object]) -> object:
+        return self._items[self._position(index) - 1]
+
+    @method(default=True)
+    def Item(self, Index: object = MISSING) -> object:
+        """A method in VBA's Collection, where a host's collections have a property: CallByName(c, "Item",
+        VbMethod, 2) reaches it (tests/fixtures/excel_model/probes.txt)."""
+        if Index is MISSING:
+            raise error(449)
+        return self.vba_lookup(Index, self._items)
+
+    #: VBA's Collection takes CallByName's call type to the letter: VbGet on
+    #: Count, a method here, is error 438 (native probe), where a host's
+    #: objects take either.
+    vba_strict_call_types = True
+
+    @method
+    def Count(self) -> object:
+        """A method in VBA's Collection: CallByName(c, "Count", VbMethod) reads it (native probe)."""
+        return VBAInt(len(self._items), "Long")
+
+    def describe(self, indent: str = "") -> str:
+        return f"{indent}Collection ({len(self._items)} items)"
+
+
+class UserTypeValue(VBAObject):
+    """An instance of a ``Type ... End Type``."""
+
+    def __init__(self, defined: A.TypeDef, interpreter: Interpreter, module: ModuleRuntime) -> None:
+        self.defined = defined
+        self.vba_type_name = defined.name
+        self.fields: dict[str, Slot] = {}
+        for field_ in defined.fields:
+            declaration = A.VarDecl(
+                name=field_.name,
+                declared=field_.declared,
+                bounds=field_.bounds,
+                is_array=field_.is_array,
+            )
+            slot = interpreter.make_slot(declaration, module)
+            self.fields[field_.name.lower()] = RecordFieldSlot(slot.get(), slot.declared, slot.array_of)
+
+    def vba_value(self) -> object:
+        # Records are values, despite sharing the member-dispatch interface.
+        return self
+
+    def record_layout(self, *, binary: bool) -> tuple[int, int]:
+        """Native 64-bit VBA record width and maximum field alignment."""
+        total, alignment = 0, 1
+        for slot in self.fields.values():
+            value, declared = slot.get(), slot.declared
+            count = 1
+            if isinstance(value, VBAArray) and value.fixed:
+                declared = value.element_type
+                count, value = value.size, value.items[0]
+            if isinstance(value, VBAArray):
+                # A dynamic array field holds a pointer to its array, whatever
+                # its element type or bounds (native probes, ReDim included).
+                width = field_alignment = 8
+            elif isinstance(value, UserTypeValue):
+                width, field_alignment = value.record_layout(binary=binary)
+            elif declared.startswith('String*'):
+                width = int(declared.partition('*')[2]) * (2 if binary else 1)
+                field_alignment = 2 if binary else 1
+            else:
+                width = STORAGE_WIDTH.get(declared, {'String': 8, 'Variant': 24}.get(declared, 8))
+                field_alignment = min(width, 8)
+            alignment = max(alignment, field_alignment)
+            if binary:
+                total = (total + field_alignment - 1) // field_alignment * field_alignment
+            total += width * count
+        if binary:
+            total = (total + alignment - 1) // alignment * alignment
+        return total, alignment
+
+    def vba_copy_value(self) -> UserTypeValue:
+        result = UserTypeValue.__new__(UserTypeValue)
+        result.defined = self.defined
+        result.vba_type_name = self.vba_type_name
+        result.fields = {name: RecordFieldSlot(copy_value(slot.get()), slot.declared, slot.array_of) for name, slot in self.fields.items()}
+        return result
+
+    def vba_bind_array(self, array: VBAArray) -> None:
+        for slot in self.fields.values():
+            if isinstance(slot, RecordFieldSlot):
+                slot.array_owner = ref(array)
+            value = slot.get()
+            if isinstance(value, UserTypeValue):
+                value.vba_bind_array(array)
+            elif isinstance(value, VBAArray) and value.fixed:
+                value.parent_array = ref(array)
+
+    def vba_assign_value(self, value: object) -> None:
+        if not isinstance(value, UserTypeValue):
+            raise error(ERR_TYPE_MISMATCH)
+        self.copy_from(value)
+
+    def copy_from(self, source: UserTypeValue) -> None:
+        if self.defined is not source.defined:
+            raise error(ERR_TYPE_MISMATCH)
+        if self is source:
+            return
+        for name, source_slot in source.fields.items():
+            target_slot = self.fields[name]
+            target, value = target_slot.get(), source_slot.get()
+            if isinstance(target, VBAArray) and isinstance(value, VBAArray):
+                # A record copy writes existing fixed storage, preserving any
+                # ByRef alias to one of its elements.
+                target.copy_from(value)
+            else:
+                target_slot.set(value)
+
+    def vba_get(self, name: str, args: Sequence[object] = (), named: dict[str, object] | None = None) -> object:
+        slot = self.fields.get(name.lower())
+        if slot is None:
+            raise error(ERR_MEMBER_NOT_FOUND, f"{self.vba_type_name} has no member named {name}")
+        value = slot.get()
+        if args and isinstance(value, VBAArray):
+            return value.get([int(to_integer(one, "Long")) for one in args])
+        return value
+
+    def vba_set(
+        self,
+        name: str,
+        value: object,
+        args: Sequence[object] = (),
+        named: dict[str, object] | None = None,
+        *,
+        by_ref: bool = False,
+    ) -> None:
+        slot = self.fields.get(name.lower())
+        if slot is None:
+            raise error(ERR_MEMBER_NOT_FOUND, f"{self.vba_type_name} has no member named {name}")
+        if args and isinstance(slot.value, VBAArray):
+            slot.value.set([int(to_integer(one, "Long")) for one in args], value)
+            return
+        slot.set(value)
+
+    def vba_member(self, name: str) -> Any:
+        return None
+
+    def describe(self, indent: str = "") -> str:
+        inner = ", ".join(f"{name}={_short(slot.get())}" for name, slot in self.fields.items())
+        return f"{indent}{self.vba_type_name}({inner})"
+
+
+class EnumNamespace(VBAObject):
+    """An enum's name before a dot: ``Shade.Light`` or ``Palette.Shade.Light``
+    reads the member (native probes)."""
+
+    def __init__(self, name: str, members: dict[str, object]) -> None:
+        self.name = name
+        self.members = members
+
+    def vba_get(self, name: str, args: Sequence[object] = (), named: dict[str, object] | None = None) -> object:
+        key = name.casefold()
+        if args or key not in self.members:
+            raise VBACompileError(f'Method or data member not found: {self.name}.{name}')
+        return self.members[key]
+
+
+class StandardModuleNamespace(VBAObject):
+    """A compiler namespace for a standard module, reached only before a dot."""
+
+    def __init__(self, module: ModuleRuntime, interpreter: Interpreter, caller: ModuleRuntime | None) -> None:
+        self.module = module
+        self.interpreter = interpreter
+        self.caller = caller
+
+    def procedure(self, name: str, kind: str = '') -> A.Procedure | None:
+        procedure = self.module.procedure(name, kind)
+        if procedure is not None and procedure.scope == 'private' and self.caller is not self.module:
+            raise VBACompileError(f'Member is private: {self.module.name}.{name}')
+        return procedure
+
+    def variable(self, name: str) -> Slot | None:
+        key = name.casefold()
+        self.module.initialise()
+        slot = self.module.variables.get(key)
+        if slot is not None and self.caller is not self.module and not any(
+            group.scope in ('public', 'global') and any(declaration.name.casefold() == key for declaration in group.decls)
+            for group in self.module.parsed.variables
+        ):
+            raise VBACompileError(f'Member is private: {self.module.name}.{name}')
+        return slot
+
+    def vba_get(self, name: str, args: Sequence[object] = (), named: dict[str, object] | None = None) -> object:
+        procedure = self.procedure(name, 'get') or self.procedure(name)
+        if procedure is not None and procedure.kind in ('get', 'function', 'sub'):
+            return self.interpreter.call_value(procedure, self.module, list(args), named or {})
+        slot = self.variable(name)
+        if slot is not None:
+            value = slot.get()
+            return value.get([int(to_integer(one, 'Long')) for one in args]) if args and isinstance(value, VBAArray) else value
+        key = name.casefold()
+        if key in self.module.constants:
+            if self.caller is not self.module and not any(group.scope == 'public' and any(item[0].casefold() == key for item in group.names) for group in self.module.parsed.constants):
+                raise VBACompileError(f'Member is private: {self.module.name}.{name}')
+            return self.module.constants[key]
+        if key in self.module.enum_members:
+            if self.caller is not self.module and not any(definition.scope == 'public' and any(item[0].casefold() == key for item in definition.members) for definition in self.module.parsed.enums):
+                raise VBACompileError(f'Member is private: {self.module.name}.{name}')
+            return self.module.enum_members[key]
+        enum = next((definition for definition in self.module.parsed.enums if definition.name.casefold() == key), None)
+        if enum is not None and not args:
+            if self.caller is not self.module and enum.scope != 'public':
+                raise VBACompileError(f'Member is private: {self.module.name}.{name}')
+            return EnumNamespace(enum.name, self.module.enums[key])
+        raise VBACompileError(f'Member not found: {self.module.name}.{name}')
+
+    def vba_set(self, name: str, value: object, args: Sequence[object] = (),
+                named: dict[str, object] | None = None, *, by_ref: bool = False) -> None:
+        procedure = self.procedure(name, 'set' if by_ref else 'let')
+        if procedure is not None:
+            self.interpreter.call_setter(procedure, self.module, list(args), named or {}, value)
+            return
+        slot = self.variable(name)
+        if slot is None:
+            raise VBACompileError(f'Member not found: {self.module.name}.{name}')
+        if args and isinstance(slot.value, VBAArray):
+            slot.value.set([int(to_integer(one, 'Long')) for one in args], value)
+        else:
+            slot.set(value)
+
+
+class UserClassInstance(VBAObject):
+    """An instance of a class module."""
+
+    def __init__(self, module: ModuleRuntime, interpreter: Interpreter) -> None:
+        self.module = module
+        self.interpreter = interpreter
+        self.vba_type_name = module.name
+        #: For a document module, the object it is the code of -- a worksheet, the workbook -- which Me is.
+        self.host: VBAObject | None = None
+        self.variables: dict[str, Slot] = {}
+        for group in module.parsed.variables:
+            for declaration in group.decls:
+                key = declaration.name.lower()
+                self.variables[key] = (
+                    EventSlot(self, key, declaration.declared) if declaration.with_events
+                    else interpreter.make_slot(declaration, module)
+                )
+
+    def vba_member(self, name: str) -> Any:
+        return None
+
+    def __del__(self) -> None:
+        """Class_Terminate, when the last reference goes. VBA counts references and
+        so does CPython: Set x = Nothing, a reassignment or the end of the
+        procedure that held it runs it there, as native probes show. An object in
+        a reference cycle, which VBA never terminates, is freed by Python's cycle
+        collector at a time of its own."""
+        if sys.is_finalizing() or self.host is not None or not self.module.is_class:
+            return
+        procedure = self.module.procedure("Class_Terminate")
+        if procedure is None:
+            return
+        try:
+            self.interpreter.call(procedure, self.module, [], {}, me=self)
+        except Exception:  # noqa: BLE001 - nothing can catch an error raised while freeing an object here
+            pass
+
+    def vba_get(self, name: str, args: Sequence[object] = (), named: dict[str, object] | None = None) -> object:
+        procedure = self.module.procedure(name, "get") or self.module.procedure(name)
+        if procedure is not None and procedure.kind in ("get", "function", "sub"):
+            return self.interpreter.call_value(procedure, self.module, list(args), named or {}, me=self)
+        slot = self.variables.get(name.lower())
+        if slot is not None:
+            value = slot.get()
+            if args or named:
+                return _call_value(value, list(args), named or {})
+            return value
+        constant = self.module.constants.get(name.lower())
+        if constant is not None:
+            return constant
+        raise error(ERR_MEMBER_NOT_FOUND, f"{self.vba_type_name} has no member named {name}")
+
+    def vba_set(
+        self,
+        name: str,
+        value: object,
+        args: Sequence[object] = (),
+        named: dict[str, object] | None = None,
+        *,
+        by_ref: bool = False,
+    ) -> None:
+        kind = "set" if by_ref else "let"
+        procedure = self.module.procedure(name, kind)
+        if procedure is None and by_ref:
+            procedure = self.module.procedure(name, "let")
+        if procedure is not None:
+            self.interpreter.call_setter(procedure, self.module, list(args), named or {}, value, me=self)
+            return
+        slot = self.variables.get(name.lower())
+        if slot is None:
+            raise error(ERR_MEMBER_NOT_FOUND, f"{self.vba_type_name} has no member named {name}")
+        if args and isinstance(slot.value, VBAArray):
+            slot.value.set([int(to_integer(one, "Long")) for one in args], value)
+            return
+        slot.set(value)
+
+    def vba_value(self) -> object:
+        procedure = self.module.procedure("Value", "get")
+        if procedure is not None:
+            return self.interpreter.call(procedure, self.module, [], {}, me=self)
+        raise error(ERR_MEMBER_NOT_FOUND, f"{self.vba_type_name} has no default member")
+
+    # --- a document module: a sheet's or the workbook's own code --------------------------
+
+    def public(self, name: str) -> bool:
+        """Whether code outside the module reaches ``name``: a Public procedure or module-level variable."""
+        key = name.lower()
+        if any(procedure.scope != "private" for procedure in self.module.procedures.get(key, [])):
+            return True
+        return key in self.variables and any(
+            group.scope in ("public", "global") and any(declaration.name.lower() == key for declaration in group.decls)
+            for group in self.module.parsed.variables)
+
+    def raise_event(self, name: str, args: list[object]) -> None:
+        self.interpreter.raise_event(self, name, args)
+
+    def describe(self, indent: str = "") -> str:
+        inner = ", ".join(f"{name}={_short(slot.get())}" for name, slot in self.variables.items())
+        return f"{indent}{self.vba_type_name}({inner})"
+
+
+class InterfaceView(VBAObject):
+    """An object seen through an interface its class ``Implements``.
+
+    A variable typed as the interface holds this, and so does any Object or
+    Variant it is assigned on to: ``sh.Area`` runs the class's private
+    ``IShape_Area``, late-bound ``v.Area`` too, and a member only the class has
+    is error 438. ``Is``, ``TypeName`` and ``TypeOf`` see the object itself
+    (native probes).
+    """
+
+    def __init__(self, instance: UserClassInstance, interface: str) -> None:
+        self.instance = instance
+        self.interface = interface
+        self.vba_type_name = instance.vba_type_name
+
+    @property
+    def vba_identity(self) -> UserClassInstance:
+        return self.instance
+
+    def _procedure(self, name: str, kind: str = "") -> A.Procedure | None:
+        return self.instance.module.procedure(f"{self.interface}_{name}", kind)
+
+    def vba_member(self, name: str) -> Any:
+        return None
+
+    def vba_get(self, name: str, args: Sequence[object] = (), named: dict[str, object] | None = None) -> object:
+        procedure = self._procedure(name, "get") or self._procedure(name)
+        if procedure is None or procedure.kind not in ("get", "function", "sub"):
+            raise error(ERR_MEMBER_NOT_FOUND, f"{self.interface} has no member named {name}")
+        instance = self.instance
+        return instance.interpreter.call(procedure, instance.module, list(args), named or {}, me=instance)
+
+    def vba_set(
+        self,
+        name: str,
+        value: object,
+        args: Sequence[object] = (),
+        named: dict[str, object] | None = None,
+        *,
+        by_ref: bool = False,
+    ) -> None:
+        procedure = self._procedure(name, "set" if by_ref else "let") or (self._procedure(name, "let") if by_ref else None)
+        if procedure is None:
+            raise error(ERR_MEMBER_NOT_FOUND, f"{self.interface} has no member named {name}")
+        instance = self.instance
+        instance.interpreter.call(procedure, instance.module, [*args, value], named or {}, me=instance)
+
+    def describe(self, indent: str = "") -> str:
+        return f"{indent}{self.interface} of {self.instance.describe()}"
+
+
+def as_declared(value: object, declared: str) -> object:
+    """An object as a variable of type ``declared`` holds it (native probes):
+
+    - a class's own type: the object itself, so ``Set s2 = sh`` reads ``s2.Area`` as the class's;
+    - an interface the class Implements: its view;
+    - another class module: error 13;
+    - Object, Variant or any other type: what was assigned, view and all.
+    """
+    instance = value.instance if isinstance(value, InterfaceView) else value
+    if not isinstance(instance, UserClassInstance):
+        return value
+    key = declared.rpartition(".")[2].lower()
+    if key == instance.module.name.lower():
+        return instance
+    implemented = next((name for name in instance.module.parsed.implements if name.lower() == key), None)
+    if implemented is not None:
+        return InterfaceView(instance, implemented)
+    target = instance.interpreter.modules.get(key)
+    if target is not None and target.is_class:
+        raise error(ERR_TYPE_MISMATCH)
+    return value
+
+
+def _short(value: object) -> str:
+    if isinstance(value, str):
+        return f'"{value}"'
+    if isinstance(value, VBAObject):
+        return f"<{value.vba_type_name}>"
+    if value is EMPTY:
+        return "Empty"
+    try:
+        return to_text(value)
+    except VBARuntimeError:
+        return type_name(value)
+
+
+# --- assignment targets --------------------------------------------------------------
+
+
+@dataclass(slots=True)
+class Assignable:
+    """Somewhere a value can be put: a slot, an element, or a member."""
+
+    put: Callable[[object, bool], None]
+    take: Callable[[], object]
+    declared: str = 'Variant'
+    #: True for a property whose Let takes an object itself (setter(objects=True)).
+    takes_objects: bool = False
+    #: What the property makes of a value given by Let, an object still whole, before anything else does.
+    given: Callable[[object], object] | None = None
+    #: For a member: the object it belongs to, the library its class is looked up in when an object is given by Let, the member, and
+    #: whether the call is bound late.
+    owner: object = None
+    library: str | None = None
+    member: str = ''
+    bound_late: bool = False
+
+
+@dataclass(slots=True)
+class NumericLoop:
+    target: Assignable
+    limit: object
+    step: object
+
+
+@dataclass(slots=True)
+class EachLoop:
+    target: Assignable
+    iterator: Iterator[object] | None
+    declared: str
+    array: VBAArray | None = None
+
+    def close(self) -> None:
+        if self.array is not None:
+            self.array.borrowed_elements -= 1
+            self.array = None
+        self.iterator = None
+
+
+# --- the interpreter -------------------------------------------------------------------
+
+
+class StepBudget:
+    """One run from the host: what started it and what is left of its steps, shared by every interpreter of the host's projects."""
+
+    __slots__ = ("entry", "left", "limit", "running")
+
+    def __init__(self) -> None:
+        self.limit: int | None = None
+        self.left = 0
+        self.running = False
+        #: What the host started the run with, "Module1.Main" or "ThisWorkbook.Workbook_Open"; "" between runs.
+        self.entry = ""
+
+
+class Interpreter:
+    """Runs VBA against a host object model."""
+
+    def __init__(self, host: HostBridge | None = None) -> None:
+        self.modules: dict[str, ModuleRuntime] = {}
+        self.host = host if host is not None else HostBridge()
+        self.err = ErrObject()
+        #: The VBA project's name: Err.Source of an error raised without one (native probe).
+        self.project_name = "VBAProject"
+        self.debug = DebugObject(self)
+        self.console: list[str] = []
+        self.assertions: list[str] = []
+        self.frames: list[Frame] = []
+        #: The file numbers, current folder and Dir's list.
+        self.files = FileTable(self)
+        #: What is left to do when VBA pumps messages at DoEvents: asynchronous HTTP requests (see _http).
+        self.pumped: list[Callable[[], None]] = []
+        #: XMLHTTP's cookies and logins, which all the objects of one program name share (see _http).
+        self.internet_sessions: dict[str, Sessions] = {}
+        #: Whether running VBA is kept from reaching outside the engine (see outside).
+        self.sandbox = True
+        #: How many steps a run of VBA may take, shared with every interpreter of the host's projects (see step_limit).
+        self.steps = StepBudget()
+        #: The COM classes the host supplies, by ProgID in lower case, with the folders a file may be in (see set_com_class).
+        self.com_classes: dict[str, tuple[Callable[..., object], tuple[str, ...]]] = {}
+        #: Every dialog the run put up, in order.
+        self.dialogs: list[tuple[str, str, str, int]] = []
+        #: What the next dialog answers with, oldest first.
+        self.answers: list[object] = []
+        #: What ExcelApplication.set_hook registered, and the members whose functions are running (see apps/excel/_hooks).
+        self.hooks: dict[str, object] = {}
+        self.hooks_running: list[str] = []
+        #: The folders a sandboxed macro may read linked workbooks in (ExcelApplication.allow_link_reads).
+        self.link_folders: tuple[str, ...] = ()
+        self.frozen_now: Any = None
+        #: The Regional format the project runs under: what CStr, Format and CDate write and read.
+        self.locale: _locale.Locale = _locale.EN_US
+        self._rnd_state = 0x50000
+        self._line_open = False
+        self._intrinsics = _load_intrinsics()
+        self.event_sinks: list[tuple[ReferenceType[UserClassInstance], str]] = []
+
+    # --- loading ---------------------------------------------------------------------
+
+    @property
+    def option_compare_text(self) -> bool:
+        """Whether the module running now says Option Compare Text, which makes =, Like, Select Case and a
+        comparison function's default compare as text."""
+        return bool(self.frames) and self.frames[-1].module.parsed.option_compare_text
+
+    def add_module(self, source: str, *, name: str = "", kind: str = "standard") -> ModuleRuntime:
+        """Parse ``source`` and add it to the project."""
+        parsed = parse_module(source, name=name, kind=kind, retain_body_errors=True)
+        if not parsed.name:
+            parsed.name = name or f"Module{len(self.modules) + 1}"
+        runtime = ModuleRuntime(parsed, self)
+        self.modules[parsed.name.lower()] = runtime
+        return runtime
+
+    def module(self, name: str) -> ModuleRuntime:
+        found = self.modules.get(name.lower())
+        if found is None:
+            raise VBACompileError(f"there is no module named {name}")
+        return found
+
+    def bind_document(self, name: str, host: VBAObject) -> UserClassInstance:
+        """Make document module ``name`` the code of ``host``: Me is ``host``, its members are the module's by
+        name, and ``host`` answers the module's Public members to code outside it."""
+        runtime = self.module(name)
+        instance = UserClassInstance(runtime, self)
+        instance.host = host
+        runtime.document = instance
+        host.vba_document = instance
+        return instance
+
+    def initialise(self) -> None:
+        for runtime in list(self.modules.values()):
+            runtime.compile_programs()
+        for runtime in list(self.modules.values()):
+            if not runtime.is_class:
+                runtime.initialise()
+
+    # --- console and the world outside the model ---------------------------------------
+
+    def write_line(self, text: str) -> None:
+        self.console.append(text)
+
+    def write_print(self, text: str, *, holding: bool = False) -> None:
+        """Print's output, which a trailing semicolon holds on one line."""
+        if self._line_open and self.console:
+            self.console[-1] += text
+        else:
+            self.console.append(text)
+        self._line_open = holding
+
+    def clock(self) -> Any:
+        """Now, as the run sees it.  Fixed by ``freeze`` for a repeatable run."""
+        import datetime as _dt
+
+        return self.frozen_now if self.frozen_now is not None else _dt.datetime.now()
+
+    def freeze(self, when: Any) -> None:
+        """Pin Now, Date, Time and Timer, so a run can be compared with another."""
+        self.frozen_now = when
+
+    def show_message(self, prompt: str, style: int, title: str) -> object:
+        """MsgBox without a screen: record it, answer from the queue."""
+        self.dialogs.append(("MsgBox", prompt, title, style))
+        if self.answers:
+            return self.answers.pop(0)
+        return VBAInt(_default_button(style), "Integer")
+
+    def ask_for_input(self, prompt: str, title: str, default: str) -> object:
+        """InputBox without a screen: False is Cancel, which reads as "", and None is OK on the default as it stands."""
+        answer = self.next_answer("InputBox", prompt, title)
+        if answer is False:
+            return NULL_STRING
+        return default if answer is None else to_text(answer)
+
+    def next_answer(self, kind: str, prompt: str = "", title: str = "", style: int = 0) -> object:
+        """Record a dialog going up and take the answer the caller queued for it; with none, stop the run, as nobody
+        is at the screen to answer."""
+        self.dialogs.append((kind, prompt, title, style))
+        return self.next_retry(kind)
+
+    def next_retry(self, kind: str) -> object:
+        """The answer for a dialog already up, which turned the last one down."""
+        if not self.answers:
+            raise VBADialogError(f"{kind} is waiting for an answer and none is queued; answer_dialogs queues them",
+                                 where=self.current_where())
+        return self.answers.pop(0)
+
+    def set_com_class(self, prog_id: str, factory: Callable[..., object] | None, *, folders: object = ()) -> None:
+        """What CreateObject and GetObject make for ``prog_id``: the factory's answer to a ComRequest. None takes it away. ``folders`` are those
+        a GetObject of a file may name while the sandbox is on. See _com_hook."""
+        from pyopenvba.interpreter._com_hook import set_com_class
+
+        set_com_class(self, prog_id, factory, folders)
+
+    def create_com(self, class_name: str, server: str = "") -> object:
+        from pyopenvba.interpreter._com_hook import CANNOT_CREATE, from_factory
+        from pyopenvba.interpreter._scripting import in_memory
+
+        made = from_factory(self, class_name, "create", server=server)
+        if made is not None:
+            return made
+        found = in_memory(class_name, program=True, interpreter=self)
+        if found is not None:
+            return found
+        if not class_name or class_name != class_name.strip():
+            # No ProgID is blank or has spaces round it, so this is Excel's answer for a class that does not exist
+            # (tests/fixtures/com_objects.json).
+            raise error(CANNOT_CREATE, "ActiveX component can't create object")
+        made = self.host.create(class_name)
+        if made is not UNRESOLVED:
+            return made
+        self.outside(f"CreateObject({class_name!r})")
+        raise VBAUnsupportedError(
+            f"CreateObject({class_name!r}) needs a real COM server, which pyOpenVBA does not start"
+        )
+
+    def get_com(self, path: object, class_name: object) -> object:
+        """GetObject: with a path of "" a new object, as CreateObject; with no path the class's running object; with a file what the host's
+        factory makes of it. pyOpenVBA never looks at what is running on the machine (tests/fixtures/com_objects.json)."""
+        from pyopenvba.interpreter._com_hook import CANNOT_CREATE, from_factory
+        from pyopenvba.interpreter._values import to_text
+
+        name = "" if class_name is MISSING else to_text(class_name)
+        if path is not MISSING and to_text(path) == "":
+            return self.create_com(name)
+        if path is not MISSING:
+            if class_name is MISSING:
+                raise VBAUnsupportedError("GetObject of a file with no class is not implemented: Windows would choose the program")
+            return self._get_file(to_text(path), name)
+        made = from_factory(self, name, "get")
+        if made is not None:
+            return made
+        running = self.host.running(name)
+        if running is not UNRESOLVED:
+            return running
+        if not name or name != name.strip():
+            raise error(CANNOT_CREATE, "ActiveX component can't create object")
+        self.outside(f"GetObject(, {name!r})")
+        # With the sandbox off, nothing runs here for it to find, as it does not on a machine with none of the class running.
+        raise error(CANNOT_CREATE, "ActiveX component can't create object")
+
+    def _get_file(self, path: str, name: str) -> object:
+        from pyopenvba.interpreter._com_hook import from_factory, gated
+
+        if name.lower() not in self.com_classes:
+            self.outside(f"GetObject({path!r}, {name!r})")
+            raise VBAUnsupportedError(f"GetObject of a file needs a class the host supplies: {name!r} is not one")
+        made = from_factory(self, name, "get", path=gated(self, name, path))
+        assert made is not None
+        return made
+
+    def current_where(self) -> str:
+        if not self.frames:
+            return ""
+        frame = self.frames[-1]
+        return f"{frame.module.name}.{frame.procedure.name}"
+
+    # --- running ---------------------------------------------------------------------
+
+    @property
+    def step_limit(self) -> int | None:
+        """The most steps one run of VBA may take, or None for no limit, which is the default. A run is everything one entry
+        from the host sets off: a procedure called from Python, an event raised from Python, a recalculation that calls VBA,
+        with whatever those call, raise or evaluate in turn. Past it VBAStepLimitError, which On Error cannot trap."""
+        return self.steps.limit
+
+    @step_limit.setter
+    def step_limit(self, value: object) -> None:
+        if value is not None and (isinstance(value, bool) or not isinstance(value, int) or value < 1):
+            raise ValueError(f"step_limit must be a whole number of at least 1, or None for no limit, not {value!r}")
+        self.steps.limit = value
+
+    def outside(self, what: str) -> None:
+        """The gate on everything that reaches outside the engine, to run before it looks at anything out there:
+        refused while VBA is running with the sandbox on. Python calling the same code is not VBA, and passes."""
+        if self.sandbox and self.frames:
+            raise VBASandboxError(f"{what} reaches outside the engine, which is not supported with sandbox on; "
+                                  "sandbox=False allows what pyOpenVBA implements of it", where=self.current_where())
+
+    def run(self, procedure_name: str, args: Sequence[object] = (), *, module: str = "",
+            preserve_error: bool = False, past_handlers: bool = False) -> object:
+        """Run one procedure by name.
+
+        Excel's Application.Run preserves Err on entry; ordinary VBA calls
+        clear it. Hosts request that distinction with preserve_error.
+        With past_handlers, an error that escapes the procedure's body goes
+        past every handler of its callers, as one from a macro
+        Application.Run started does; one from binding its arguments does not.
+        """
+        self.initialise()
+        target, runtime = self.find_procedure(procedure_name, module)
+        if target is None or runtime is None:
+            raise VBARuntimeError(
+                35, f"Sub or Function not defined: {procedure_name}", where=module or "the project"
+            )
+        try:
+            # A sheet's or the workbook's own module runs as that object's code.
+            return self.call(target, runtime, list(args), {}, me=runtime.document, reset_error=not preserve_error,
+                             past_handlers=past_handlers)
+        except _EndSignal:
+            return EMPTY
+        finally:
+            BINDING.late = False
+
+    def find_procedure(self, name: str, module: str = "") -> tuple[A.Procedure | None, ModuleRuntime | None]:
+        if "." in name and not module:
+            module, _, name = name.rpartition(".")
+        if module:
+            runtime = self.module(module)
+            return runtime.procedure(name), runtime
+        for runtime in self.modules.values():
+            if runtime.is_class:
+                continue
+            found = runtime.procedure(name)
+            if found is not None:
+                return found, runtime
+        return None, None
+
+    def call(
+        self,
+        procedure: A.Procedure,
+        module: ModuleRuntime,
+        args: list[object],
+        named: dict[str, object],
+        *,
+        me: object = None,
+        reset_error: bool = False,
+        past_handlers: bool = False,
+    ) -> object:
+        """Call one procedure and give back what it returns."""
+        steps = self.steps
+        if not steps.running:
+            # The host's entry into VBA: whatever it sets off draws on one budget, however many interpreters it passes
+            # through, is part of the run it started, and the next entry starts afresh.
+            steps.running, steps.left, steps.entry = True, steps.limit or 0, f"{module.name}.{procedure.name}"
+            try:
+                return self.call(procedure, module, args, named, me=me, reset_error=reset_error, past_handlers=past_handlers)
+            finally:
+                steps.running, steps.entry = False, ""
+        if not self.frames and _locale.current() is not self.locale:
+            # The outermost call runs everything under the project's locale.
+            with _locale.active(self.locale):
+                return self.call(procedure, module, args, named, me=me, reset_error=reset_error, past_handlers=past_handlers)
+        if len(self.frames) + sum(active.gosub_depth for active in self.frames) >= MAX_DEPTH:
+            raise error(28)
+        from pyopenvba.interpreter._compile import validate_numeric_loops, validate_record_arguments
+        from pyopenvba.interpreter._references import validate_references
+
+        program = module.program_for(procedure)
+        validate_record_arguments(self, module, procedure)
+        validate_references(self, module, procedure, program)
+        validate_numeric_loops(self, module, procedure, program.arrays)
+        module.initialise()
+        frame = Frame(procedure=procedure, module=module, me=me, program=program)
+        try:
+            self._bind_arguments(frame, procedure, args, named)
+        except BaseException:
+            for array in frame.locked_arrays:
+                array.borrowed_elements -= 1
+            raise
+        # Ordinary calls preserve Err. On Error statements clear it; native
+        # conformance probes must not inject handlers at procedure entry.
+        if reset_error:
+            self.err.reset(clear_erl=True)
+        if procedure.kind in ("function", "get"):
+            frame.locals[procedure.name.lower()] = self.make_slot(
+                A.VarDecl(name=procedure.name, declared=procedure.returns, is_array=procedure.returns_array), module
+            )
+        self.frames.append(frame)
+        try:
+            self._run_body(frame)
+        except _ExitSignal as signal:
+            if signal.what not in ("sub", "function", "property"):
+                raise
+        except VBARuntimeError as failure:
+            if past_handlers:
+                failure.past_handlers = True
+            raise
+        except RecursionError:
+            # Python ran out of stack before the VBA depth cap did.
+            # Either way the macro recursed away, which is error 28.
+            raise error(28) from None
+        finally:
+            self.frames.pop()
+            frame.numeric_loops.clear()
+            for loop in frame.each_loops.values():
+                loop.close()
+            frame.each_loops.clear()
+            frame.with_values.clear()
+            frame.with_stack.clear()
+            for array in frame.locked_arrays:
+                array.borrowed_elements -= 1
+        if procedure.kind in ("function", "get"):
+            return frame.locals[procedure.name.lower()].get()
+        return EMPTY
+
+    def call_value(self, procedure: A.Procedure, module: ModuleRuntime, args: list[object],
+                   named: dict[str, object], *, me: object = None) -> object:
+        """Expression arguments may belong to a returned object's default member."""
+        if (args or named) and not procedure.params and procedure.kind in ('function', 'get'):
+            result = self.call(procedure, module, [], {}, me=me)
+            if result is NOTHING:
+                raise error(91)
+            if procedure.returns == 'Variant' and not isinstance(result, (VBAObject, VBAArray)):
+                raise error(13)
+            if procedure.returns != 'Variant' and not isinstance(result, (VBAObject, VBAArray)):
+                raise error(451, 'Property let procedure not defined and property get procedure did not return an object')
+            return _call_value(result, args, named)
+        return self.call(procedure, module, args, named, me=me)
+
+    def call_setter(self, procedure: A.Procedure, module: ModuleRuntime, args: list[object],
+                    named: dict[str, object], value: object, *, me: object = None) -> object:
+        if named and procedure.params:
+            named = {**named, procedure.params[-1].name: value}
+        else:
+            args = [*args, value]
+        return self.call(procedure, module, args, named, me=me)
+
+    def _bind_arguments(
+        self, frame: Frame, procedure: A.Procedure, args: list[object], named: dict[str, object]
+    ) -> None:
+        laid: list[object] = list(args)
+        params = procedure.params
+        if len(laid) > len(params) and not (params and params[-1].param_array):
+            raise error(450, f"{procedure.name} takes {len(params)} arguments")
+        for key, value in named.items():
+            for index, parameter in enumerate(params):
+                if parameter.name.lower() == key.lower():
+                    while len(laid) <= index:
+                        laid.append(MISSING)
+                    laid[index] = value
+                    break
+            else:
+                raise error(448, f"{procedure.name} has no argument named {key}")
+        for index, parameter in enumerate(params):
+            if parameter.param_array:
+                # A variable stays its Slot, so the element aliases it.
+                rest = [one if isinstance(one, Slot) else self._by_value(one) for one in laid[index:]]
+                array = ParamArrayValues(
+                    [(0, len(rest) - 1)] if rest else [(0, -1)],
+                    items=rest if rest else [],
+                )
+                frame.locals[parameter.name.lower()] = Slot(array, "Variant")
+                return
+            given = laid[index] if index < len(laid) else MISSING
+            declared = self.storage_declaration(parameter.declared, frame.module)
+            if given is MISSING or given is None:
+                if not parameter.optional and parameter.default is None:
+                    if index < len(laid):
+                        raise error(449, f"{procedure.name} needs an argument for {parameter.name}")
+                    raise error(449, f"{procedure.name} needs an argument for {parameter.name}")
+                if parameter.default is not None:
+                    frame.locals[parameter.name.lower()] = Slot(
+                        coerce(self.evaluate_constant(parameter.default, frame.module), declared),
+                        declared,
+                    )
+                else:
+                    frame.locals[parameter.name.lower()] = Slot(
+                        MISSING if declared == "Variant" else default_for(declared),
+                        declared,
+                    )
+                continue
+            held = self._by_value(given)
+            if isinstance(held, VBAObject) and not of_declared_class(held, declared):
+                # A parameter of a class takes only that class, ByVal or ByRef (tests/fixtures/typed_set.json).
+                raise error(ERR_TYPE_MISMATCH)
+            if isinstance(given, Slot) and not parameter.by_val:
+                for array in given.borrow_arrays():
+                    array.borrowed_elements += 1
+                    frame.locked_arrays.append(array)
+                frame.locals[parameter.name.lower()] = given
+                continue
+            value = self._by_value(given)
+            if parameter.is_array:
+                if not isinstance(value, VBAArray):
+                    raise error(13)
+                frame.locals[parameter.name.lower()] = Slot(copy_value(value), 'Variant', declared)
+                continue
+            frame.locals[parameter.name.lower()] = Slot(
+                copy_value(coerce(as_declared(value, declared), declared)), declared
+            )
+
+    @staticmethod
+    def _by_value(given: object) -> object:
+        return given.get() if isinstance(given, Slot) else given
+
+    def _run_body(self, frame: Frame) -> None:
+        program = frame.program or frame.module.program_for(frame.procedure)
+        frame.program = program
+        self._declare_locals(frame, frame.procedure.body)
+        for declaration in program.arrays:
+            key = declaration.name.lower()
+            store = frame.module.statics.setdefault(frame.procedure.name.lower(), {}) if frame.procedure.static else frame.locals
+            if key not in store:
+                store[key] = self.make_slot(declaration, frame.module)
+            frame.locals[key] = store[key]
+        self._run_flow(frame)
+
+    def _run_flow(self, frame: Frame, start: int = 0) -> None:
+        program = frame.program
+        assert program is not None
+        pc = start
+        scopes: tuple[int, ...] | None = None
+        steps = self.steps
+        while pc < len(program.instructions):
+            if steps.limit is not None:
+                steps.left -= 1
+                if steps.left < 0:
+                    # Spent stays spent until the host's next entry, so a caller that swallows this cannot run on.
+                    raise VBAStepLimitError(f"the run took more than step_limit={steps.limit} steps", where=self.current_where())
+            instruction = program.instructions[pc]
+            # Lexical With context is independent of the path used to reach
+            # this instruction. A skipped initializer leaves a Nothing slot.
+            if scopes != instruction.scopes:
+                frame.with_stack[:] = [frame.with_values.get(key, NOTHING) for key in instruction.scopes]
+                scopes = instruction.scopes
+            try:
+                try:
+                    if instruction.kind == 'exec':
+                        self._execute(instruction.statement, frame)
+                        following = pc + 1
+                    else:
+                        following = self._flow_step(instruction, frame, pc)
+                except VBARuntimeError as failure:
+                    outcome = self._handle(failure, frame, instruction.statement)
+                    # A handler may have traversed different With scopes.
+                    scopes = None
+                    if outcome == 'next':
+                        following = instruction.resume_next if instruction.resume_next >= 0 else pc + 1
+                    elif outcome == 'same':
+                        following = pc
+                    else:
+                        raise
+            except _GotoSignal as jump:
+                if F.label_key(jump.label) not in program.labels:
+                    raise self._unknown_label(jump.label, frame) from None
+                following = program.labels[F.label_key(jump.label)]
+                scopes = None
+            pc = following
+
+    def _flow_step(self, instruction: F.Instruction, frame: Frame, pc: int) -> int:
+        statement, kind = instruction.statement, instruction.kind
+        if kind == 'jump':
+            return instruction.target
+        if kind == 'if':
+            assert isinstance(statement, A.If)
+            return instruction.target if condition(self.evaluate(statement.branches[0].condition, frame)) else instruction.otherwise
+        if kind == 'select':
+            assert isinstance(statement, A.SelectCase)
+            frame.select_values[id(statement)] = self._flow_value(statement.subject, frame)
+        elif kind == 'select_end':
+            frame.select_values.pop(id(statement), None)
+        elif kind == 'case':
+            subject = frame.select_values.get(id(statement), EMPTY)
+            return instruction.target if any(self._case_matches(clause, subject, frame) for clause in instruction.clauses) else instruction.otherwise
+        elif kind in ('for_init', 'for_next'):
+            assert isinstance(statement, A.For)
+            key = id(statement)
+            if kind == 'for_init':
+                target = self.resolve_target(statement.target, frame)
+                first = self._flow_value(statement.start, frame)
+                limit = self._flow_value(statement.limit, frame)
+                step = self._flow_value(statement.step, frame) if statement.step is not None else VBAInt(1, 'Integer')
+                declared = target.declared
+                if declared in ('Variant', ''):
+                    declared = self._for_kind(first, limit)
+                    if statement.step is not None:
+                        declared = self._for_kind(coerce(first, declared), step, asymmetric=False)
+                first, limit, step = (coerce(value, declared) for value in (first, limit, step))
+                target.put(first, False)
+                state = NumericLoop(target, limit, step)
+                frame.numeric_loops[key] = state
+            else:
+                state = frame.numeric_loops.get(key)
+                # Native Next resolves an element's current subscript and
+                # storage again, including an array replaced by ReDim.
+                target = self.resolve_target(statement.target, frame)
+                if state is None:
+                    declared = target.declared
+                    if declared in ('Variant', ''):
+                        raise error(92, 'For loop not initialized')
+                    zero = default_for(declared)
+                    step = VBAInt(1, 'Integer') if declared in ('Integer', 'Long') and statement.step is None else zero
+                    state = NumericLoop(target, zero, step)
+                    frame.numeric_loops[key] = state
+                state.target = target
+                state.target.put(add(state.target.take(), state.step), False)
+            upward = not to_bool(compare('<', state.step, VBAInt(0, 'Integer')))
+            finished = to_bool(compare('>' if upward else '<', state.target.take(), state.limit))
+            return instruction.otherwise if finished else instruction.target
+        elif kind in ('each_init', 'each_next'):
+            assert isinstance(statement, A.ForEach)
+            key = id(statement)
+            if kind == 'each_init':
+                target = self.resolve_target(statement.target, frame)
+                subject = self.evaluate(statement.collection, frame, want_object=True)
+                self._close_each(frame, key)
+                declared = self._loop_declaration(statement.target, frame)
+                if isinstance(subject, VBAArray) and not subject.bounds:
+                    raise error(92, 'For loop not initialized')
+                if isinstance(subject, VBAArray) and declared not in ('Variant', ''):
+                    raise error(424, 'Object required')
+                each = EachLoop(target, _iterate(subject), declared)
+                if isinstance(subject, VBAArray):
+                    subject.borrowed_elements += 1
+                    each.array = subject
+                frame.each_loops[key] = each
+            else:
+                each = frame.each_loops.get(key)
+                if each is None:
+                    raise error(92, 'For loop not initialized')
+            try:
+                assert each.iterator is not None
+                item = next(each.iterator)
+            except StopIteration:
+                each.target.put(EMPTY if each.declared in ('Variant', '') else NOTHING, each.declared not in ('Variant', ''))
+                return instruction.otherwise
+            if each.declared not in ('Variant', '') and not is_object(item) and item is not NOTHING:
+                raise error(424, 'Object required')
+            each.target.put(item, isinstance(item, VBAObject))
+            return instruction.target
+        elif kind == 'each_end':
+            self._close_each(frame, id(statement))
+        elif kind == 'loop_test':
+            assert isinstance(statement, (A.DoLoop, A.WhileLoop))
+            truth = condition(self.evaluate(statement.condition, frame))
+            if isinstance(statement, A.DoLoop) and statement.test == 'until':
+                truth = not truth
+            return instruction.target if truth else instruction.otherwise
+        elif kind == 'with_init':
+            assert isinstance(statement, A.With)
+            frame.with_values[id(statement)] = self.evaluate(statement.subject, frame, want_object=True)
+        elif kind == 'with_end':
+            frame.with_values.pop(id(statement), None)
+        elif kind == 'exit_loop':
+            # Exit For from a For Each whose header failed under On Error Resume Next has nothing to leave.
+            if isinstance(instruction.owner, A.ForEach) and id(instruction.owner) not in frame.each_loops:
+                raise error(92, 'For loop not initialized')
+            return instruction.target
+        elif kind in ('goto', 'computed'):
+            assert isinstance(statement, (A.GoTo, A.OnGoto))
+            if isinstance(statement, A.OnGoto):
+                index = int(to_integer(self.evaluate(statement.value, frame), 'Integer'))
+                if not 0 <= index <= 255:
+                    raise error(5)
+                if not 1 <= index <= len(statement.labels):
+                    return pc + 1
+                label = statement.labels[index - 1]
+            else:
+                label = statement.label
+            if statement.gosub:
+                if len(self.frames) + sum(active.gosub_depth for active in self.frames) >= MAX_DEPTH:
+                    raise error(28)
+                frame.gosub_returns.append(pc + 1)
+                frame.gosub_depth += 1
+            assert frame.program is not None
+            return frame.program.labels[F.label_key(label)]
+        elif kind == 'return':
+            if not frame.gosub_returns:
+                raise error(3)
+            frame.gosub_depth -= 1
+            return frame.gosub_returns.pop()
+        else:
+            raise AssertionError(kind)
+        return pc + 1
+
+    def _flow_value(self, expression: A.Expr | None, frame: Frame) -> object:
+        """Capture a header's value before evaluating the next expression."""
+        value = self.evaluate(expression, frame)
+        for _ in range(MAX_DEPTH):
+            if not isinstance(value, VBAObject):
+                return value
+            default = value.vba_value()
+            if default is value:
+                raise error(ERR_TYPE_MISMATCH)
+            value = default
+        raise error(28)
+
+    @staticmethod
+    def _for_kind(first: object, second: object, *, asymmetric: bool = True) -> str:
+        """Variant For promotion, including native Decimal's asymmetric case."""
+        kinds = [type_name(value) for value in (first, second)]
+        if asymmetric and kinds[0] == 'Decimal' and kinds[1] != 'Decimal':
+            return 'Date'
+        order = ('Byte', 'Integer', 'Long', 'LongLong', 'Double', 'Currency', 'Date', 'Decimal')
+        normalized: list[str] = []
+        for value, kind in zip((first, second), kinds, strict=True):
+            to_number(value)  # Validate even when another operand dominates.
+            kind = 'Double' if kind in ('String', 'Single') else 'Integer' if kind in ('Empty', 'Boolean') else kind
+            normalized.append(kind)
+        return max(normalized, key=order.index)
+
+    def _loop_declaration(self, target: A.Expr | None, frame: Frame) -> str:
+        if isinstance(target, A.Name):
+            slot = self.lookup(target.name, frame, want_slot=True)
+            if isinstance(slot, Slot):
+                return slot.declared
+        return 'Variant'
+
+    @staticmethod
+    def _close_each(frame: Frame, key: int) -> None:
+        each = frame.each_loops.pop(key, None)
+        if each is not None:
+            each.close()
+
+    def _unknown_label(self, label: str, frame: Frame) -> Exception:
+        return VBACompileError(
+            f"label {label} is not in {frame.procedure.name}",
+            where=f"{frame.module.name}.{frame.procedure.name}",
+        )
+
+    def _declare_locals(self, frame: Frame, body: Sequence[A.Stmt]) -> None:
+        """Give every Dim in the procedure its slot before anything runs.
+
+        VBA allocates a procedure's locals on entry, which is why a Dim
+        inside an If still exists on the path that skipped it.
+        """
+        for statement in body:
+            if isinstance(statement, A.Dim):
+                for declaration in statement.decls:
+                    key = declaration.name.lower()
+                    if statement.static or frame.procedure.static:
+                        store = frame.module.statics.setdefault(frame.procedure.name.lower(), {})
+                        if key not in store:
+                            store[key] = self.make_slot(declaration, frame.module, frame)
+                        frame.locals[key] = store[key]
+                    elif key not in frame.locals:
+                        frame.locals[key] = self.make_slot(declaration, frame.module, frame)
+            elif isinstance(statement, A.ConstDecl):
+                # A constant is known before anything runs, so a Dim's bounds can use it:
+                # Const N = 3 then Dim a(1 To N) (native probe).
+                self._do_const(statement, frame)
+                continue
+            for nested in F.nested_bodies(statement):
+                self._declare_locals(frame, nested)
+
+    # --- statements --------------------------------------------------------------------
+
+    def _handle(self, failure: VBARuntimeError, frame: Frame, statement: A.Stmt) -> str:
+        """What to do with a run-time error: resume, run a handler, or pass it on."""
+        if not failure.where:
+            failure.where = f"{frame.module.name}.{frame.procedure.name} line {statement.line}"
+            failure.args = (f"{failure.where}: {failure.message}",)
+        if not failure.source:
+            failure.source = self.project_name
+        if failure.past_handlers or frame.in_handler or frame.handler == "none":
+            return "raise"
+        self.err.capture(failure)
+        self.err.erl = frame.line_number
+        if frame.handler == "resume_next":
+            return "next"
+        assert frame.program is not None
+        index = frame.program.labels.get(F.label_key(frame.handler_label))
+        if index is None:
+            raise self._unknown_label(frame.handler_label, frame) from failure
+        frame.in_handler = True
+        try:
+            self._run_flow(frame, start=index)
+        except _ResumeSignal as resume:
+            frame.in_handler = False
+            self.err.reset(clear_erl=True)
+            if resume.mode == "next":
+                return "next"
+            if resume.mode == "same":
+                return "same"
+            raise _GotoSignal(resume.label) from None
+        except _GotoSignal:
+            frame.in_handler = False
+            raise
+        except _ExitSignal:
+            # Leaving the procedure from its handler leaves no error behind.
+            self.err.reset(clear_erl=True)
+            raise
+        finally:
+            if frame.in_handler:
+                frame.in_handler = False
+        self.err.reset(clear_erl=True)
+        raise _ExitSignal(_exit_word(frame.procedure.kind))
+
+    @classmethod
+    def statement_handlers(cls) -> dict[type, Callable[..., None]]:
+        """Leaf-statement handlers; structured control is compiled by _flow."""
+        table: dict[type, Callable[..., None]] = {
+            A.Assign: cls._do_assign,
+            A.CallStmt: cls._do_call,
+            A.Dim: cls._do_dim,
+            A.ConstDecl: cls._do_const,
+            A.ReDim: cls._do_redim,
+            A.Erase: cls._do_erase,
+            A.ExitStmt: cls._do_exit,
+            A.OpenFile: cls._do_open_file,
+            A.FileOutput: cls._do_file_output,
+            A.FileInput: cls._do_file_input,
+            A.LineInput: cls._do_line_input,
+            A.FileCommand: cls._do_file_command,
+            A.FileRecord: cls._do_file_record,
+            A.FileLock: cls._do_file_lock,
+            A.Label: cls._do_label,
+            A.ProcedureAttribute: cls._do_procedure_attribute,
+            A.OnError: cls._do_on_error,
+            A.Resume: cls._do_resume,
+            A.ErrorStmt: cls._do_error,
+            A.Stop: cls._do_stop,
+            A.EndStmt: cls._do_end,
+            A.OptionStmt: cls._do_option,
+            A.MidAssign: cls._do_mid_assign,
+            A.RaiseEvent: cls._do_raise_event,
+            A.Unsupported: cls._do_unsupported,
+        }
+        return table
+
+    def _execute(self, statement: A.Stmt, frame: Frame) -> None:
+        handler = _STATEMENTS.get(type(statement))
+        if handler is None:  # pragma: no cover - every node has one
+            raise VBAUnsupportedError(f"{type(statement).__name__} is not implemented")
+        handler(self, statement, frame)
+
+    def _do_assign(self, statement: A.Assign, frame: Frame) -> None:
+        if statement.kind in ("lset", "rset"):
+            self._pad_assign(statement, frame)
+            return
+        if statement.kind == "let" and isinstance(statement.target, A.Name):
+            held = self._check_let_into_object(statement.target.name, frame)
+            if held is not None:
+                found = find_class(self.host.vba_type_library, held.vba_type_name)  # type: ignore[attr-defined]
+                assert found is not None
+                self._let_default(held, self.evaluate(statement.value, frame), found)
+                return
+        value = self.evaluate(statement.value, frame, want_object=statement.kind == "set")
+        if statement.kind == "set" and not is_object(value) and value is not NOTHING:
+            # A value Set into a Variant is a type mismatch, and into an object variable wants an object
+            # (tests/fixtures/vba_object_lifetime.json).
+            if isinstance(statement.target, A.Name) and self._loop_declaration(statement.target, frame) in (
+                    "Variant", ""):
+                raise error(ERR_TYPE_MISMATCH, "Set needs an object on the right")
+            raise error(424, "Object required")
+        if statement.kind == "let" and value is NOTHING and not isinstance(statement.target, A.Member):
+            # Nothing has no value to let: v = Range("A1:B1").Style, whose cells differ, is error 91.
+            raise error(ERR_OBJECT_VARIABLE_NOT_SET)
+        target = self.resolve_target(statement.target, frame)
+        if statement.kind == "let" and target.given is not None:
+            value = target.given(value)
+        if statement.kind == "let" and isinstance(statement.target, A.Member) and (isinstance(value, VBAObject) or value is NOTHING):
+            value = _object_let_value(target, value)
+        received = isinstance(value, _Received)
+        if received:
+            value = value.held
+        if statement.kind == "let" and isinstance(value, VBAObject) and not received:
+            # Some objects, and some properties, take an object itself by Let; anything else hands over the
+            # object's default member.
+            if not ((value.vba_let_as_object or target.takes_objects) and isinstance(statement.target, A.Member)):
+                try:
+                    value = value.vba_value()
+                except VBARuntimeError:
+                    # A Variant that held Nothing is Empty after the Let fails (tests/fixtures/com_objects.json).
+                    if isinstance(statement.target, A.Name):
+                        slot = self.lookup(statement.target.name, frame, want_slot=True)
+                        if isinstance(slot, Slot) and slot.declared in ("", "Variant") and slot.get() is NOTHING:
+                            slot.set(EMPTY)
+                    raise
+        target.put(value, statement.kind == "set")
+
+    def _let_default(self, held: VBAObject, value: object, found: LibraryClass) -> None:
+        """r = 1: a Let into a variable that holds an object goes to the object's default member. A value that is an object
+        hands over its own default, and one with none cannot be taken (tests/fixtures/vba_default_let.json)."""
+        number = let_error(found)
+        if number is not None:
+            raise error(number, f"{found.name} has no default member to assign to")
+        if isinstance(value, VBAObject):
+            if value.vba_default_member() is None:
+                raise error(1004, f"{found.name} cannot take a {value.vba_type_name}")
+            value = value.vba_value()
+        if value is NOTHING:
+            raise error(ERR_OBJECT_VARIABLE_NOT_SET)
+        held.vba_set(found.default, value, [], {})
+
+    def _check_let_into_object(self, name: str, frame: Frame) -> VBAObject | None:
+        """A Let into an object variable assigns its object's default member, so one
+        that holds Nothing is error 91 before the value is looked at: q = p and
+        o = 5 alike (native probes). The object it holds, where the host's library knows its class."""
+        key = _bare(name)
+        slot = frame.locals.get(key)
+        if slot is None and isinstance(frame.me, UserClassInstance):
+            slot = frame.me.variables.get(key)
+        if slot is None:
+            slot = frame.module.variables.get(key)
+        if (type(slot) is Slot and not slot.array_of and slot.declared not in ("Variant", "")
+                and default_for(slot.declared) is NOTHING and slot.value is NOTHING):
+            raise error(ERR_OBJECT_VARIABLE_NOT_SET)
+        if type(slot) is not Slot or slot.array_of or slot.declared in ("Variant", "") or default_for(slot.declared) is not NOTHING:
+            return None
+        library = getattr(self.host, "vba_type_library", None)
+        held = slot.value
+        if library is None or not isinstance(held, VBAObject) or isinstance(held, UserClassInstance):
+            return None
+        return held if find_class(library, held.vba_type_name) is not None else None
+
+    def _pad_assign(self, statement: A.Assign, frame: Frame) -> None:
+        """LSet and RSet: the text cut or padded with spaces to the length the
+        target holds now, left- or right-aligned (native probes)."""
+        value = self.evaluate(statement.value, frame)
+        if value is NULL:
+            raise error(ERR_INVALID_USE_OF_NULL)
+        target = self.resolve_target(statement.target, frame)
+        current = target.take()
+        if isinstance(current, UserTypeValue) or isinstance(value, UserTypeValue):
+            raise VBAUnsupportedError("LSet of one record onto another copies its bytes, which is not implemented")
+        width = len(to_text(current))
+        text = to_text(value)[:width]
+        target.put(text.ljust(width) if statement.kind == "lset" else text.rjust(width), False)
+
+    def _do_call(self, statement: A.CallStmt, frame: Frame) -> None:
+        self.evaluate_call(statement.callee, statement.args, frame, statement_context=True)
+
+    def _do_dim(self, statement: A.Dim, frame: Frame) -> None:
+        for declaration in statement.decls:
+            key = declaration.name.lower()
+            if key not in frame.locals:
+                frame.locals[key] = self.make_slot(declaration, frame.module, frame)
+
+    def _do_const(self, statement: A.ConstDecl, frame: Frame) -> None:
+        for name, declared, expression in statement.names:
+            frame.locals[name.lower()] = Slot(
+                coerce(self.evaluate(expression, frame), declared), declared
+            )
+
+    def _do_redim(self, statement: A.ReDim, frame: Frame) -> None:
+        for index, declaration in enumerate(statement.decls):
+            bounds = self._bounds(declaration, frame)
+            if any(upper < lower for lower, upper in bounds):
+                # A dimension with no elements, a(1 To 0), is error 9, Preserve or not (tests/fixtures/redim_bounds.json).
+                raise error(ERR_SUBSCRIPT_OUT_OF_RANGE)
+            field_ = statement.targets[index] if index < len(statement.targets) else None
+            slot: Slot | None = None
+            if field_ is None:
+                found = self.lookup(declaration.name, frame, want_slot=True)
+                if found is UNRESOLVED:
+                    # ReDim itself declares an array, even with Option Explicit.
+                    slot = Slot(self.make_array([], declaration.declared, frame.module), 'Variant', declaration.declared)
+                    frame.locals[declaration.name.lower()] = slot
+                elif isinstance(found, Slot):
+                    slot = found
+                if slot is not None and slot.declared not in ('', 'Variant'):
+                    raise VBACompileError('Expected array', where=f'{frame.module.name}.{frame.procedure.name}')
+            target = self.resolve_target(field_ or A.Name(line=statement.line, name=declaration.name), frame)
+            current = target.take()
+            if isinstance(current, VBAArray) and current.borrowed_elements:
+                raise error(10, "This array is fixed or temporarily locked")
+            element = declaration.declared if declaration.declared != "Variant" else "Variant"
+            if statement.preserve and isinstance(current, VBAArray):
+                if declaration.explicit_type and element != current.element_type:
+                    raise error(ERR_TYPE_MISMATCH, 'ReDim Preserve cannot change element types')
+                target.put(current.resized(bounds, preserve=True), False)
+            else:
+                if statement.preserve and not isinstance(current, VBAArray):
+                    raise error(ERR_TYPE_MISMATCH, "ReDim Preserve needs an array")
+                keep = current.element_type if isinstance(current, VBAArray) and not declaration.explicit_type else element
+                target.put(self.make_array(bounds, keep, frame.module), False)
+
+    def _do_erase(self, statement: A.Erase, frame: Frame) -> None:
+        for name in statement.names:
+            target = self.resolve_target(name, frame)
+            current = target.take()
+            if isinstance(current, VBAArray):
+                if current.borrowed_elements:
+                    raise error(10, "This array is fixed or temporarily locked")
+                if current.fixed:
+                    fresh = self.make_array(current.bounds, current.element_type, frame.module, fixed=True)
+                    target.put(fresh, False)
+                else:
+                    # An erased dynamic array is unallocated again: UBound is error 9.
+                    target.put(self.make_array([], current.element_type, frame.module), False)
+
+    def _case_matches(self, clause: A.CaseClause, subject: object, frame: Frame) -> bool:
+        # Select Case holds its subject as a Variant, even a String variable:
+        # Case Is < 0 against "a" is False, not a type mismatch (native probe).
+        text = self.option_compare_text
+
+        def kinds(expression: A.Expr | None) -> tuple[str, str]:
+            return ("variant", self._static_kind(expression, frame))
+
+        if clause.kind == "value":
+            return condition(compare("=", subject, self.evaluate(clause.value, frame), text_compare=text,
+                                   kinds=kinds(clause.value)))
+        if clause.kind == "range":
+            low = self.evaluate(clause.value, frame)
+            high = self.evaluate(clause.upper, frame)
+            return condition(compare(">=", subject, low, text_compare=text, kinds=kinds(clause.value))) and condition(
+                compare("<=", subject, high, text_compare=text, kinds=kinds(clause.upper))
+            )
+        return condition(compare(clause.op, subject, self.evaluate(clause.value, frame), text_compare=text,
+                               kinds=kinds(clause.value)))
+
+    def _do_exit(self, statement: A.ExitStmt, frame: Frame) -> None:
+        raise _ExitSignal(statement.what)
+
+    def _do_label(self, statement: A.Label, frame: Frame) -> None:
+        if statement.name.isdigit():
+            frame.line_number = int(statement.name)
+
+    def _do_procedure_attribute(self, statement: A.ProcedureAttribute, frame: Frame) -> None:
+        """Metadata VBA never runs: a procedure's description, help id or shortcut key."""
+
+    def _do_on_error(self, statement: A.OnError, frame: Frame) -> None:
+        # Every On Error statement clears Err (tests/fixtures/vba_semantics/err_lifetime.json).
+        self.err.reset(clear_erl=True)
+        if statement.mode == "reset":
+            # On Error GoTo -1: the current error is over, so a new On Error
+            # can take effect inside the handler (native probes).
+            frame.in_handler = False
+        elif statement.mode == "clear":
+            frame.handler = "none"
+            frame.handler_label = ""
+        elif statement.mode == "resume_next":
+            frame.handler = "resume_next"
+        else:
+            frame.handler = "goto"
+            frame.handler_label = statement.label
+
+    def _do_resume(self, statement: A.Resume, frame: Frame) -> None:
+        if not frame.in_handler:
+            raise error(20)
+        raise _ResumeSignal(statement.mode, statement.label)
+
+    def _do_error(self, statement: A.ErrorStmt, frame: Frame) -> None:
+        raise error(int(to_integer(self.evaluate(statement.number, frame), "Long")))
+
+    def _do_stop(self, statement: A.Stop, frame: Frame) -> None:
+        self.write_line(f"[Stop at {self.current_where()}]")
+
+    def _do_end(self, statement: A.EndStmt, frame: Frame) -> None:
+        self.end_run()
+
+    def end_run(self) -> None:
+        """Stop the running macro where it is, as End does."""
+        raise _EndSignal()
+
+    def _do_option(self, statement: A.OptionStmt, frame: Frame) -> None:
+        return None
+
+    def _do_mid_assign(self, statement: A.MidAssign, frame: Frame) -> None:
+        target = self.resolve_target(statement.target, frame)
+        text = to_text(target.take())
+        start = int(to_integer(self.evaluate(statement.start, frame), "Long"))
+        if start < 1:
+            raise error(5)
+        replacement = to_text(self.evaluate(statement.value, frame))
+        room = len(text) - start + 1
+        width = room if statement.length is None else int(to_integer(self.evaluate(statement.length, frame), "Long"))
+        width = max(0, min(width, room, len(replacement)))
+        target.put(text[: start - 1] + replacement[:width] + text[start - 1 + width :], False)
+
+    def _do_raise_event(self, statement: A.RaiseEvent, frame: Frame) -> None:
+        if isinstance(frame.me, UserClassInstance):
+            event = next((event for event in frame.module.parsed.events if event.name.lower() == statement.name.lower()), None)
+            if event is None:
+                raise VBACompileError(f"event {statement.name} is not declared in {frame.module.name}")
+            # Binding a synthetic procedure supplies typed, shared ByRef storage even
+            # when the caller passes an expression rather than a variable.
+            signature = A.Procedure(name=event.name, params=event.params)
+            positional, named = self._arguments(statement.args, frame, procedure=signature)
+            arguments = Frame(signature, frame.module)
+            self._bind_arguments(arguments, signature, positional, named)
+            args: list[object] = [arguments.locals[param.name.lower()] for param in event.params]
+            self.raise_event(frame.me, statement.name, args)
+            return
+        raise VBACompileError("RaiseEvent requires a class module")
+
+    def bind_event_sink(self, owner: UserClassInstance, name: str) -> None:
+        """Remove the old binding before appending the new one; do not retain a listener."""
+        self.event_sinks[:] = [(held, key) for held, key in self.event_sinks
+                               if held() is not None and not (held() is owner and key == name)]
+        if owner.variables[name].get() is not NOTHING:
+            self.event_sinks.append((ref(owner), name))
+
+    def raise_event(self, source: object, name: str, args: list[object]) -> None:
+        """Deliver in binding order, sharing ByRef event arguments between sinks."""
+        for held, key in list(self.event_sinks):
+            owner = held()
+            if owner is None or owner.variables[key].get() is not source:
+                continue
+            handler = owner.module.procedure(f"{key}_{name}")
+            if handler is not None:
+                owner.interpreter.call_event_handler(handler, owner.module, args, me=owner)
+
+    def call_event_handler(self, procedure: A.Procedure, module: ModuleRuntime,
+                           args: list[object], *, me: object) -> None:
+        """Event handlers recover locally; an escaped error aborts event delivery."""
+        try:
+            self.call(procedure, module, args, {}, me=me)
+        except VBARuntimeError as failure:
+            failure.past_handlers = True
+            raise
+
+    def listens_for_event(self, source: object, name: str) -> bool:
+        return any(owner is not None and owner.variables[key].get() is source
+                   and owner.module.procedure(f"{key}_{name}") is not None
+                   for held, key in self.event_sinks for owner in (held(),))
+
+    def _do_open_file(self, statement: A.OpenFile, frame: Frame) -> None:
+        self.outside("Open")
+        path = self.evaluate(statement.path, frame)
+        length = MISSING if statement.length is None else self.evaluate(statement.length, frame)
+        number = self.evaluate(statement.number, frame)
+        self.files.open(path, statement.mode, number, access=statement.access, length=length)
+
+    def _do_file_output(self, statement: A.FileOutput, frame: Frame) -> None:
+        name = "Print #" if statement.kind == "print" else "Write #"
+        self.outside(name)
+        handle = self.files.writing(self.evaluate(statement.number, frame))
+        args = statement.args
+        hold = bool(args) and isinstance(args[-1].value, A.Literal) and args[-1].value.value is PRINT_CONTINUE
+        if statement.kind == "write":
+            items = [self.files.written(self.evaluate(one.value, frame, want_object=True)) for one in args
+                     if not (isinstance(one.value, A.Literal) and one.value.value in (PRINT_ZONE, PRINT_CONTINUE))]
+            self.files.write_items(handle, items, hold)
+            return
+        for one in args:
+            value = one.value
+            if isinstance(value, A.Literal) and value.value is PRINT_ZONE:
+                self.files.print_zone(handle)
+            elif isinstance(value, A.Literal) and value.value is PRINT_CONTINUE:
+                continue
+            else:
+                self.files.print_item(handle, self._print_item(value, frame))
+        if not hold:
+            self.files.end_line(handle)
+
+    def _print_item(self, value: A.Expr | None, frame: Frame) -> object:
+        """A value of a Print #, or its Tab or Spc, which only mean that here."""
+        target = value.target if isinstance(value, A.Index) else value
+        if isinstance(target, A.Name) and _bare(target.name) in ("tab", "spc"):
+            given = value.args if isinstance(value, A.Index) else []
+            amount = int(to_integer(self.evaluate(given[0].value, frame), "Long")) if given else None
+            if _bare(target.name) == "tab":
+                return TabTo(amount)
+            if amount is not None:
+                return Spaces(amount)
+        return self.evaluate(value, frame, want_object=True)
+
+    def _do_file_input(self, statement: A.FileInput, frame: Frame) -> None:
+        self.outside("Input #")
+        handle = self.files.reading(self.evaluate(statement.number, frame))
+        for target in statement.targets:
+            quoted, text = self.files.read_field(handle)
+            value = self.files.field_value(quoted, text, self._loop_declaration(target, frame))
+            self.resolve_target(target, frame).put(value, False)
+
+    def _do_line_input(self, statement: A.LineInput, frame: Frame) -> None:
+        self.outside("Line Input #")
+        declared = self._loop_declaration(statement.target, frame).lower()
+        if declared not in ("variant", "string"):
+            raise VBACompileError("Type mismatch", where=self.current_where())
+        text = self.files.read_line(self.evaluate(statement.number, frame))
+        self.resolve_target(statement.target, frame).put(text, False)
+
+    def _do_file_command(self, statement: A.FileCommand, frame: Frame) -> None:
+        names = {"close": "Close", "reset": "Reset", "seek": "Seek #", "width": "Width #", "kill": "Kill",
+                 "mkdir": "MkDir", "rmdir": "RmDir", "chdir": "ChDir", "filecopy": "FileCopy", "setattr": "SetAttr",
+                 "name": "Name"}
+        self.outside(names[statement.verb])
+        args = [self.evaluate(one, frame) for one in statement.args]
+        files = self.files
+        commands = {"close": lambda: files.close(args), "reset": lambda: files.close([]),
+                    "seek": lambda: files.seek_to(*args), "width": lambda: files.set_width(*args),
+                    "kill": lambda: files.kill(*args), "mkdir": lambda: files.make_folder(*args),
+                    "rmdir": lambda: files.remove_folder(*args), "chdir": lambda: files.change_folder(*args),
+                    "filecopy": lambda: files.copy(*args), "setattr": lambda: files.set_attributes(*args),
+                    "name": lambda: files.rename(*args)}
+        commands[statement.verb]()
+
+    def _do_file_record(self, statement: A.FileRecord, frame: Frame) -> None:
+        name = "Get #" if statement.kind == "get" else "Put #"
+        self.outside(name)
+        handle = self.files.record_handle(self.evaluate(statement.number, frame))
+        where = MISSING if statement.position is None else self.evaluate(statement.position, frame)
+        declared, value = self._file_target(statement.target, frame)
+        if statement.kind == "put":
+            self.files.put(handle, where, value, declared)
+            return
+        result = self.files.get(handle, where, value, declared)
+        if not isinstance(value, VBAArray) and not isinstance(value, UserTypeValue):
+            self.resolve_target(statement.target, frame).put(result, False)
+
+    def _file_target(self, target: A.Expr | None, frame: Frame) -> tuple[str, object]:
+        """What Get and Put are given: the type its declaration says, "" for a value that has none, and the value. A
+        Variant's array keeps "variant", which its declared kin do not."""
+        value = self.evaluate(target, frame, want_object=True)
+        slot = None
+        if isinstance(target, A.Name):
+            slot = self._variable_named(target.name, frame)
+        elif isinstance(target, A.Member):
+            slot = self.member_variable(self._member_target(target, frame), target.name, frame)
+        if isinstance(slot, Slot):
+            if isinstance(value, VBAArray) and (slot.array_of or slot.fixed_array):
+                return "", value
+            return slot.declared, value
+        if isinstance(target, A.Index) and isinstance(target.target, A.Name):
+            owner = self._variable_named(target.target.name, frame)
+            array = owner.get() if owner is not None else None
+            if isinstance(array, VBAArray):
+                return array.element_type, value
+        return "", value
+
+    def _variable_named(self, name: str, frame: Frame) -> Slot | None:
+        """The variable of this name, if it is one: a function of the name is not called to find out."""
+        key = _bare(name)
+        slot = frame.locals.get(key)
+        if slot is None and isinstance(frame.me, UserClassInstance):
+            slot = frame.me.variables.get(key)
+        if slot is None:
+            slot = frame.module.variables.get(key)
+        if slot is None:
+            slot = next((runtime.variables[key] for runtime in self.modules.values()
+                         if not runtime.is_class and key in runtime.variables), None)
+        return slot
+
+    def _do_file_lock(self, statement: A.FileLock, frame: Frame) -> None:
+        self.outside("Lock #" if statement.kind == "lock" else "Unlock #")
+        number = self.evaluate(statement.number, frame)
+        first = MISSING if statement.first is None else self.evaluate(statement.first, frame)
+        last = MISSING if statement.last is None else self.evaluate(statement.last, frame)
+        self.files.lock(statement.kind == "lock", number, first, last, statement.has_range)
+
+    def _do_unsupported(self, statement: A.Unsupported, frame: Frame) -> None:
+        if statement.reason != "the PC speaker":
+            self.outside(statement.text.split(" ")[0])
+        raise VBAUnsupportedError(
+            f"{statement.text.split(' ')[0]} is {statement.reason}, which pyOpenVBA does not implement",
+            where=f"{frame.module.name}.{frame.procedure.name} line {statement.line}",
+        )
+
+    # --- expressions --------------------------------------------------------------------
+
+    def evaluate(self, expression: A.Expr | None, frame: Frame | None, *, want_object: bool = False) -> object:
+        if expression is None:
+            return MISSING
+        value = self._evaluate(expression, frame)
+        if isinstance(value, Slot):
+            value = value.get()
+        if not want_object and isinstance(value, VBAObject) and not isinstance(value, (Collection,)):
+            return value
+        return value
+
+    def evaluate_constant(self, expression: A.Expr, module: ModuleRuntime) -> object:
+        """An expression in a declaration, where no frame exists yet."""
+        frame = Frame(procedure=A.Procedure(name="<declarations>"), module=module)
+        return self.evaluate(expression, frame)
+
+    def _evaluate(self, expression: A.Expr, frame: Frame | None) -> object:
+        kind = type(expression)
+        if kind is A.Literal:
+            return expression.value  # type: ignore[attr-defined]
+        if kind is A.Name:
+            return self._read_name(expression.name, frame, expression)  # type: ignore[attr-defined]
+        if kind is A.Member:
+            return self._read_member(expression, frame)  # type: ignore[arg-type]
+        if kind is A.Index:
+            return self.evaluate_call(expression.target, expression.args, frame)  # type: ignore[attr-defined]
+        if kind is A.Binary:
+            return self._binary(expression, frame)  # type: ignore[arg-type]
+        if kind is A.Unary:
+            return self._unary(expression, frame)  # type: ignore[arg-type]
+        if kind is A.Bang:
+            return self._read_bang(expression, frame)  # type: ignore[arg-type]
+        if kind is A.NewExpr:
+            return self.create(expression.type_name)  # type: ignore[attr-defined]
+        if kind is A.TypeOfIs:
+            value = self.evaluate(expression.value, frame, want_object=True)  # type: ignore[attr-defined]
+            return _is_type(value, expression.type_name)  # type: ignore[attr-defined]
+        if kind is A.Bracket:
+            return self.host.evaluate_bracket(expression.text)  # type: ignore[attr-defined]
+        if kind is A.AddressOf:
+            raise VBAUnsupportedError("AddressOf is not implemented by pyOpenVBA")
+        raise VBAUnsupportedError(f"{kind.__name__} is not implemented by pyOpenVBA")
+
+    def _binary(self, expression: A.Binary, frame: Frame | None) -> object:
+        op = expression.op
+        if op == "and":
+            left = self.evaluate(expression.left, frame)
+            return logical_and(left, self.evaluate(expression.right, frame))
+        if op == "or":
+            left = self.evaluate(expression.left, frame)
+            return logical_or(left, self.evaluate(expression.right, frame))
+        left = self.evaluate(expression.left, frame, want_object=op == "is")
+        right = self.evaluate(expression.right, frame, want_object=op == "is")
+        if op != "is":
+            left = _scalar(left)
+            right = _scalar(right)
+        if op == "+":
+            return add(left, right)
+        if op == "-":
+            return subtract(left, right)
+        if op == "*":
+            return multiply(left, right)
+        if op == "/":
+            return divide(left, right)
+        if op == "\\":
+            return int_divide(left, right)
+        if op == "mod":
+            return modulo(left, right)
+        if op == "^":
+            return power(left, right)
+        if op == "&":
+            return concat(left, right)
+        if op == "like":
+            if left is NULL or right is NULL:
+                return NULL
+            return like_match(to_text(left), to_text(right), text_compare=self.option_compare_text)
+        if op == "xor":
+            return logical_xor(left, right)
+        if op == "eqv":
+            return logical_eqv(left, right)
+        if op == "imp":
+            return logical_imp(left, right)
+        kinds = None
+        if isinstance(left, str) != isinstance(right, str):
+            kinds = (self._static_kind(expression.left, frame), self._static_kind(expression.right, frame))
+        return compare(op, left, right, text_compare=self.option_compare_text, kinds=kinds)
+
+    def _static_kind(self, expression: A.Expr | None, frame: Frame | None) -> str:
+        """An expression's static type as a comparison sees it: "string",
+        "number" or "variant". A String against a number is read as one or is
+        a type mismatch; a Variant decides by what it holds (native probes)."""
+        if isinstance(expression, A.Literal):
+            return "string" if isinstance(expression.value, str) else "number"
+        if isinstance(expression, A.Binary):
+            if expression.op == "&":
+                return "string"
+            return "number" if expression.op in ("=", "<>", "<", ">", "<=", ">=", "like", "is") else "variant"
+        if isinstance(expression, A.Name):
+            return self._name_kind(expression.name, frame, called=False)
+        if isinstance(expression, A.Index) and isinstance(expression.target, A.Name):
+            return self._name_kind(expression.target.name, frame, called=True)
+        return "variant"
+
+    def _name_kind(self, name: str, frame: Frame | None, *, called: bool) -> str:
+        suffix = name[-1:]
+        if suffix == "$":
+            return "string"
+        if suffix in ("%", "&", "!", "#", "@"):
+            return "number"
+        if frame is None:
+            return "variant"
+        key = _bare(name)
+        slot = frame.locals.get(key)
+        if slot is None and isinstance(frame.me, UserClassInstance):
+            slot = frame.me.variables.get(key)
+        module = frame.module
+        if slot is None and key in module.constants:
+            return "string" if isinstance(module.constants[key], str) else "number"
+        if slot is None:
+            slot = module.variables.get(key)
+        if slot is None:
+            slot = next((runtime.variables[key] for runtime in self.modules.values()
+                         if not runtime.is_class and key in runtime.variables), None)
+        if slot is not None:
+            if slot.array_of:
+                return _declared_kind(slot.array_of) if called else "variant"
+            value = slot.get()
+            if isinstance(value, VBAArray):
+                return _declared_kind(value.element_type) if called else "variant"
+            return _declared_kind(slot.declared)
+        procedure = module.procedure(key) or next(
+            (runtime.procedure(key) for runtime in self.modules.values() if not runtime.is_class and runtime.procedure(key)), None)
+        if procedure is not None:
+            return "variant" if procedure.returns_array else _declared_kind(procedure.returns)
+        return "variant"
+
+    def _unary(self, expression: A.Unary, frame: Frame | None) -> object:
+        value = self.evaluate(expression.operand, frame)
+        if expression.op == "-":
+            return negate(_scalar(value))
+        return logical_not(_scalar(value))
+
+    def _read_name(self, name: str, frame: Frame | None, expression: A.Expr) -> object:
+        found = self.lookup(name, frame)
+        if found is UNRESOLVED:
+            if frame is None or frame.procedure.name == '<declarations>' or self.option_explicit(frame):
+                raise self._undefined(name, frame, expression)
+            return self._implicit_slot(name, frame).get()
+        return found
+
+    def _undefined(self, name: str, frame: Frame | None, expression: A.Expr) -> Exception:
+        where = ""
+        if frame is not None:
+            where = f"{frame.module.name}.{frame.procedure.name} line {expression.line}"
+        return VBACompileError(f"Variable not defined: {name}", where=where)
+
+    def lookup(self, name: str, frame: Frame | None, *, want_slot: bool = False) -> object:
+        """Resolve a bare name the way VBA resolves one."""
+        key = _bare(name)
+        if frame is not None:
+            if key == "me" and frame.me is not None:
+                # Me in a sheet's or the workbook's own module is the sheet or the workbook.
+                return frame.me.host if isinstance(frame.me, UserClassInstance) and frame.me.host is not None \
+                    else frame.me
+            slot = frame.locals.get(key)
+            if slot is not None:
+                return slot if want_slot else slot.get()
+            if frame.me is not None and isinstance(frame.me, UserClassInstance):
+                instance = frame.me
+                if key in instance.variables:
+                    return instance.variables[key] if want_slot else instance.variables[key].get()
+                if instance.module.procedure(key) is not None and key != frame.procedure.name.lower():
+                    return self.call_named(key, [], {}, instance.module, me=instance)
+            module = frame.module
+            module.initialise()
+            if key in module.constants:
+                return module.constants[key]
+            if key in module.variables:
+                return module.variables[key] if want_slot else module.variables[key].get()
+            if key in module.enum_members:
+                return module.enum_members[key]
+            procedure = module.procedure(key)
+            if procedure is not None:
+                return self.call(procedure, module, [], {}, me=frame.me if module.is_class else None)
+            host = _host_of(frame)
+            if host is not None and host.vba_member(key) is not None:
+                # A sheet's own module reaches the sheet's members by name: Range is Me.Range.
+                return _dispatch_get(host, key, [], {})
+        for runtime in self.modules.values():
+            if runtime.is_class:
+                continue
+            runtime.initialise()
+            if key in runtime.constants and key in runtime.public_constants:
+                return runtime.constants[key]
+            if key in runtime.variables and key in runtime.public_variables:
+                return runtime.variables[key] if want_slot else runtime.variables[key].get()
+            if key in runtime.enum_members and key in runtime.public_enum_members:
+                return runtime.enum_members[key]
+            procedure = runtime.procedure(key)
+            if procedure is not None and procedure.scope != "private":
+                return self.call(procedure, runtime, [], {})
+        if key == "err":
+            return self.err
+        if key == "debug":
+            return self.debug
+        constant = self.host.constant(key)
+        if constant is not UNRESOLVED:
+            return constant
+        language = vba_constant(key)
+        if language is not UNRESOLVED:
+            return language
+        supplied = self.host.global_object(key)
+        if supplied is not UNRESOLVED:
+            return supplied
+        if self.host.has_global_member(key):
+            return self.host.call_global(key, [], {})
+        if key in self._intrinsics:
+            return self.call_intrinsic(key, [], {})
+        form = self.modules.get(key)
+        if form is not None and form.parsed.kind == "form":
+            # A UserForm's default instance, which the interpreter does not run (issue #251).
+            raise VBAUnsupportedError(f"{form.parsed.name} is a UserForm, which pyOpenVBA does not run")
+        return UNRESOLVED
+
+    def _note_binding(self, expression: A.Expr, frame: Frame | None) -> None:
+        program = frame.program if frame is not None else None
+        BINDING.late = program is not None and id(expression) not in program.early_bound_members
+
+    def _check_late_call(self, target: object, name: str, positional: list[object], named: dict[str, object]) -> None:
+        """A call bound late reaches the object's Invoke, which refuses arguments that do not fit before the member runs."""
+        library = getattr(self.host, "vba_type_library", None)
+        if library is None or not isinstance(target, VBAObject) or isinstance(target, UserClassInstance):
+            return
+        found = find_class(library, target.vba_type_name)
+        if found is None:
+            return
+        count = len(positional)
+        while count and positional[count - 1] is MISSING:
+            count -= 1
+        number = late_index_error(found, strip_suffix(name)) if count and not named else None
+        if number is None:
+            number = late_error(found, strip_suffix(name), count, list(named))
+        if number is not None:
+            raise error(number)
+
+    def _bracket_class(self, target: object, expression: A.Member) -> LibraryClass | None:
+        """The class of an object whose target.[name] is not a call of that member: one bound late, or a name it does not have.
+        VBA compiles those to the object's DISPID_EVALUATE, so that o.[_Default] is 438 on a Range and ws.[B2] is a cell
+        (tests/fixtures/vba_brackets.json)."""
+        library = getattr(self.host, "vba_type_library", None)
+        if not expression.bracketed or library is None or not isinstance(target, VBAObject) or isinstance(target, UserClassInstance):
+            return None
+        found = find_class(library, target.vba_type_name)
+        if found is None:
+            return UNDESCRIBED if BINDING.late else None
+        return found if BINDING.late or found.reading(strip_suffix(expression.name)) is None else None
+
+    def _late_get(self, target: object, name: str, positional: list[object], named: dict[str, object]) -> object:
+        """A method bound late takes each Variant itself, where the model answers as VBA turns it into the parameter's type."""
+        library = getattr(self.host, "vba_type_library", None)
+        described = (find_class(library, target.vba_type_name)
+                     if library is not None and isinstance(target, VBAObject) and not isinstance(target, UserClassInstance) else None)
+        if described is not None:
+            positional = late_arguments(described, strip_suffix(name), positional)
+        try:
+            found = _dispatch_get(target, name, positional, named)
+            # Range.NoteText is declared String; through an Object its answer is a number (tests/fixtures/method_audit.json).
+            if strip_suffix(name).lower() == "notetext" and isinstance(found, str) and getattr(target, "vba_type_name", "") == "Range" and found.lstrip("-").isdigit():
+                return float(found)
+            return found
+        except VBARuntimeError as failed:
+            library = getattr(self.host, "vba_type_library", None)
+            found = (find_class(library, target.vba_type_name)
+                     if library is not None and isinstance(target, VBAObject) and not isinstance(target, UserClassInstance) else None)
+            number = None if found is None else late_call_error(found, strip_suffix(name), failed.number,
+                                                                kinds_of([*positional, *named.values()], NULL))
+            if number is None:
+                raise
+            if number:
+                raise error(number) from failed
+            # Excel takes it: Null as if it were left out, and True as 1.
+            positional = [MISSING if one is NULL else 1 if one is True else one for one in positional]
+            named = {key: 1 if one is True else one for key, one in named.items() if one is not NULL}
+            try:
+                return _dispatch_get(target, name, positional, named)
+            except VBARuntimeError as refused:
+                # CentimetersToPoints(Null) answers nothing, where the same call with nothing given is 449.
+                if refused.number == 449:
+                    return EMPTY
+                raise
+
+    def _read_member(self, expression: A.Member, frame: Frame | None) -> object:
+        target = self._member_target(expression, frame)
+        self._note_binding(expression, frame)
+        evaluating = self._bracket_class(target, expression)
+        if evaluating is not None:
+            if not evaluating.evaluates:
+                raise error(ERR_MEMBER_NOT_FOUND)
+            return _dispatch_get(target, "Evaluate", [expression.name], {})
+        if BINDING.late:
+            self._check_late_call(target, expression.name, [], {})
+        return self._property_value(target, expression.name)
+
+    def _property_value(self, target: object, name: str) -> object:
+        """A property read with no arguments: through an Object, one the library declares Long that Excel answers as a
+        Double is a Double, however the read is reached, a ByRef argument's included (tests/fixtures/application_settings.json)."""
+        answer = _dispatch_get(target, name, [], {})
+        if not BINDING.late or isinstance(answer, bool) or not isinstance(answer, int | float):
+            return answer
+        library = getattr(self.host, "vba_type_library", None)
+        found = find_class(library, target.vba_type_name) if library is not None and isinstance(target, VBAObject) else None
+        return float(answer) if found is not None and reads_double_late(found, strip_suffix(name)) else answer
+
+    def _member_target(self, expression: A.Member | A.Bang, frame: Frame | None) -> object:
+        if expression.target is None:
+            if frame is None or not frame.with_stack:
+                raise error(91, "a leading dot needs an open With block")
+            return frame.with_stack[-1]
+        if isinstance(expression, A.Member) and isinstance(expression.target, A.Name):
+            key = expression.target.name.casefold()
+            module = self.modules.get(key)
+            shadowed = frame is not None and (key in frame.locals or key in frame.module.variables or key in frame.module.constants or
+                                             isinstance(frame.me, UserClassInstance) and key in frame.me.variables)
+            if module is not None and not module.is_class and not shadowed:
+                return StandardModuleNamespace(module, self, frame.module if frame is not None else None)
+            enum = self.visible_enum(key, frame.module) if frame is not None and not shadowed else None
+            if enum is not None:
+                return enum
+        value = self.evaluate(expression.target, frame, want_object=True)
+        if value is NOTHING:
+            raise error(ERR_OBJECT_VARIABLE_NOT_SET)
+        return value
+
+    def _read_bang(self, expression: A.Bang, frame: Frame | None) -> object:
+        target = self._member_target(expression, frame)
+        if isinstance(target, VBAObject):
+            spec = target.vba_default_member()
+            if spec is not None and spec.getter is not None:
+                return target.vba_get(spec.name, [expression.name])
+        raise error(ERR_MEMBER_NOT_FOUND, f"{type_name(target)} has no default member for !")
+
+    # --- calls ---------------------------------------------------------------------------
+
+    def evaluate_call(
+        self,
+        callee: A.Expr | None,
+        args: list[A.Argument],
+        frame: Frame | None,
+        *,
+        statement_context: bool = False,
+    ) -> object:
+        """Everything that looks like ``thing(args)``, including no args at all."""
+        if callee is None:
+            raise VBACompileError("a call with nothing to call")
+        if isinstance(callee, A.Name):
+            return self._call_name(callee, args, frame, statement_context=statement_context)
+        if isinstance(callee, A.Member):
+            target = self._member_target(callee, frame)
+            procedure = target.procedure(strip_suffix(callee.name)) if isinstance(target, StandardModuleNamespace) else target.module.procedure(strip_suffix(callee.name)) if isinstance(target, UserClassInstance) else None
+            positional, named = self._arguments(args, frame, procedure=procedure, target=target, name=callee.name)
+            if (procedure is not None and isinstance(target, UserClassInstance) and named and frame is not None
+                    and frame.program is not None and id(callee) in frame.program.late_bound_members):
+                if any(parameter.param_array for parameter in procedure.params):
+                    raise error(446)
+                parameters = {parameter.name.lower(): index for index, parameter in enumerate(procedure.params)}
+                occupied = set(range(len(positional)))
+                for name in named:
+                    index = parameters.get(name.lower())
+                    if index is None or index in occupied:
+                        raise error(448, 'Named argument not found or already specified')
+                    occupied.add(index)
+                if any(index not in occupied and not parameter.optional and not parameter.param_array
+                       for index, parameter in enumerate(procedure.params)):
+                    raise error(450)
+            self._note_binding(callee, frame)
+            if isinstance(target, VBAObject):
+                positional, named = target.vba_given_arguments(strip_suffix(callee.name), positional, named)
+            evaluating = self._bracket_class(target, callee)
+            if evaluating is not None:
+                if not evaluating.evaluates:
+                    raise error(ERR_MEMBER_NOT_FOUND)
+                if positional or named:
+                    # Its DISPID_EVALUATE takes the name alone: o.[_Run2]("Twice", 4) is 450 (tests/fixtures/run2.json).
+                    raise error(450)
+                return _call_value(_dispatch_get(target, "Evaluate", [callee.name], {}), positional, named)
+            if BINDING.late:
+                self._check_late_call(target, callee.name, positional, named)
+                return self._late_get(target, callee.name, positional, named)
+            return _dispatch_get(target, callee.name, positional, named)
+        if isinstance(callee, A.Index):
+            inner = self.evaluate_call(callee.target, callee.args, frame)
+            positional, named = self._arguments(args, frame)
+            return _call_value(inner, positional, named)
+        value = self.evaluate(callee, frame, want_object=True)
+        positional, named = self._arguments(args, frame)
+        return _call_value(value, positional, named)
+
+    def _call_name(
+        self,
+        callee: A.Name,
+        args: list[A.Argument],
+        frame: Frame | None,
+        *,
+        statement_context: bool = False,
+    ) -> object:
+        key = _bare(callee.name)
+        if frame is not None:
+            if key == frame.procedure.name.lower() and frame.procedure.kind in ("function", "get"):
+                # Inside a Function, its own name with an argument list
+                # is a recursive call; without one it is the return
+                # value.  That is VBA's rule, and it is what makes
+                # Fact = n * Fact(n - 1) work.
+                positional, named = self._arguments(args, frame, procedure=frame.procedure)
+                return self.call_value(frame.procedure, frame.module, positional, named, me=frame.me)
+            slot = frame.locals.get(key)
+            if slot is not None:
+                return self._index_or_call(slot.get(), args, frame, callee)
+            if isinstance(frame.me, UserClassInstance) and key in frame.me.variables:
+                return self._index_or_call(frame.me.variables[key].get(), args, frame, callee)
+            module = frame.module
+            module.initialise()
+            if key in module.variables:
+                return self._index_or_call(module.variables[key].get(), args, frame, callee)
+            if key in module.constants:
+                return self._index_or_call(module.constants[key], args, frame)
+            procedure = module.procedure(key)
+            if procedure is not None:
+                positional, named = self._arguments(args, frame, procedure=procedure)
+                return self.call_value(procedure, module, positional, named, me=frame.me if module.is_class else None)
+            host = _host_of(frame)
+            if host is not None and host.vba_member(key) is not None:
+                positional, named = self._arguments(args, frame, target=host, name=key)
+                return _dispatch_get(host, key, positional, named)
+            if key in module.declares:
+                self.outside(f"{module.declares[key].name}, a Declare,")
+                raise VBAUnsupportedError(
+                    f"{module.declares[key].name} is a Declare into "
+                    f"{module.declares[key].library or 'a library'}, which pyOpenVBA cannot call"
+                )
+        for runtime in self.modules.values():
+            if runtime.is_class:
+                continue
+            runtime.initialise()
+            if key in runtime.variables:
+                return self._index_or_call(runtime.variables[key].get(), args, frame, callee)
+            procedure = runtime.procedure(key)
+            if procedure is not None and procedure.scope != "private":
+                positional, named = self._arguments(args, frame, procedure=procedure)
+                return self.call_value(procedure, runtime, positional, named)
+            if key in runtime.declares and runtime.declares[key].name:
+                self.outside(f"{runtime.declares[key].name}, a Declare,")
+                raise VBAUnsupportedError(
+                    f"{runtime.declares[key].name} is a Declare into "
+                    f"{runtime.declares[key].library or 'a library'}, which pyOpenVBA cannot call"
+                )
+        if key in ("len", "lenb"):
+            measured = self._len_of_declared(args, frame, in_bytes=key == "lenb")
+            if measured is not None:
+                return measured
+        if key in self._intrinsics:
+            positional, named = self._arguments(args, frame, intrinsic=key)
+            return self.call_intrinsic(key, positional, named)
+        supplied = self.host.global_object(key)
+        if supplied is not UNRESOLVED:
+            positional, named = self._arguments(args, frame, target=supplied)
+            return _call_value(supplied, positional, named)
+        if self.host.has_global_member(key):
+            positional, named = self._arguments(args, frame)
+            return self.host.call_global(key, positional, named)
+        constant = self.host.constant(key)
+        if constant is not UNRESOLVED:
+            positional, named = self._arguments(args, frame)
+            return _call_value(constant, positional, named)
+        if key in ("load", "unload"):
+            # The statements that load and unload a UserForm, which the interpreter does not run (issue #251).
+            raise VBAUnsupportedError(f"{callee.name}, which loads or unloads a UserForm, is not implemented: "
+                                      "UserForms do not run")
+        raise VBARuntimeError(35, f"Sub or Function not defined: {callee.name}")
+
+    def _len_of_declared(self, args: list[A.Argument], frame: Frame | None, *,
+                         in_bytes: bool = False) -> object | None:
+        """Len of a variable that is not a String is its size in bytes.
+
+        VBA settles this at compile time from the declaration, which is
+        why Len(n) is 4 for a Long holding 12345 while Len of the same
+        number in a Variant is 5.  Measured against Excel.
+        """
+        if frame is None or len(args) != 1 or args[0].name:
+            return None
+        stored = frame.program.stored_len_arguments.get(id(args[0].value)) if frame.program is not None else None
+        if stored is not None:
+            width = STORAGE_WIDTH.get(stored)
+            return VBAInt(width, "Integer") if width is not None else None
+        if not isinstance(args[0].value, A.Name):
+            return None
+        slot = self.lookup(args[0].value.name, frame, want_slot=True)
+        if not isinstance(slot, Slot):
+            return None
+        if in_bytes and slot.declared.lower().replace(" ", "").startswith("string*"):
+            return VBAInt(len(to_text(slot.get())) * 2, "Integer")
+        width = STORAGE_WIDTH.get(slot.declared)
+        return VBAInt(width, "Integer") if width is not None else None
+
+    def _index_or_call(self, value: object, args: list[A.Argument], frame: Frame | None, callee: A.Name | None = None) -> object:
+        positional, named = self._arguments(args, frame, target=value)
+        if callee is not None:
+            self._note_binding(callee, frame)
+        return _call_value(value, positional, named)
+
+    def _arguments(
+        self,
+        args: Sequence[A.Argument],
+        frame: Frame | None,
+        *,
+        procedure: A.Procedure | None = None,
+        target: object = None,
+        name: str = "",
+        intrinsic: str = "",
+    ) -> tuple[list[object], dict[str, object]]:
+        """Evaluate a call's arguments, keeping ByRef ones as slots."""
+        positional: list[object] = []
+        named: dict[str, object] = {}
+        by_ref = _by_ref_positions(procedure)
+        trailing = len(args)
+        while trailing and args[trailing - 1].omitted and not args[trailing - 1].name:
+            trailing -= 1
+        for index, argument in enumerate(args[:trailing]):
+            if argument.omitted:
+                if argument.name:
+                    continue
+                positional.append(MISSING)
+                continue
+            wants_slot = (name.lower() in getattr(target, "vba_slot_arguments", ()) and isinstance(
+                argument.value, A.Name)) or procedure is not None and by_ref(index, argument.name) and not argument.by_value
+            value: object
+            if wants_slot and isinstance(argument.value, A.Name):
+                value = self.lookup(argument.value.name, frame, want_slot=True)
+                if value is UNRESOLVED:
+                    if frame is None or frame.procedure.name == '<declarations>' or self.option_explicit(frame):
+                        raise self._undefined(argument.value.name, frame, argument.value)
+                    value = self._implicit_slot(argument.value.name, frame)
+            elif wants_slot and isinstance(argument.value, A.Member):
+                owner = self._member_target(argument.value, frame)
+                slot = self.member_variable(owner, argument.value.name, frame)
+                if slot is None:
+                    self._note_binding(argument.value, frame)
+                value = slot if slot is not None else self._property_value(owner, argument.value.name)
+            elif wants_slot and isinstance(argument.value, A.Index):
+                expression = argument.value
+                slot = None
+                owner = None
+                if isinstance(expression.target, A.Name):
+                    key = _bare(expression.target.name)
+                    if frame is not None:
+                        slot = frame.locals.get(key)
+                        if slot is None and isinstance(frame.me, UserClassInstance):
+                            slot = frame.me.variables.get(key)
+                        if slot is None:
+                            slot = frame.module.variables.get(key)
+                    if slot is None:
+                        slot = next((runtime.variables[key] for runtime in self.modules.values() if not runtime.is_class and key in runtime.variables), None)
+                elif isinstance(expression.target, A.Member):
+                    owner = self._member_target(expression.target, frame)
+                    slot = self.member_variable(owner, expression.target.name, frame)
+                array = slot.get() if slot is not None else None
+                if isinstance(array, VBAArray):
+                    if expression.args:
+                        indices, _ = self._arguments(expression.args, frame)
+                        value = ArrayElementSlot(array, [int(to_integer(one, 'Long')) for one in indices])
+                    else:
+                        value = slot
+                elif owner is not None and isinstance(expression.target, A.Member):
+                    procedure = owner.procedure(strip_suffix(expression.target.name)) if isinstance(owner, StandardModuleNamespace) else owner.module.procedure(strip_suffix(expression.target.name)) if isinstance(owner, UserClassInstance) else None
+                    positional_inner, named_inner = self._arguments(expression.args, frame, procedure=procedure)
+                    value = _dispatch_get(owner, expression.target.name, positional_inner, named_inner)
+                else:
+                    value = self.evaluate(expression, frame, want_object=True)
+            else:
+                value = self.evaluate(argument.value, frame, want_object=True)
+            if argument.name:
+                if any(key.lower() == argument.name.lower() for key in named):
+                    raise error(448, 'Named argument already specified')
+                named[argument.name] = value
+            else:
+                positional.append(value)
+        return positional, named
+
+    def member_variable(self, owner: object, name: str, frame: Frame | None) -> Slot | None:
+        name = strip_suffix(name)
+        if isinstance(owner, StandardModuleNamespace):
+            return owner.variable(name)
+        if isinstance(owner, UserTypeValue):
+            return owner.fields.get(name.casefold())
+        # A class/document's public field is exposed as a property: VBA
+        # passes its returned value temporarily, rather than its storage.
+        return None
+
+    def call_named(
+        self,
+        name: str,
+        args: list[object],
+        named: dict[str, object],
+        module: ModuleRuntime,
+        *,
+        me: object = None,
+    ) -> object:
+        procedure = module.procedure(name)
+        if procedure is None:
+            raise VBARuntimeError(35, f"Sub or Function not defined: {name}")
+        return self.call(procedure, module, args, named, me=me)
+
+    def call_intrinsic(self, name: str, args: list[object], named: dict[str, object]) -> object:
+        function = self._intrinsics[name]
+        return function(self, [self._by_value(one) for one in args], named)
+
+    def create(self, type_name_: str) -> object:
+        """``New`` on a class module, a Collection, or a host class."""
+        key = type_name_.lower()
+        if key == "collection":
+            return Collection()
+        runtime = self.modules.get(key)
+        if runtime is not None and runtime.is_class:
+            runtime.initialise()
+            instance = UserClassInstance(runtime, self)
+            initialise = runtime.procedure("Class_Initialize")
+            if initialise is not None:
+                self.call(initialise, runtime, [], {}, me=instance)
+            return instance
+        from pyopenvba.interpreter._scripting import in_memory
+
+        # New Dictionary or New RegExp, with a reference to their library; a class module of that name comes first.
+        found = in_memory(key, program=False, interpreter=self)
+        if found is not None:
+            return found
+        made = self.host.create(type_name_)
+        if made is not UNRESOLVED:
+            return made
+        raise VBAUnsupportedError(f"New {type_name_} is not a class pyOpenVBA can make")
+
+    # --- targets -----------------------------------------------------------------------
+
+    def resolve_target(self, expression: A.Expr | None, frame: Frame) -> Assignable:
+        """Where a value goes when a statement assigns to ``expression``."""
+        if isinstance(expression, A.Name):
+            return self._name_target(expression, frame)
+        if isinstance(expression, A.Member):
+            target = self._member_target(expression, frame)
+            name = expression.name
+            self._note_binding(expression, frame)
+            evaluating = self._bracket_class(target, expression)
+            if evaluating is not None:
+                raise error(424 if evaluating.evaluates else ERR_MEMBER_NOT_FOUND)
+            slot = self.member_variable(target, name, frame)
+            spec = target.vba_member(name) if isinstance(target, VBAObject) else None
+            library = getattr(self.host, "vba_type_library", None)
+            late = (find_class(library, target.vba_type_name)
+                    if BINDING.late and library is not None and isinstance(target, VBAObject) and not isinstance(target, UserClassInstance) else None)
+            return Assignable(
+                put=lambda value, by_ref: _set_member(target, name, value, by_ref, late),
+                take=lambda: _dispatch_get(target, name, [], {}),
+                declared=slot.declared if slot is not None else 'Variant',
+                takes_objects=bool(spec is not None and getattr(spec.setter, '_vba_let_objects', False)),
+                given=(lambda value: target.vba_given(strip_suffix(name), value)) if isinstance(target, VBAObject) else None,
+                owner=target, library=library, member=strip_suffix(name), bound_late=BINDING.late,
+            )
+        if isinstance(expression, A.Index):
+            return self._index_target(expression, frame)
+        if isinstance(expression, A.Bang):
+            target = self._member_target(expression, frame)
+            name = expression.name
+            return Assignable(
+                put=lambda value, by_ref: _dispatch_set(target, "Item", value, [name], {}, by_ref),
+                take=lambda: _dispatch_get(target, "Item", [name], {}),
+            )
+        raise VBACompileError("this cannot be assigned to")
+
+    def _name_target(self, expression: A.Name, frame: Frame) -> Assignable:
+        key = _bare(expression.name)
+        slot = frame.locals.get(key)
+        if slot is None and isinstance(frame.me, UserClassInstance) and key in frame.me.variables:
+            slot = frame.me.variables[key]
+        if slot is None:
+            frame.module.initialise()
+            slot = frame.module.variables.get(key)
+        host = _host_of(frame)
+        if slot is None and host is not None and host.vba_member(key) is not None:
+            # A sheet's own module sets the sheet's members by name: Name = "x" renames the sheet.
+            owner = host
+            return Assignable(put=lambda value, by_ref: owner.vba_set(key, value, by_ref=by_ref),
+                              take=lambda: owner.vba_get(key))
+        if slot is None:
+            for runtime in self.modules.values():
+                if runtime.is_class:
+                    continue
+                runtime.initialise()
+                if key in runtime.variables and key in runtime.public_variables:
+                    slot = runtime.variables[key]
+                    break
+        if slot is None:
+            if isinstance(frame.me, UserClassInstance):
+                mine = frame.me.module.procedure(key, "let") or frame.me.module.procedure(key, "set")
+                if mine is not None:
+                    instance = frame.me
+
+                    def put_on_instance(value: object, by_ref: bool) -> None:
+                        self.call(mine, instance.module, [value], {}, me=instance)
+
+                    return Assignable(put=put_on_instance, take=lambda: instance.vba_get(key))
+            procedure, runtime = self.find_procedure(key)
+            if procedure is not None and procedure.kind in ("let", "set") and runtime is not None:
+                found = procedure
+                owner = runtime
+
+                def put_on_module(value: object, by_ref: bool) -> None:
+                    self.call(found, owner, [value], {})
+
+                return Assignable(put=put_on_module, take=lambda: EMPTY)
+            if self.host.has_global_member(key):
+                return Assignable(
+                    put=lambda value, by_ref: self.host.set_global(key, value, by_ref),
+                    take=lambda: self.host.call_global(key, [], {}),
+                )
+            if self.option_explicit(frame):
+                raise VBACompileError(
+                    f"Variable not defined: {expression.name}",
+                    where=f"{frame.module.name}.{frame.procedure.name} line {expression.line}",
+                )
+            slot = self._implicit_slot(expression.name, frame)
+        target = slot
+        return Assignable(put=lambda value, by_ref: target.set(value), take=target.get, declared=target.declared)
+
+    def _implicit_slot(self, name: str, frame: Frame) -> Slot:
+        key = _bare(name)
+        declared = default_type(name, frame.module.parsed.default_types)
+        store = frame.module.statics.setdefault(frame.procedure.name.lower(), {}) if frame.procedure.static else frame.locals
+        if key not in store:
+            store[key] = self.make_slot(A.VarDecl(name=key, declared=declared), frame.module)
+        frame.locals[key] = store[key]
+        return store[key]
+
+    def option_explicit(self, frame: Frame) -> bool:
+        return frame.module.parsed.option_explicit
+
+    def _index_target(self, expression: A.Index, frame: Frame) -> Assignable:
+        inner = expression.target
+        args = [self.evaluate(argument.value, frame) for argument in expression.args if argument.value is not None]
+        named = {
+            argument.name: self.evaluate(argument.value, frame)
+            for argument in expression.args
+            if argument.name and argument.value is not None
+        }
+        positional = [value for argument, value in zip(expression.args, args) if not argument.name]
+        if isinstance(inner, A.Name):
+            key = _bare(inner.name)
+            slot = frame.locals.get(key)
+            if slot is None and isinstance(frame.me, UserClassInstance):
+                slot = frame.me.variables.get(key)
+            if slot is None:
+                frame.module.initialise()
+                slot = frame.module.variables.get(key)
+            if slot is not None and isinstance(slot.value, VBAArray):
+                array = slot.value
+                subscripts = [int(to_integer(one, "Long")) for one in positional]
+                return Assignable(
+                    put=lambda value, by_ref: array.set(subscripts, value),
+                    take=lambda: array.get(subscripts),
+                    declared=array.element_type,
+                )
+            if slot is not None and isinstance(slot.value, VBAObject):
+                held = slot.value
+                return Assignable(
+                    put=lambda value, by_ref: _dispatch_set(held, "Item", value, positional, named, by_ref),
+                    take=lambda: _dispatch_get(held, "Item", positional, named),
+                )
+            procedure, runtime = self.find_procedure(key)
+            if procedure is not None and runtime is not None:
+                found = procedure.name
+                owner = runtime
+                return Assignable(
+                    put=lambda value, by_ref: self._property_put(owner, found, positional, named, value, by_ref),
+                    take=lambda: self.call_named(found, list(positional), named, owner),
+                )
+            host = self.host.global_object("application") if self.host.has_global_member(key) else UNRESOLVED
+            if isinstance(host, VBAObject):
+                # Range("A1") = 5: the host's own member, as Application.Range("A1") = 5 would be.
+                application = host
+                return Assignable(
+                    put=lambda value, by_ref: _dispatch_set(application, key, value, positional, named, by_ref),
+                    take=lambda: _dispatch_get(application, key, positional, named),
+                )
+        if isinstance(inner, A.Member):
+            target = self._member_target(inner, frame)
+            name = inner.name
+            slot = self.member_variable(target, name, frame)
+            declared = slot.value.element_type if slot is not None and isinstance(slot.value, VBAArray) else 'Variant'
+            return Assignable(
+                put=lambda value, by_ref: _dispatch_set(target, name, value, positional, named, by_ref),
+                take=lambda: _dispatch_get(target, name, positional, named),
+                declared=declared,
+            )
+        value = self.evaluate(inner, frame, want_object=True)
+        if isinstance(value, VBAObject):
+            held = value
+            return Assignable(
+                put=lambda put, by_ref: _dispatch_set(held, "Item", put, positional, named, by_ref),
+                take=lambda: _dispatch_get(held, "Item", positional, named),
+            )
+        if isinstance(value, VBAArray):
+            # outer(0)(1) = 9 writes into the array outer(0) holds (native probe).
+            nested = value
+            indexes = [int(to_integer(one, "Long")) for one in positional]
+            return Assignable(
+                put=lambda put, by_ref: nested.set(indexes, put),
+                take=lambda: nested.get(indexes),
+                declared=nested.element_type,
+            )
+        raise VBACompileError("this cannot be assigned to")
+
+    def _property_put(
+        self,
+        module: ModuleRuntime,
+        name: str,
+        args: list[object],
+        named: dict[str, object],
+        value: object,
+        by_ref: bool,
+    ) -> None:
+        procedure = module.procedure(name, "set" if by_ref else "let") or module.procedure(name, "let")
+        if procedure is None:
+            raise error(ERR_MEMBER_NOT_FOUND, f"{name} has no Property Let")
+        self.call_setter(procedure, module, args, named, value)
+
+    def record_type(self, declared: str, module: ModuleRuntime) -> tuple[A.TypeDef, ModuleRuntime] | None:
+        """Resolve a record together with the module that defines its fields."""
+        key = declared.lower()
+        if '.' in key:
+            prefix, _, key = key.rpartition('.')
+            owner = next((runtime for runtime in self.modules.values() if runtime.name.lower() == prefix), None)
+            if owner is not None and key in owner.types:
+                if owner is not module and owner.types[key].scope != 'public':
+                    raise VBACompileError('User-defined type not defined', where=declared)
+                return owner.types[key], owner
+            return None
+        if key in module.types:
+            return module.types[key], module
+        matches = [(runtime.types[key], runtime) for runtime in self.modules.values()
+                   if key in runtime.types and runtime.types[key].scope == 'public']
+        if len(matches) > 1:
+            raise VBACompileError(f'Ambiguous name detected: {declared}', where=module.name)
+        if matches:
+            return matches[0]
+        if any(key in runtime.types for runtime in self.modules.values()):
+            raise VBACompileError('User-defined type not defined', where=declared)
+        return None
+
+    def _enum_definition(self, key: str, module: ModuleRuntime) -> tuple[A.EnumDef, ModuleRuntime] | None:
+        """The enum named ``key`` that ``module`` sees: its own, else a public one."""
+        owners = [module, *(runtime for runtime in self.modules.values() if runtime is not module)]
+        for owner in owners:
+            for enum in owner.parsed.enums:
+                if enum.name.casefold() == key and (owner is module or enum.scope == 'public'):
+                    return enum, owner
+        return None
+
+    def visible_enum(self, key: str, module: ModuleRuntime) -> EnumNamespace | None:
+        found = self._enum_definition(key, module)
+        if found is None:
+            return None
+        enum, owner = found
+        owner.initialise()
+        return EnumNamespace(enum.name, owner.enums[key])
+
+    def is_enum_type(self, declared: str, module: ModuleRuntime) -> bool:
+        """Whether ``declared`` names an enum ``module`` can see: its own, or a
+        public one elsewhere. Native VBA refuses an enum type qualified by its
+        module (``As Palette.Shade``) with "User-defined type not defined",
+        though it takes ``Palette.Light`` as a value."""
+        key = declared.lower()
+        if '.' in key:
+            prefix, _, key = key.rpartition('.')
+            owner = next((runtime for runtime in self.modules.values() if runtime.name.lower() == prefix), None)
+            if owner is not None and any(enum.name.lower() == key for enum in owner.parsed.enums):
+                raise VBACompileError('User-defined type not defined', where=declared)
+            return False
+        return self._enum_definition(key, module) is not None
+
+    def make_array(self, bounds: list[tuple[int, int]], declared: str, module: ModuleRuntime, *, fixed: bool = False) -> VBAArray:
+        declared = self.storage_declaration(declared, module)
+        record = self.record_type(declared, module)
+        factory: Callable[[], object] | None = None
+        if record is not None:
+            definition, owner = record
+            factory = lambda: UserTypeValue(definition, self, owner)
+        return VBAArray(bounds, element_type=declared, fixed=fixed, element_factory=factory)
+
+    def make_slot(self, declaration: A.VarDecl, module: ModuleRuntime, frame: Frame | None = None) -> Slot:
+        """A fresh variable, array bounds and all; frame is the procedure a local
+        one belongs to, whose constants its bounds may name."""
+        declared = self.storage_declaration(declaration.declared, module)
+        if declaration.is_array:
+            if declaration.bounds:
+                bounds = self._bounds(declaration, frame, module=module)
+                array = self.make_array(bounds, declared, module, fixed=True)
+                if declaration.as_new:
+                    array.auto_new = lambda: self.create(declared)
+                return Slot(array, "Variant", fixed_array=True)
+            # Unallocated until a ReDim: no dimensions, so LBound and UBound are error 9.
+            return Slot(self.make_array([], declared, module), "Variant", declared)
+        if declaration.as_new:
+            return AutoNewSlot(declared, self)
+        record = self.record_type(declared, module)
+        if record is not None:
+            definition, owner = record
+            return Slot(UserTypeValue(definition, self, owner), declared)
+        return Slot(default_for(declared), declared)
+
+    def storage_declaration(self, declared: str, module: ModuleRuntime) -> str:
+        """The type a declaration stores: a fixed string's width resolved, an
+        enum as the Long it holds (native probes: TypeName and VarType say
+        Long, assignments round and overflow as a Long's do)."""
+        if declared in STORAGE_WIDTH or declared in ('', 'Variant', 'String', 'Object'):
+            return declared
+        if self.is_enum_type(declared, module):
+            return 'Long'
+        if re.fullmatch(r'(?:Xl|Mso|Vb)[A-Z]\w*', declared) and self.record_type(declared, module) is None and not any(
+                runtime.is_class and runtime.name.casefold() == declared.casefold() for runtime in self.modules.values()):
+            library = getattr(self.host, "vba_type_library", None)
+            if library is None or find_class(library, declared) is None:
+                # An Excel, Office or VBA enumeration, which VBA holds as the Long it is: a handler's ByVal Result As
+                # XlXmlImportResult (tests/fixtures/xml_map_events.json).
+                return 'Long'
+        if declared.startswith('String*'):
+            from pyopenvba.interpreter._parse import parse_expression
+
+            width = int(to_integer(self.evaluate_constant(parse_expression(declared.partition('*')[2]), module), 'Long'))
+            if not 1 <= width <= 65535:
+                raise VBACompileError('Invalid fixed-length string size', where=module.name)
+            return f'String*{width}'
+        return declared
+
+    def _bounds(
+        self, declaration: A.VarDecl, frame: Frame | None, *, module: ModuleRuntime | None = None
+    ) -> list[tuple[int, int]]:
+        base = (module or (frame.module if frame else None))
+        option_base = base.parsed.option_base if base is not None else 0
+        bounds: list[tuple[int, int]] = []
+        for lower, upper in declaration.bounds:
+            if lower is None:
+                bounds.append((option_base, int(to_integer(self.evaluate(upper, frame), "Long"))))
+            else:
+                bounds.append(
+                    (
+                        int(to_integer(self.evaluate(lower, frame), "Long")),
+                        int(to_integer(self.evaluate(upper, frame), "Long")),
+                    )
+                )
+        return bounds
+
+
+# --- helpers ---------------------------------------------------------------------------
+
+
+class _Unresolved:
+    def __repr__(self) -> str:
+        return "<unresolved>"
+
+
+UNRESOLVED: Final = _Unresolved()
+
+
+class HostBridge:
+    """What a host application offers a VBA project.
+
+    The default bridge offers nothing, which is enough to run language
+    tests; :mod:`pyopenvba.apps.excel` supplies a real one.
+    """
+
+    def global_object(self, name: str) -> object:
+        return UNRESOLVED
+
+    def has_global_member(self, name: str) -> bool:
+        return False
+
+    def call_global(self, name: str, args: list[object], named: dict[str, object]) -> object:
+        raise VBAUnsupportedError(f"{name} is not something this host provides")
+
+    def set_global(self, name: str, value: object, by_ref: bool) -> None:
+        raise VBAUnsupportedError(f"{name} is not something this host provides")
+
+    def constant(self, name: str) -> object:
+        return UNRESOLVED
+
+    def document(self) -> object:
+        """The Workbook, Document or Presentation whose project runs, for a hook's request; None where there is none."""
+        return None
+
+    def running(self, class_name: str) -> object:
+        """GetObject(, class): the host's own object of that class where the host is one, else UNRESOLVED."""
+        return UNRESOLVED
+
+    def create(self, type_name_: str) -> object:
+        return UNRESOLVED
+
+    def evaluate_bracket(self, text: str) -> object:
+        raise VBAUnsupportedError("[] needs a host that can evaluate it")
+
+
+_NUMERIC_DECLARATIONS: Final = frozenset({
+    "byte", "integer", "long", "longlong", "longptr", "single", "double", "currency", "decimal", "date", "boolean",
+})
+
+
+def _declared_kind(declared: str) -> str:
+    """A declared type as a comparison sees it: "string", "number" or "variant"."""
+    base = declared.rstrip("()").lower()
+    if base == "string" or base.startswith("string*"):
+        return "string"
+    return "number" if base in _NUMERIC_DECLARATIONS else "variant"
+
+
+def _bare(name: str) -> str:
+    return strip_suffix(name).lower()
+
+
+def _host_of(frame: Frame) -> VBAObject | None:
+    """The object a document module running in ``frame`` is the code of, if it is one."""
+    me = frame.me
+    return me.host if isinstance(me, UserClassInstance) else None
+
+
+@lru_cache(maxsize=1)
+def _vba_constants() -> dict[str, int | float | str]:
+    from pyopenvba.interpreter._constants_data import VBA_CONSTANTS
+
+    return {name.lower(): value for name, value in VBA_CONSTANTS.items()}
+
+
+def vba_constant(name: str) -> object:
+    """A constant of the VBA library itself, which every host has.
+
+    vbCrLf and vbYes belong to the language rather than to Excel, so
+    they resolve with no host at all. A whole number is a Long, as an
+    enum's member is however small, unless it is declared an Integer, as
+    the key codes are.
+    """
+    from pyopenvba.interpreter._constants_data import INTEGER_CONSTANTS
+
+    found = _vba_constants().get(name)
+    if found is None:
+        return UNRESOLVED
+    if isinstance(found, int) and not isinstance(found, bool):
+        return VBAInt(found, "Integer" if name.lower() in INTEGER_CONSTANTS else "Long")
+    return found
+
+
+def _scalar(value: object) -> object:
+    return value.vba_value() if isinstance(value, VBAObject) else value
+
+
+def _dispatch_get(target: object, name: str, args: list[object], named: dict[str, object]) -> object:
+    name = strip_suffix(name)
+    if isinstance(target, VBAObject):
+        return target.vba_get(name, args, named)
+    if target is NOTHING:
+        raise error(ERR_OBJECT_VARIABLE_NOT_SET)
+    raise error(424, f"{type_name(target)} has no member named {name}")
+
+
+#: Members that make a reference of a Range given by Let, not its value: Name.RefersTo given Range("A1") is =Sheet1!$A$1
+#: (tests/fixtures/late_object_lets_2.json). An object given to one is refused openly until each is measured.
+_TAKES_REFERENCES = frozenset({'refersto', 'referstolocal', 'referstor1c1', 'referstor1c1local'})
+
+
+@dataclass(frozen=True, slots=True)
+class _Received:
+    """An object given by Let that the member receives itself, not its default member's value."""
+
+    held: object
+
+
+def _object_let_value(target: Assignable, value: object) -> object:
+    """An object given by Let to a member, before the member sees it. Excel hands the object itself to a member bound late, and to one typed
+    whose declared type is a Variant or an object; only a typed member of a value type gets the object's default value from VBA. A member
+    given the object answers by its own rule, which goes by the member, not its type: Workbook.Date1904 refuses a Font with 1004 and
+    Workbook.CheckCompatibility with 13, though both are Booleans. So an object with a value, a one-cell Range or a Name, gives that value,
+    as every measured member takes it, and one with none, Nothing, or a Range of several cells is refused openly where the member gets the
+    object (tests/fixtures/late_object_lets.json, tests/fixtures/late_object_lets_2.json). The member sweep (tests/fixtures/object_let_sweep.json)
+    measured each settable member of Range, Font, Interior, Worksheet and Workbook, and Application's settings; a member measured to take an
+    object with no value receives it as _Received."""
+    owner = target.owner
+    found = (find_class(target.library, owner.vba_type_name)
+             if target.library is not None and isinstance(owner, VBAObject) and not isinstance(owner, UserClassInstance) else None)
+    if found is None or target.takes_objects or (isinstance(value, VBAObject) and value.vba_let_as_object):
+        if value is NOTHING:
+            raise error(ERR_OBJECT_VARIABLE_NOT_SET)
+        return value
+    from pyopenvba.interpreter._late_object_lets import LATE_OBJECT_LETS
+
+    declared = found.result(target.member) or ''
+    measured = LATE_OBJECT_LETS['late' if target.bound_late else 'typed'].get(f"{found.name.lstrip('_').lower()}.{target.member.lower()}", {})
+    if not target.bound_late and declared not in ('Variant', 'Object', ''):
+        # Typed into a value type: VBA reads the default member, as before, but for what was measured, as a Range of several cells,
+        # whose array no value type takes (13).
+        if value is NOTHING:
+            raise error(ERR_OBJECT_VARIABLE_NOT_SET)
+        areas = getattr(value, 'areas', None)
+        kind = 'areas' if areas is not None and len(areas) > 1 else 'cells' if areas is not None and sum(
+            area.rows * area.columns for area in areas) > 1 else ''
+        if measured.get(kind):
+            raise error(measured[kind])
+        return value
+    what = 'Nothing' if value is NOTHING else type_name(value)
+    refusal = f"{found.name.lstrip('_')}.{target.member} given {what} by Let is not measured: what a member makes of an object is its own"
+    given: object = None
+    if value is NOTHING:
+        kind = 'nothing'
+    elif isinstance(value, VBACollection):
+        kind = 'collection'
+    else:
+        assert isinstance(value, VBAObject)
+        areas = getattr(value, 'areas', None)
+        if areas is not None and len(areas) > 1:
+            kind = 'areas'
+        elif areas is not None and sum(area.rows * area.columns for area in areas) > 1:
+            kind = 'cells'
+        else:
+            kind = 'value'
+            try:
+                given = value.vba_value() if value.vba_default_member() is not None else None
+            except VBARuntimeError:
+                given = None
+            if given is None:
+                kind = 'novalue'
+    if kind in measured:
+        if measured[kind] == -1:
+            # Measured to take an object with no value: the member receives the object itself, as Workbook.DefaultTableStyle takes Nothing.
+            return _Received(value)
+        if not measured[kind]:
+            # Measured to take the object's value, as VBA reads it.
+            assert isinstance(value, VBAObject)
+            return value.vba_value()
+        raise error(measured[kind])
+    if kind in ('cells', 'areas') and target.member.lower() not in _TAKES_REFERENCES:
+        # A Range of several cells hands over its value, an array or its first cell's, as every settable member of Range, Font,
+        # Interior, Border, Borders, Style and Characters was measured to take it (tests/fixtures/given_value_rounds.json).
+        assert isinstance(value, VBAObject)
+        return value.vba_value()
+    if kind != 'value' or target.member.lower() in _TAKES_REFERENCES:
+        raise VBAUnsupportedError(refusal)
+    return given
+
+
+def _set_member(target: object, name: str, value: object, by_ref: bool, late: LibraryClass | None) -> None:
+    """A property set. Bound early VBA turns the value into the parameter's type first, which the setters answer: Null is 94 and
+    text that is no number 13. Bound late the object takes the Variant itself and answers otherwise (tests/fixtures/settable_audit.json)."""
+    try:
+        if late is not None and isinstance(target, VBAObject) and not by_ref:
+            value = late_number(late, strip_suffix(name), value)
+        _dispatch_set(target, name, value, [], {}, by_ref)
+    except VBARuntimeError as failed:
+        number = None if late is None else late_let_error(late, strip_suffix(name), failed.number, kinds_of([value], NULL))
+        if number is None:
+            raise
+        if number == 1004:
+            raise error(1004, f"Unable to set the {strip_suffix(name)} property of the {target.vba_type_name} class") from failed  # type: ignore[attr-defined]
+        if number:
+            raise error(number) from failed
+
+
+def _dispatch_set(
+    target: object, name: str, value: object, args: list[object], named: dict[str, object], by_ref: bool
+) -> None:
+    name = strip_suffix(name)
+    if isinstance(target, VBAObject):
+        target.vba_set(name, value, args, named, by_ref=by_ref)
+        return
+    if target is NOTHING:
+        raise error(ERR_OBJECT_VARIABLE_NOT_SET)
+    raise error(424, f"{type_name(target)} has no member named {name}")
+
+
+def _call_value(value: object, args: list[object], named: dict[str, object]) -> object:
+    """``value(args)`` where value is already in hand."""
+    if isinstance(value, VBAArray):
+        if not args:
+            return value
+        return value.get([int(to_integer(one, "Long")) for one in args])
+    if isinstance(value, VBAObject):
+        if not args and not named:
+            return value
+        caller = getattr(value, "vba_default_call", None)
+        if callable(caller):
+            # An object whose default member with arguments is another member:
+            # Range("B2:C3")(1) is Range.Item(1), not Value(1) (native probes).
+            return caller(args, named)
+        spec = value.vba_default_member()
+        if spec is None:
+            raise error(ERR_MEMBER_NOT_FOUND, f"{value.vba_type_name} has no default member")
+        return value.vba_get(spec.name, args, named)
+    if isinstance(value, str) and args:
+        raise error(ERR_TYPE_MISMATCH, "a String cannot be subscripted")
+    if value is NOTHING and args:
+        # An object variable set to Nothing has no default member to call (tests/fixtures/data_labels_object.json).
+        raise error(ERR_OBJECT_VARIABLE_NOT_SET)
+    if args:
+        raise error(ERR_TYPE_MISMATCH)
+    return value
+
+
+def _iterate(subject: object) -> Iterator[object]:
+    if isinstance(subject, VBAArray):
+        return iter(subject.elements())
+    if isinstance(subject, VBAObject):
+        return subject.vba_iterate()
+    if subject is NOTHING:
+        raise error(424, "Object required")
+    raise error(13, "Type mismatch")
+
+
+def _is_type(value: object, wanted: str) -> bool:
+    if value is NOTHING:
+        return False
+    if isinstance(value, InterfaceView):
+        value = value.instance
+    # Excel.Worksheet is Worksheet: the library's name says where the class is, not what it is.
+    bare = wanted.rpartition(".")[2].lower()
+    if isinstance(value, UserClassInstance) and any(name.lower() == bare for name in value.module.parsed.implements):
+        # TypeOf x Is IShape for a class that Implements IShape (native probes).
+        return True
+    if isinstance(value, VBAObject):
+        if value.vba_type_name.lower() in (wanted.lower(), bare):
+            return True
+        return any(base.__name__.lower() in (wanted.lower(), bare) for base in type(value).__mro__)
+    return type_name(value).lower() in (wanted.lower(), bare)
+
+
+#: What a variable declared as one of these takes is not an object of a class.
+_NOT_A_CLASS = frozenset({"", "variant", "object", "byte", "integer", "long", "longlong", "longptr", "single", "double", "currency", "decimal",
+                          "date", "string", "boolean", "any"})
+
+
+def of_declared_class(value: VBAObject, declared: str) -> bool:
+    """Whether a variable declared ``declared`` takes this object by Set: any object, where it is no class's name."""
+    key = declared.lower()
+    if key in _NOT_A_CLASS or key.startswith("string *"):
+        return True
+    return _is_type(value, declared)
+
+
+#: Each MsgBox button set's buttons, by what each answers, in order: vbOKOnly to vbRetryCancel.
+_BUTTONS = {0: (1,), 1: (1, 2), 2: (3, 4, 5), 3: (6, 7, 2), 4: (6, 7), 5: (4, 2)}
+
+
+def _default_button(style: int) -> int:
+    """Which button MsgBox comes back with if nobody clicks and Enter is pressed: the one vbDefaultButton2, 3 or 4
+    names, or the first where it names none or one past the last (tests/fixtures/msgbox_default.json)."""
+    buttons = _BUTTONS.get(style & 0x0F, (1,))
+    place = (style >> 8) & 0x0F
+    return buttons[place] if place < len(buttons) else buttons[0]
+
+
+def _exit_word(kind: str) -> str:
+    if kind == "sub":
+        return "sub"
+    if kind == "function":
+        return "function"
+    return "property"
+
+
+def _by_ref_positions(procedure: A.Procedure | None) -> Callable[[int, str], bool]:
+    if procedure is None:
+        return lambda index, name: False
+
+    def wanted(index: int, name: str) -> bool:
+        if name:
+            for parameter in procedure.params:
+                if parameter.name.lower() == name.lower():
+                    return not parameter.by_val
+            return False
+        params = procedure.params
+        if params and params[-1].param_array and index >= len(params) - 1:
+            # Every argument a ParamArray gathers is passed ByRef (native probes).
+            return True
+        if index < len(params):
+            return not params[index].by_val
+        return False
+
+    return wanted
+
+
+def _load_intrinsics() -> dict[str, Callable[[Interpreter, list[object], dict[str, object]], object]]:
+    from pyopenvba.interpreter._intrinsics import INTRINSICS
+
+    return INTRINSICS
+
+
+_STATEMENTS: Final[dict[type, Callable[..., None]]] = (
+    Interpreter.statement_handlers()
+)

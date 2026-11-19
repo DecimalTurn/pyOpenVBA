@@ -1,0 +1,84 @@
+name: Fuzz
+
+# Coverage-guided fuzzing of the parsers that read untrusted files, with
+# Atheris (fuzz/fuzz_parsers.py). Each target runs from its seeds in
+# tests/fuzz_corpus: a minute on a change to the parsers, five minutes daily.
+# A finding fails the run and is kept as the crash artifact; add it to the
+# corpus as a regression seed with the fix. This is not a required check, so
+# a finding in code a pull request did not touch does not block it.
+
+on:
+  push:
+    branches: [main]
+    paths: [src/**, fuzz/**, tests/fuzz_corpus/**, .github/requirements/fuzz.*, .github/workflows/fuzz.yml]
+  pull_request:
+    paths: [src/**, fuzz/**, tests/fuzz_corpus/**, .github/requirements/fuzz.*, .github/workflows/fuzz.yml]
+  schedule:
+    - cron: '17 5 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# A new push to a pull request cancels its older runs. A push to main waits
+# for the run before it, and only the newest waiting run starts.
+concurrency:
+  group: fuzz-${{ github.workflow }}-${{ (github.event_name == 'pull_request' || github.event_name == 'push') && github.ref || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  fuzz:
+    name: Fuzz (${{ matrix.target }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        # A pull request fuzzes every target in turn on one runner, so its
+        # required checks are not left waiting for runners behind seven fuzz
+        # jobs. Every other run gives each target its own job. The two lists
+        # name the same targets.
+        target: ${{ fromJSON(github.event_name == 'pull_request' && '["all"]' || '["cfb", "decompress", "dir", "project", "projectwm", "mashup", "mformula"]') }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12.14"
+
+      - name: Install Atheris, then the package
+        run: |
+          python -m pip install --require-hashes -r .github/requirements/fuzz.txt
+          python -m pip install --no-deps --no-build-isolation -e .
+
+      - name: Fuzz
+        env:
+          TARGET: ${{ matrix.target }}
+          SECONDS_TO_RUN: ${{ github.event_name == 'schedule' && '300' || '60' }}
+        run: |
+          targets="$TARGET"
+          if [ "$TARGET" = all ]; then
+            targets="cfb decompress dir project projectwm mashup mformula"
+          fi
+          mkdir -p findings
+          status=0
+          for target in $targets; do
+            # The fuzzer adds what it learns to the first corpus directory, so
+            # it works on a copy and the checked-in seeds stay as they are.
+            mkdir -p "$RUNNER_TEMP/corpus/$target"
+            cp -r "tests/fuzz_corpus/$target/." "$RUNNER_TEMP/corpus/$target/"
+            python fuzz/fuzz_parsers.py "$target" \
+              -max_total_time="$SECONDS_TO_RUN" -timeout=10 -rss_limit_mb=2048 \
+              -artifact_prefix="findings/$target-" "$RUNNER_TEMP/corpus/$target" || status=1
+          done
+          exit "$status"
+
+      - name: Keep the finding
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: fuzz-finding-${{ matrix.target }}
+          path: findings/
+          if-no-files-found: ignore

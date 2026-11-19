@@ -5,6 +5,7 @@ Supports:
   - .docm  (OOXML macro-enabled document -- ZIP containing word/vbaProject.bin)
   - .dotm  (OOXML macro-enabled template -- ZIP containing word/vbaProject.bin)
   - .doc   (Legacy Word -- the entire file is a CFB)
+  - .dot   (Legacy template -- the .doc container; read only)
 
 Usage
 -----
@@ -25,7 +26,7 @@ from pathlib import Path
 from pyopenvba._host import VBAHostFile
 
 _ZIP_FORMATS = frozenset({".docm", ".dotm"})
-_CFB_FORMATS = frozenset({".doc"})
+_CFB_FORMATS = frozenset({".doc", ".dot"})
 _VBA_ENTRY = "word/vbaProject.bin"
 
 
@@ -43,9 +44,22 @@ class WordFile(VBAHostFile):
     _cfb_formats = _CFB_FORMATS
     _vba_entry = _VBA_ENTRY
     _host_noun = "document"
-    _no_vba_hint = (
-        "Make sure the document has a VBA project (save as .docm in Word)."
-    )
+    _application = "Word"
+    _project_storage = "Macros"
+    _project_formats = frozenset({".docm"})
+    _read_only_formats = frozenset({".dot"})
+    _main_part = "word/document.xml"
+
+    # A new project, as Word makes one: ThisDocument, from the Normal
+    # template, which Word writes even when it is all the project holds.
+
+    def _project_template(self) -> bytes:
+        from pyopenvba._templates import EMPTY_DOCM_BYTES
+
+        return EMPTY_DOCM_BYTES
+
+    def _new_documents(self) -> list[tuple[str, str | None]]:
+        return [("ThisDocument", None)]
 
     @classmethod
     def create_new(cls, path: str | Path) -> WordFile:

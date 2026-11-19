@@ -1,0 +1,24 @@
+{
+  "raw_inputs": {
+    "worksheet-outline-initial.json": "e31925c364479381f33a7a3cabdf3501b47d9e15b7d999e3c97787f704ac3ecd",
+    "worksheet-outline-mixed.json": "68d1a39d6478626dddb573585587fdc7b9bab196328f7b9d8c74f110fcc1f0bc"
+  },
+  "files": {
+    "basic-columns.xlsx": "e9b81d9b0cb64dd46ff608ba692ee092bafbda12a74bb8be3d41cae95ccc6d18",
+    "basic-rows.xlsx": "dd54e242636626edf69116e70c069e4d3df514b0c4c7dd6b7f4994483ad09b27",
+    "initial.json": "6517ae5a0b8a29b92c89a635bf04b7e27de4c0231131b65830a336a0dc8eb2e5",
+    "mixed-collapse-expand-clear-summary.xlsx": "f6c5dfd189e6d1670f7d3c6e55a81d75011f4c53819fda946e9ba8702127bfb0",
+    "mixed-columns-explicit-default-and-collapse.xlsx": "49d38114a686bf8a8a2c911395260eee50620e5a376bba39b2fc6282550451d1",
+    "mixed-explicit-default-row.xlsx": "6d862501dd8f749a4c51f3f5bafa9d66a37eb240bb649d2ed5799c45fc2d57b2",
+    "mixed-explicit-mixed-depths.xlsx": "eae9aa9e46b279cafbd249d317f64062451c6e2e3b5edac0e75599f6d6125a5d",
+    "mixed-repeated-short-group.xlsx": "b70306382932e14e46708c66d062e222c37c84477a49e77a497804636081ff6b",
+    "mixed-sparse-rows.xlsx": "492bd2cc17c83ab29b05cdad9e07b0d39a298128338a2338c1c221608d90abb6",
+    "mixed_diagnostics.json": "43859839a37dbf75bd6484ff355ce186a501e0400812fe8f041533016cac7278",
+    "nested-overlap-rows.xlsx": "e70ab9b4c7d03e5a98a44bedf5057e2bba8f8f366fc892736c44b1ac3c81b067",
+    "show-detail-and-manual-hidden.xlsx": "ecffb9cc7b3b2ff63138684ed463c43acdfde83ca91fe4f866b94c2390e291c8",
+    "show-levels-coercions.xlsx": "e8743c487bb827383da5f0d8209903b9e5eedf565c02cd388ee834422d60803e",
+    "summary-sides.xlsx": "ca8644820d555902c9824021e82a01f6d78ca5389e3207fedfc6216bfff5cb60",
+    "worksheet-outline-coercions.json": "e4b4877e6b59142611ee47ec87bcfdc35e43b5d76839e488dd026ac5d2619ee3",
+    "worksheet-outline-coercion-strings.json": "fedfeca28c87e30fa5287122e189139048a6707e10715f25356f60a8fe666db5"
+  }
+}

@@ -1,0 +1,866 @@
+"""Live Access gate for forms and reports (opt-in).
+
+A design blob that parses and rebuilds is a blob agreeing with itself.
+This gate hands what pyOpenVBA wrote to Access and **opens it in the
+designer**, which is the only thing that says the design is one Access
+will accept.
+
+Opt-in: set ``RUN_LIVE_ACCESS_VBA=1`` on a Windows machine with desktop
+Access and ``pyvbaharness`` installed.  ``pyvbaharness`` is a test-time
+oracle only; pyOpenVBA never uses COM.
+"""
+
+from __future__ import annotations
+
+import os
+import shutil
+import sys
+from collections.abc import Callable
+from pathlib import Path
+
+import pytest
+
+from pyopenvba.access import AccessDatabase
+from pyopenvba.access._designs import vba_identifier
+
+pytestmark = pytest.mark.skipif(
+    os.environ.get("RUN_LIVE_ACCESS_VBA") != "1" or sys.platform != "win32",
+    reason="live Access gate: set RUN_LIVE_ACCESS_VBA=1 on Windows with Access installed",
+)
+
+_TEMPLATE = (
+    Path(__file__).parents[1]
+    / "src"
+    / "pyopenvba"
+    / "_templates"
+    / "blank_files"
+    / "blank_database.accdb"
+)
+_TIMEOUT = 120.0
+
+_PROBES = """
+Public Function DesignNames() As Variant
+    Dim i As Long, s As String
+    For i = 0 To CurrentProject.AllForms.Count - 1
+        s = s & "F:" & CurrentProject.AllForms(i).Name & ";"
+    Next i
+    For i = 0 To CurrentProject.AllReports.Count - 1
+        s = s & "R:" & CurrentProject.AllReports(i).Name & ";"
+    Next i
+    DesignNames = s
+End Function
+
+Public Function OpenFormDesign(ByVal name As String) As Variant
+    DoCmd.OpenForm name, acDesign
+    OpenFormDesign = Forms(name).Name & "|" & Forms(name).Controls.Count & "|" & Forms(name).Section(0).Height
+    DoCmd.Close acForm, name, acSaveNo
+End Function
+
+Public Function OpenReportDesign(ByVal name As String) As Variant
+    DoCmd.OpenReport name, acViewDesign
+    OpenReportDesign = Reports(name).Name & "|" & Reports(name).Controls.Count & "|" & Reports(name).Section(0).Height
+    DoCmd.Close acReport, name, acSaveNo
+End Function
+
+Public Function DescribeControls(ByVal name As String) As Variant
+    Dim c As Object, s As String
+    DoCmd.OpenForm name, acDesign
+    For Each c In Forms(name).Controls
+        s = s & c.Name & ":" & TypeName(c) & ":" & c.Left & "," & c.Top & "," & c.Width & "," & c.Height
+        If TypeName(c) = "Label" Then
+            s = s & ":" & c.Caption
+        ElseIf TypeName(c) = "TextBox" Then
+            s = s & ":" & c.ControlSource
+        End If
+        s = s & ";"
+    Next c
+    DoCmd.Close acForm, name, acSaveNo
+    DescribeControls = s
+End Function
+
+Public Function DescribeKinds(ByVal name As String) As Variant
+    Dim c As Object, s As String, order As String, place As String
+    DoCmd.OpenForm name, acDesign
+    For Each c In Forms(name).Controls
+        order = "-"
+        place = "-"
+        On Error Resume Next
+        order = CStr(c.TabIndex)
+        place = CStr(c.Top)
+        On Error GoTo 0
+        s = s & c.Name & ":" & TypeName(c) & ":" & order & ":" & place & ";"
+    Next c
+    DoCmd.Close acForm, name, acSaveNo
+    DescribeKinds = s
+End Function
+
+Public Function DriveCalculator() As Variant
+    Dim total As Currency
+    DoCmd.OpenForm "Calculator"
+    With Forms("Calculator")
+        .Qty = 6
+        .Price = 10
+        .Express = True
+        total = .AddCurrent()
+        DriveCalculator = total & "|" & .TotalLabel.Caption & "|" & .Lines.ListCount & "|" & Pricing.DiscountRate(12)
+    End With
+    DoCmd.Close acForm, "Calculator", acSaveNo
+End Function
+
+Public Function DescribeTree(ByVal name As String) As Variant
+    Dim c As Object, s As String, holder As String
+    DoCmd.OpenForm name, acDesign
+    For Each c In Forms(name).Controls
+        holder = "-"
+        On Error Resume Next
+        holder = c.Parent.Name
+        On Error GoTo 0
+        s = s & c.Name & "=" & TypeName(c) & "/" & holder & ";"
+    Next c
+    DoCmd.Close acForm, name, acSaveNo
+    DescribeTree = s
+End Function
+
+Public Function ReadProperties(ByVal name As String) As Variant
+    Dim f As Object, out As String
+    DoCmd.OpenForm name, acDesign
+    Set f = Forms(name)
+    out = "form.Caption=" & f.Caption & ";"
+    out = out & "Title.Caption=" & f("Title").Caption & ";"
+    out = out & "Title.FontSize=" & f("Title").FontSize & ";"
+    out = out & "Title.FontName=" & f("Title").FontName & ";"
+    out = out & "Title.FontWeight=" & f("Title").FontWeight & ";"
+    out = out & "Title.ForeColor=" & f("Title").ForeColor & ";"
+    out = out & "Title.BackColor=" & f("Title").BackColor & ";"
+    out = out & "Title.Left=" & f("Title").Left & ";"
+    out = out & "Box.ControlSource=" & f("Box").ControlSource & ";"
+    out = out & "Box.ControlTipText=" & f("Box").ControlTipText & ";"
+    out = out & "Box.Tag=" & f("Box").Tag & ";"
+    out = out & "Detail.Height=" & f.Section(0).Height & ";"
+    DoCmd.Close acForm, name, acSaveNo
+    ReadProperties = out
+End Function
+
+Public Function ReadTheme(ByVal name As String) As Variant
+    Dim f As Object
+    DoCmd.OpenForm name, acDesign
+    Set f = Forms(name)
+    ReadTheme = f("Title").FontName & "|" & f("Go").FontName & "|" & f("Go").BackColor & "|" & _
+        f("Go").BorderColor & "|" & f("Title").ForeColor
+    DoCmd.Close acForm, name, acSaveNo
+End Function
+
+Public Function ReadCaptions(ByVal name As String) As Variant
+    Dim f As Object, out As String
+    DoCmd.OpenForm name, acDesign
+    Set f = Forms(name)
+    out = "Toggle=" & f("Toggle").Caption & ";"
+    out = out & "Button=" & f("Button").Caption & ";"
+    out = out & "Sign=" & f("Sign").Caption & ";"
+    out = out & "First=" & f("First").Caption & ";"
+    DoCmd.Close acForm, name, acSaveNo
+    ReadCaptions = out
+End Function
+
+Public Function ReadFlags(ByVal name As String) As Variant
+    Dim f As Object, out As String
+    DoCmd.OpenForm name, acDesign
+    Set f = Forms(name)
+    out = "Box.TextAlign=" & f("Box").TextAlign & ";"
+    out = out & "Box.Enabled=" & f("Box").Enabled & ";"
+    out = out & "Box.Visible=" & f("Box").Visible & ";"
+    out = out & "Box.TabStop=" & f("Box").TabStop & ";"
+    out = out & "Box.CanGrow=" & f("Box").CanGrow & ";"
+    out = out & "Box.FontItalic=" & f("Box").FontItalic & ";"
+    out = out & "Box.FontUnderline=" & f("Box").FontUnderline & ";"
+    out = out & "Box.ScrollBars=" & f("Box").ScrollBars & ";"
+    out = out & "Box.Locked=" & f("Box").Locked & ";"
+    out = out & "Box.IMESentenceMode=" & f("Box").IMESentenceMode & ";"
+    out = out & "Sign.TextAlign=" & f("Sign").TextAlign & ";"
+    out = out & "Go.Default=" & f("Go").Default & ";"
+    out = out & "Go.Cancel=" & f("Go").Cancel & ";"
+    DoCmd.Close acForm, name, acSaveNo
+    ReadFlags = out
+End Function
+
+Public Function CallFormCode(ByVal name As String, ByVal proc As String) As Variant
+    DoCmd.OpenForm name, , , , , acHidden
+    CallFormCode = CallByName(Forms(name), proc, VbMethod)
+    DoCmd.Close acForm, name, acSaveNo
+End Function
+
+Public Function RunForm(ByVal name As String) As Variant
+    DoCmd.OpenForm name
+    RunForm = Forms(name).Name & "|" & Forms(name).CurrentView
+    DoCmd.Close acForm, name, acSaveNo
+End Function
+
+Public Function ProjectThroughTheVbe() As Variant
+    Dim c As Object, s As String
+    For Each c In Application.VBE.ActiveVBProject.VBComponents
+        s = s & c.Name & ":" & c.Type & ";"
+    Next c
+    ProjectThroughTheVbe = s
+End Function
+
+Public Function DesignAndItsCode(ByVal name As String, ByVal moduleName As String) As Variant
+    Dim c As Object, s As String
+    DoCmd.OpenForm name, acDesign
+    s = Forms(name).Name & "|"
+    DoCmd.Close acForm, name, acSaveNo
+    Set c = Application.VBE.ActiveVBProject.VBComponents(moduleName)
+    DesignAndItsCode = s & c.CodeModule.Lines(1, c.CodeModule.CountOfLines)
+End Function
+"""
+
+
+def ask(path: Path, proc: str, *args: str) -> object:
+    harness = pytest.importorskip("pyvbaharness")
+
+    with harness.AccessSession() as access:
+        access.open_document(path, read_only=False)
+        result = access.run_vba(_PROBES, proc=proc, args=tuple(args), timeout=_TIMEOUT)
+        # A design Access will not open shows a dialog rather than
+        # failing, so the dialog's own words are worth reporting.
+        reported: list[object] = list(result.dialogs or [])
+        dialogs = "; ".join(str(getattr(d, "message", "")) for d in reported)
+        assert result.outcome == "passed", (
+            f"{proc}{tuple(args)}: {result.outcome} {getattr(result, 'error', None)} {dialogs}"
+        )
+        return result.value
+
+
+@pytest.fixture
+def blank(tmp_path: Path) -> Path:
+    if not _TEMPLATE.exists():  # pragma: no cover - the template ships with the package
+        pytest.skip("blank template not present")
+    out = tmp_path / "blank.accdb"
+    shutil.copyfile(_TEMPLATE, out)
+    return out
+
+
+def written(blank: Path, out: Path, build: Callable[[AccessDatabase], object]) -> Path:
+    database = AccessDatabase(blank)
+    build(database)
+    database.save(out)
+    return out
+
+
+def test_access_lists_the_designs_we_write(blank: Path, tmp_path: Path) -> None:
+    def build(db: AccessDatabase) -> None:
+        db.create_form("Plain")
+        db.create_report("Sheet")
+
+    out = written(blank, tmp_path / "listed.accdb", build)
+
+    assert {n for n in str(ask(out, "DesignNames")).split(";") if n} == {"F:Plain", "R:Sheet"}
+
+
+def test_access_opens_a_form_we_write_in_the_designer(blank: Path, tmp_path: Path) -> None:
+    """A design Access will not open is one this gate exists to catch."""
+    out = written(blank, tmp_path / "form.accdb", lambda db: db.create_form("Plain"))
+
+    name, controls, height = str(ask(out, "OpenFormDesign", "Plain")).split("|")
+    assert name == "Plain"
+    assert int(controls) == 0
+    assert int(height) > 0  # the Detail section has a size of its own
+
+
+def test_access_opens_a_report_we_write_in_the_designer(blank: Path, tmp_path: Path) -> None:
+    out = written(blank, tmp_path / "report.accdb", lambda db: db.create_report("Sheet"))
+
+    name, controls, height = str(ask(out, "OpenReportDesign", "Sheet")).split("|")
+    assert name == "Sheet"
+    assert int(controls) == 0
+    assert int(height) > 0
+
+
+def test_a_first_form_in_a_database_without_code_opens(tmp_path: Path) -> None:
+    """The form brings the VBA project with it, as Access's first form
+    does; Access opens it in the designer and runs it."""
+    out = tmp_path / "first_form.accdb"
+    shutil.copyfile(Path(__file__).parent / "live_access_test" / "no_project.accdb", out)
+    database = AccessDatabase(out)
+    database.create_form("Plain")
+    database.create_report("Sheet")
+    database.save()
+
+    assert str(ask(out, "OpenFormDesign", "Plain")).startswith("Plain|")
+    assert str(ask(out, "RunForm", "Plain")).startswith("Plain|")
+    assert str(ask(out, "OpenReportDesign", "Sheet")).startswith("Sheet|")
+
+
+def test_a_form_in_a_database_on_the_2023_theme_is_drawn_in_it(tmp_path: Path) -> None:
+    """A form and its controls in a database on Office's 2023 theme take
+    Aptos and the theme's colours, which Access reads back, and the form
+    runs."""
+    out = tmp_path / "themed.accdb"
+    shutil.copyfile(Path(__file__).parent / "live_access_test" / "first_form.accdb", out)
+    database = AccessDatabase(out)
+    database.create_form("Themed")
+    database.add_control("Themed", "Label", "Title", caption="Hello", top=100)
+    database.add_control("Themed", "CommandButton", "Go", caption="Go", top=600)
+    database.save()
+
+    label_font, button_font, back, border, fore = str(ask(out, "ReadTheme", "Themed")).split("|")
+    assert (label_font, button_font) == ("Aptos", "Aptos")
+    # accent1 lightened 40% on this theme is 46B1E1; Access answers BGR.
+    assert (int(back), int(border)) == (0xE1B146, 0xE1B146)
+    # Text 1 lightened 40%, the same on every theme with a black text colour.
+    assert int(fore) == 0x666666
+    assert str(ask(out, "RunForm", "Themed")).startswith("Themed|")
+
+
+def test_a_form_we_write_runs(blank: Path, tmp_path: Path) -> None:
+    """Opening it in form view, not just the designer."""
+    out = written(blank, tmp_path / "run.accdb", lambda db: db.create_form("Plain"))
+
+    name, _view = str(ask(out, "RunForm", "Plain")).split("|")
+    assert name == "Plain"
+
+
+def test_two_forms_both_open(blank: Path, tmp_path: Path) -> None:
+    """The second takes a storage folder of its own, and Access will not
+    find an object in a folder named anything else."""
+
+    def build(db: AccessDatabase) -> None:
+        db.create_form("First")
+        db.create_form("Second")
+
+    out = written(blank, tmp_path / "two.accdb", build)
+
+    assert str(ask(out, "OpenFormDesign", "First")).startswith("First|")
+    assert str(ask(out, "OpenFormDesign", "Second")).startswith("Second|")
+
+
+def test_a_form_and_a_report_in_folder_ten_open(blank: Path, tmp_path: Path) -> None:
+    """The eleventh of each takes folder `10` (GitHub issue #34)."""
+
+    def build(db: AccessDatabase) -> None:
+        for i in range(11):
+            db.create_form(f"Form{i}")
+            db.create_report(f"Report{i}")
+
+    out = written(blank, tmp_path / "past_nine.accdb", build)
+
+    assert str(ask(out, "OpenFormDesign", "Form10")).startswith("Form10|")
+    assert str(ask(out, "OpenReportDesign", "Report10")).startswith("Report10|")
+
+
+def test_a_deleted_design_is_gone_from_access(blank: Path, tmp_path: Path) -> None:
+    def build(db: AccessDatabase) -> None:
+        db.create_form("Keep")
+        db.create_form("Drop")
+        db.create_report("Sheet")
+        db.delete_form("Drop")
+        db.delete_report("Sheet")
+
+    out = written(blank, tmp_path / "deleted.accdb", build)
+
+    assert {n for n in str(ask(out, "DesignNames")).split(";") if n} == {"F:Keep"}
+    assert str(ask(out, "OpenFormDesign", "Keep")).startswith("Keep|")
+
+
+def test_access_reads_back_the_controls_we_add(blank: Path, tmp_path: Path) -> None:
+    """Name, type and every measurement, as Access reports them."""
+
+    def build(db: AccessDatabase) -> None:
+        db.create_form("Built")
+        db.add_control(
+            "Built", "Label", "Title", left=240, top=240, width=2000, height=300,
+            caption="Hello there",
+        )
+        db.add_control(
+            "Built", "TextBox", "Box", left=240, top=700, width=2400, height=320,
+            caption="=1+1",
+        )
+
+    out = written(blank, tmp_path / "controls.accdb", build)
+
+    reported = [c for c in str(ask(out, "DescribeControls", "Built")).split(";") if c]
+    assert reported == [
+        "Title:Label:240,240,2000,300:Hello there",
+        "Box:TextBox:240,700,2400,320:=1+1",
+    ]
+
+
+def test_controls_on_a_report_reach_access(blank: Path, tmp_path: Path) -> None:
+    """Three across two sections, which is what makes the markers matter:
+    the page header holds one and the detail band two, and Access refuses
+    either encoding in the other's place."""
+
+    def build(db: AccessDatabase) -> None:
+        db.create_report("Sheet")
+        db.add_control("Sheet", "Label", "Heading", kind="report", caption="Monthly", width=2000)
+        db.add_control("Sheet", "TextBox", "Total", kind="report", caption="=2*21", top=500)
+        db.add_control(
+            "Sheet", "Label", "PageTitle", kind="report", section="PageHeaderSection",
+            caption="Header band", width=2000,
+        )
+
+    out = written(blank, tmp_path / "report_control.accdb", build)
+
+    name, controls, _height = str(ask(out, "OpenReportDesign", "Sheet")).split("|")
+    assert name == "Sheet" and int(controls) == 3
+
+
+def test_one_control_on_a_form_reaches_access(blank: Path, tmp_path: Path) -> None:
+    """A lone control takes the other marker, so it needs its own check."""
+    out = written(
+        blank,
+        tmp_path / "one.accdb",
+        lambda db: (db.create_form("Solo"), db.add_control("Solo", "Label", "Only", caption="Hi")),
+    )
+
+    assert [c for c in str(ask(out, "DescribeControls", "Solo")).split(";") if c] == [
+        "Only:Label:0,0,1440,240:Hi"
+    ]
+
+
+def test_access_runs_code_we_put_behind_a_form(blank: Path, tmp_path: Path) -> None:
+    """A module the design does not answer to loads all the same, so the
+    only check that means anything is calling it through the form."""
+
+    def build(db: AccessDatabase) -> None:
+        db.create_form("Behind")
+        db.set_design_code("Behind", "Option Compare Database\n\n"
+        "Public Function Ping() As Variant\n"
+        "    Ping = 7\n"
+        "End Function")
+
+    out = written(blank, tmp_path / "behind.accdb", build)
+
+    assert ask(out, "CallFormCode", "Behind", "Ping") == 7
+
+
+def test_code_behind_a_form_can_be_replaced_and_still_runs(blank: Path, tmp_path: Path) -> None:
+    def build(db: AccessDatabase) -> None:
+        db.create_form("Behind")
+        db.set_design_code("Behind", "Option Compare Database\n\n"
+        "Public Function Ping() As Variant\n"
+        "    Ping = 7\n"
+        "End Function")
+        db.set_design_code("Behind", "Option Compare Database\n\n"
+        "Public Function Ping() As Variant\n"
+        "    Ping = 77\n"
+        "End Function")
+
+    out = written(blank, tmp_path / "replaced.accdb", build)
+
+    assert ask(out, "CallFormCode", "Behind", "Ping") == 77
+
+
+#: Every type whose slots were read back from a control Access made.
+MEASURED = [
+    "Label",
+    "TextBox",
+    "CommandButton",
+    "ToggleButton",
+    "OptionButton",
+    "CheckBox",
+    "OptionGroup",
+    "ListBox",
+    "ComboBox",
+    "Rectangle",
+    "Line",
+    "Image",
+    "PageBreak",
+    "BoundObjectFrame",
+    "ObjectFrame",
+    "Subform",
+    "Tab",
+    "CustomControl",
+    "Attachment",
+    "WebBrowser",
+    "Chart",
+    "EdgeBrowser",
+]
+#: Access does not call every control what pyOpenVBA calls it.
+ACCESS_NAMES = {
+    "Subform": "SubForm",
+    "Tab": "TabControl",
+    "WebBrowser": "WebBrowserControl",
+    "EdgeBrowser": "Edge",
+}
+
+
+def test_access_opens_a_form_holding_one_of_every_control_we_can_write(
+    blank: Path, tmp_path: Path
+) -> None:
+    """One of every type we can write, on one form.  Access reporting each
+    one back by name and type is what says the slots are right; a design it
+    will not accept shows a dialog instead."""
+
+    def build(db: AccessDatabase) -> None:
+        db.create_form("Every")
+        for i, kind in enumerate(MEASURED):
+            db.add_control(
+                "Every",
+                kind,
+                f"My{kind}",
+                left=240,
+                top=240 + i * 400,
+                width=1400,
+                height=300,
+            )
+
+    out = written(blank, tmp_path / "every.accdb", build)
+
+    reported = [c for c in str(ask(out, "DescribeKinds", "Every")).split(";") if c]
+    seen = {part.split(":")[0]: part.split(":")[1] for part in reported}
+    assert seen == {
+        f"My{kind}": ACCESS_NAMES.get(kind, kind) for kind in MEASURED
+    }
+
+
+def test_access_agrees_with_the_tab_order_we_wrote(blank: Path, tmp_path: Path) -> None:
+    """A control that takes the focus is numbered in the order it was
+    added, and one that cannot is not numbered at all."""
+
+    def build(db: AccessDatabase) -> None:
+        db.create_form("Tabs")
+        for i, kind in enumerate(["TextBox", "Rectangle", "CommandButton", "ComboBox"]):
+            db.add_control("Tabs", kind, f"C{i}", left=240, top=240 + i * 400)
+
+    out = written(blank, tmp_path / "tabs.accdb", build)
+
+    reported = [c for c in str(ask(out, "DescribeKinds", "Tabs")).split(";") if c]
+    tabs = {part.split(":")[0]: part.split(":")[2] for part in reported}
+    assert tabs == {"C0": "0", "C1": "-", "C2": "1", "C3": "2"}
+
+
+def test_a_page_break_we_write_keeps_its_place(blank: Path, tmp_path: Path) -> None:
+    """A page break has a top and nothing else, so that is all we write."""
+
+    def build(db: AccessDatabase) -> None:
+        db.create_form("Broken")
+        db.add_control("Broken", "PageBreak", "Split", top=1440)
+
+    out = written(blank, tmp_path / "break.accdb", build)
+
+    reported = [c for c in str(ask(out, "DescribeKinds", "Broken")).split(";") if c]
+    assert reported == ["Split:PageBreak:-:1440"]
+
+
+def test_access_puts_the_pages_we_write_on_the_tab_control(
+    blank: Path, tmp_path: Path
+) -> None:
+    """A page belongs to a tab control, written as a group of its own right
+    after it.  Access naming the tab as each page's parent, and the form as
+    the parent of the controls beside it, is what says the nesting is
+    right -- a page swallowed into the wrong group still parses."""
+
+    def build(db: AccessDatabase) -> None:
+        db.create_form("Tabbed")
+        db.add_control("Tabbed", "TextBox", "Box", top=240)
+        db.add_control("Tabbed", "Tab", "Tabs", top=800, width=4000, height=2000)
+        db.add_control("Tabbed", "Page", "First", parent="Tabs", caption="One")
+        db.add_control("Tabbed", "Page", "Second", parent="Tabs", caption="Two")
+        db.add_control("Tabbed", "CommandButton", "Go", top=3000)
+
+    out = written(blank, tmp_path / "tabbed.accdb", build)
+
+    reported = [c for c in str(ask(out, "DescribeTree", "Tabbed")).split(";") if c]
+    assert reported == [
+        "Box=TextBox/Tabbed",
+        "Tabs=TabControl/Tabbed",
+        "First=Page/Tabs",
+        "Second=Page/Tabs",
+        "Go=CommandButton/Tabbed",
+    ]
+
+
+def test_access_reads_back_the_properties_we_set(blank: Path, tmp_path: Path) -> None:
+    """Setting a property means putting a record at the id that control
+    type's own schema gives it.  Access reading each one back is what says
+    the id was right; a record at the wrong id would still parse."""
+
+    def build(db: AccessDatabase) -> None:
+        db.create_form("Styled")
+        db.add_control("Styled", "Label", "Title", left=240, top=240, width=3000, height=400, caption="before")
+        db.add_control("Styled", "TextBox", "Box", left=240, top=800, width=3000, height=320)
+        db.set_design_property("Styled", "Caption", "My window")
+        db.set_control_property("Styled", "Title", "Caption", "after")
+        db.set_control_property("Styled", "Title", "FontSize", 18)
+        db.set_control_property("Styled", "Title", "FontName", "Consolas")
+        db.set_control_property("Styled", "Title", "FontWeight", 700)
+        db.set_control_property("Styled", "Title", "ForeColor", 255)
+        db.set_control_property("Styled", "Title", "BackColor", 65535)
+        db.set_control_property("Styled", "Title", "Left", 1440)
+        db.set_control_property("Styled", "Box", "ControlSource", "=2+2")
+        db.set_control_property("Styled", "Box", "ControlTipText", "hover me")
+        db.set_control_property("Styled", "Box", "Tag", "tagged")
+        db.set_control_property("Styled", "Detail", "Height", 2880)
+
+    out = written(blank, tmp_path / "styled.accdb", build)
+
+    reported = [c for c in str(ask(out, "ReadProperties", "Styled")).split(";") if c]
+    assert reported == [
+        "form.Caption=My window",
+        "Title.Caption=after",
+        "Title.FontSize=18",
+        "Title.FontName=Consolas",
+        "Title.FontWeight=700",
+        "Title.ForeColor=255",
+        "Title.BackColor=65535",
+        "Title.Left=1440",
+        "Box.ControlSource==2+2",
+        "Box.ControlTipText=hover me",
+        "Box.Tag=tagged",
+        "Detail.Height=2880",
+    ]
+
+
+def test_a_caption_reaches_every_control_that_has_one(blank: Path, tmp_path: Path) -> None:
+    """A caption sits at a different id on each type -- 221 on a label and
+    a command button, 231 on a toggle button, 232 on a page -- and Access
+    does not complain about one written at the wrong id, it just shows the
+    caption missing and some other property changed."""
+
+    def build(db: AccessDatabase) -> None:
+        db.create_form("Captions")
+        db.add_control("Captions", "Label", "Sign", top=240, caption="label text")
+        db.add_control("Captions", "CommandButton", "Button", top=700, caption="button text")
+        db.add_control("Captions", "ToggleButton", "Toggle", top=1200, caption="toggle text")
+        db.add_control("Captions", "Tab", "Tabs", top=1700, width=4000, height=1500)
+        db.add_control("Captions", "Page", "First", parent="Tabs", caption="page text")
+
+    out = written(blank, tmp_path / "captions.accdb", build)
+
+    reported = [c for c in str(ask(out, "ReadCaptions", "Captions")).split(";") if c]
+    assert reported == [
+        "Toggle=toggle text",
+        "Button=button text",
+        "Sign=label text",
+        "First=page text",
+    ]
+
+
+def test_access_agrees_on_the_properties_differencing_named(
+    blank: Path, tmp_path: Path
+) -> None:
+    """A property whose values are small integers cannot be named by
+    matching values -- every other property uses 0, 1 and 2 as well -- so
+    these were named by building the same form twice, identical but for
+    one property, and seeing which record moved.
+
+    `TextAlign` is the one that makes the point: it was long taken to be
+    code 379, which is really `IMESentenceMode`, and since Access writes 3
+    there on every new text box nothing looked wrong until someone tried
+    to set the alignment and it did not change.
+    """
+
+    def build(db: AccessDatabase) -> None:
+        db.create_form("Flags")
+        db.add_control("Flags", "TextBox", "Box", top=240)
+        db.add_control("Flags", "Label", "Sign", top=700)
+        db.add_control("Flags", "CommandButton", "Go", top=1200)
+        for prop, value in (
+            ("TextAlign", 2),
+            ("Enabled", False),
+            ("Visible", False),
+            ("TabStop", False),
+            ("CanGrow", True),
+            ("FontItalic", True),
+            ("FontUnderline", True),
+            ("ScrollBars", 2),
+            ("Locked", True),
+            ("IMESentenceMode", 0),
+        ):
+            db.set_control_property("Flags", "Box", prop, value)
+        db.set_control_property("Flags", "Sign", "TextAlign", 3)
+        db.set_control_property("Flags", "Go", "Default", True)
+        db.set_control_property("Flags", "Go", "Cancel", True)
+
+    out = written(blank, tmp_path / "flags.accdb", build)
+
+    reported = [c for c in str(ask(out, "ReadFlags", "Flags")).split(";") if c]
+    assert reported == [
+        "Box.TextAlign=2",
+        "Box.Enabled=False",
+        "Box.Visible=False",
+        "Box.TabStop=False",
+        "Box.CanGrow=True",
+        "Box.FontItalic=True",
+        "Box.FontUnderline=True",
+        "Box.ScrollBars=2",
+        "Box.Locked=True",
+        "Box.IMESentenceMode=0",
+        "Sign.TextAlign=3",
+        "Go.Default=True",
+        "Go.Cancel=True",
+    ]
+
+
+def test_access_agrees_with_what_is_left_after_a_control_is_removed(blank: Path, tmp_path: Path) -> None:
+    """Taking the middle of three text boxes off closes the tab order up
+    behind it, and Access reads back the two that remain at 0 and 1."""
+
+    def build(db: AccessDatabase) -> None:
+        form = db.add_form("Fewer")
+        for i in range(3):
+            form.add_control("TextBox", f"T{i}", left=240, top=240 + i * 400)
+        form.add_control("Label", "Note", left=240, top=2000, caption="kept")
+        form.remove_control("T1")
+
+    out = written(blank, tmp_path / "fewer.accdb", build)
+
+    reported = [c for c in str(ask(out, "DescribeKinds", "Fewer")).split(";") if c]
+    assert [part.split(":")[0] for part in reported] == ["T0", "T2", "Note"]
+    tabs = {part.split(":")[0]: part.split(":")[2] for part in reported}
+    assert tabs == {"T0": "0", "T2": "1", "Note": "-"}
+
+
+def test_access_sees_a_page_gone_from_its_tab_control(blank: Path, tmp_path: Path) -> None:
+    def build(db: AccessDatabase) -> None:
+        form = db.add_form("Fewer2", caption="Two pages left")
+        form.add_control("Tab", "Tabs", top=800, width=4000, height=2000)
+        for name in ("First", "Second", "Third"):
+            form.add_control("Page", name, parent="Tabs", caption=name)
+        form.remove_control("Second")
+
+    out = written(blank, tmp_path / "fewer2.accdb", build)
+
+    reported = [c for c in str(ask(out, "DescribeTree", "Fewer2")).split(";") if c]
+    assert reported == ["Tabs=TabControl/Fewer2", "First=Page/Tabs", "Third=Page/Tabs"]
+
+
+def test_the_demo_form_drives_its_modules_in_access(blank: Path, tmp_path: Path) -> None:
+    """examples/access_form_demo.py: a form whose code calls a standard
+    module and keeps state in a class module.  Access opens the form, the
+    driver sets six units at 10 with express delivery, and the total is
+    6 * 10 less the 5% discount plus 4.50, with one line listed."""
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("access_form_demo", Path(__file__).parents[1] / "examples" / "access_form_demo.py")
+    assert spec is not None and spec.loader is not None
+    demo = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(demo)
+    out = tmp_path / "demo.accdb"
+    getattr(demo, "build")(out)
+
+    total, caption, listed, discount = str(ask(out, "DriveCalculator")).split("|")
+    assert float(total) == 61.5
+    assert caption.startswith("Total: ") and "1 lines" in caption
+    assert listed == "1"
+    assert float(discount) == 0.1
+
+
+def test_access_takes_an_edit_to_a_form_it_built_itself(tmp_path: Path) -> None:
+    """The form Access built with one of every control, a label attached to
+    a text box and buttons inside an option group: remove a button, add a
+    text box, and Access opens it and lists what is there."""
+    out = tmp_path / "every_edited.accdb"
+    shutil.copyfile(Path(__file__).parent / "live_access_test" / "designs_every.accdb", out)
+    db = AccessDatabase(out)
+    form = db.form("Every")
+    form.remove_control("Cmd")
+    form.add_control("TextBox", "Extra", top=12000)
+    db.save()
+
+    reported = [c for c in str(ask(out, "DescribeKinds", "Every")).split(";") if c]
+    names = [part.split(":")[0] for part in reported]
+    assert "Cmd" not in names
+    assert "Extra" in names and "GrpOptA" in names and "TxtLabel" in names
+    assert len(names) == 33
+
+
+
+_CODED = Path(__file__).parent / "live_access_test" / "form_with_code.accdb"
+
+
+def test_access_takes_a_renamed_form_and_its_code(tmp_path: Path) -> None:
+    """A design's name lives in four places, and `PROJECT` names the module
+    behind it only as a `DocClass=` line.
+
+    Leaving that line stale is the failure worth a live gate: Access opens
+    the database and shows the form, then reports the whole project as
+    corrupt on the first VBE reference (GitHub issue #21).  So the probe
+    opens the design and then reads its code through the VBE.
+    """
+    out = tmp_path / "renamed.accdb"
+    shutil.copyfile(_CODED, out)
+    database = AccessDatabase(out)
+    database.rename_form("Coded", "Invoice")
+    database.save()
+
+    assert str(ask(out, "DesignNames")) == "F:Invoice;"
+    opened, code = str(ask(out, "DesignAndItsCode", "Invoice", "Form_Invoice")).split("|", 1)
+    assert opened == "Invoice"
+    assert "Answer = 42" in code
+
+    listed = [entry for entry in str(ask(out, "ProjectThroughTheVbe")).split(";") if entry]
+    assert "Form_Invoice:100" in listed
+    assert not [entry for entry in listed if entry.startswith("Form_Coded:")]
+
+
+def test_access_takes_a_deleted_form_whose_code_went_with_it(tmp_path: Path) -> None:
+    """Deleting the design used to leave its module, so `PROJECT` named a
+    `DocClass` whose form was gone.  The VBE is where that shows."""
+    out = tmp_path / "deleted.accdb"
+    shutil.copyfile(_CODED, out)
+    database = AccessDatabase(out)
+    database.delete_form("Coded")
+    database.save()
+
+    assert str(ask(out, "DesignNames")) == ""
+    listed = [entry for entry in str(ask(out, "ProjectThroughTheVbe")).split(";") if entry]
+    assert "Module1:1" in listed
+    assert not [entry for entry in listed if entry.startswith("Form_")]
+
+
+_CONTROL_NAMES = Path(__file__).parent / "live_access_test" / "control_names.accdb"
+_CODE_PAGE_NAMES = Path(__file__).parent / "live_access_test" / "code_page_names.accdb"
+
+
+def compiles(path: Path) -> str:
+    """Hand the database to Access and compile its VBA project.
+
+    The damage this guards against is invisible in the file: the form
+    opens and the code behind it stops compiling, because a member
+    listed under a name `Me.` cannot reach is no member at all.
+    """
+    harness = pytest.importorskip("pyvbaharness")
+    with harness.AccessSession() as access:
+        access.open_document(path, read_only=False)
+        report = access.compile_project(watch_seconds=30.0)
+        return f"{report.outcome} {report.message}".strip()
+
+
+def test_access_compiles_code_reaching_every_control_after_an_edit(tmp_path: Path) -> None:
+    """A control is rarely named as VBA names it, and the member list
+    holds both spellings.  Reading it as one name rewrote `Order Date` as
+    exactly that, which `Me.` cannot reach (GitHub issue #22)."""
+    out = tmp_path / "names.accdb"
+    shutil.copyfile(_CONTROL_NAMES, out)
+    database = AccessDatabase(out)
+    reached = [vba_identifier(c.name) for c in database.form("Names").controls]
+    database.set_design_code(
+        "Names",
+        "\r\n".join(
+            ["Option Compare Database", "Option Explicit", "", "Public Sub Touch()"]
+            + [f"    Debug.Print Me.{name}.Name" for name in reached]
+            + ["End Sub"]
+        ),
+    )
+    database.add_control("Names", "TextBox", "Added")
+    database.save()
+
+    assert reached[:3] == ["Order_Date", "Qty_1", "Ctl2ndBox"]
+    assert compiles(out) == "accepted"
+    assert str(ask(out, "OpenFormDesign", "Names")).startswith("Names|7|")
+
+
+def test_access_compiles_a_form_with_a_name_its_page_cannot_hold(tmp_path: Path) -> None:
+    """The Cyrillic control is in the design and not in the member list.
+    Every edit used to append a `???` member, and a second edit gave the
+    class two of them (GitHub issue #23)."""
+    out = tmp_path / "pages.accdb"
+    shutil.copyfile(_CODE_PAGE_NAMES, out)
+    database = AccessDatabase(out)
+    database.set_control_property("Names", "Plain", "Width", 2000)
+    database.set_control_property("Names", "Plain", "Height", 300)
+    database.save()
+
+    assert compiles(out) == "accepted"
+    assert str(ask(out, "DescribeControls", "Names")).count(";") == 6

@@ -1,0 +1,760 @@
+{
+  "generic-generic-low-far-51.xlsx": {
+    "native_sha256": "8e71af11afce54598ccbfb496ef1351611421e503340fc961d57a8cddf58b342",
+    "native_path": "<folder>\\generic-generic-low-far-51.xlsx",
+    "fixture_sha256": "8e71af11afce54598ccbfb496ef1351611421e503340fc961d57a8cddf58b342"
+  },
+  "generic-generic-low-far-52.xlsm": {
+    "native_sha256": "87397220ef10bda07be60c4301e272424b9d5aad2258f72d7618aeebfc91b9e1",
+    "native_path": "<folder>\\generic-generic-low-far-52.xlsm",
+    "rejected_derivation": {
+      "fixture_sha256": "0e973ebea79ca25e0db0634d1c4cb74c1de6096e9d409f6b62d91d5e6fbd1af5",
+      "derivation": "Native input with VBA parts and their relationships/content-type entries removed; workbook format52 content type, workbook, worksheets and styles unchanged.",
+      "removed_parts": [
+        "xl/vbaProject.bin"
+      ],
+      "rewritten_package_metadata": [
+        "[Content_Types].xml",
+        "xl/_rels/workbook.xml.rels"
+      ],
+      "reason": "Native acceptance differed in group identity after VBA removal; original native package required."
+    },
+    "fixture_sha256": "87397220ef10bda07be60c4301e272424b9d5aad2258f72d7618aeebfc91b9e1"
+  },
+  "generic-stat-low-far-51.xlsx": {
+    "native_sha256": "74ecdc3f4f23f867754775f823678edd737ec5f792a1dcabf6ca0c4e7e2f9b88",
+    "native_path": "<folder>\\generic-stat-low-far-51.xlsx",
+    "fixture_sha256": "74ecdc3f4f23f867754775f823678edd737ec5f792a1dcabf6ca0c4e7e2f9b88"
+  },
+  "generic-stat-low-far-52.xlsm": {
+    "native_sha256": "cf25dec51d6fa5eb790a9c20aab786f42d60c0c1db37b39788d65afdbc9e5c51",
+    "native_path": "<folder>\\generic-stat-low-far-52.xlsm",
+    "rejected_derivation": {
+      "fixture_sha256": "4196b88f5371d43cbeb17921c1a156a9573920af8388067297c080392c596b44",
+      "derivation": "Native input with VBA parts and their relationships/content-type entries removed; workbook format52 content type, workbook, worksheets and styles unchanged.",
+      "removed_parts": [
+        "xl/vbaProject.bin"
+      ],
+      "rewritten_package_metadata": [
+        "[Content_Types].xml",
+        "xl/_rels/workbook.xml.rels"
+      ],
+      "reason": "Native acceptance differed in group identity after VBA removal; original native package required."
+    },
+    "fixture_sha256": "cf25dec51d6fa5eb790a9c20aab786f42d60c0c1db37b39788d65afdbc9e5c51"
+  },
+  "stat-generic-low-far-51.xlsx": {
+    "native_sha256": "4444f92ec187c1aca230bc89d3ec857dab16d0009a3f06ce31fa98c726a490c8",
+    "native_path": "<folder>\\stat-generic-low-far-51.xlsx",
+    "fixture_sha256": "4444f92ec187c1aca230bc89d3ec857dab16d0009a3f06ce31fa98c726a490c8"
+  },
+  "stat-generic-low-far-52.xlsm": {
+    "native_sha256": "ccd8f1c5e52efddf083978bdb89bcb06448899b5637f0baddff306f4d7ad40ab",
+    "native_path": "<folder>\\stat-generic-low-far-52.xlsm",
+    "rejected_derivation": {
+      "fixture_sha256": "68a3150a0dcbc0fb04b0de6ad3a5752ea561ee6ee0657c296d3a9cc665d03bb1",
+      "derivation": "Native input with VBA parts and their relationships/content-type entries removed; workbook format52 content type, workbook, worksheets and styles unchanged.",
+      "removed_parts": [
+        "xl/vbaProject.bin"
+      ],
+      "rewritten_package_metadata": [
+        "[Content_Types].xml",
+        "xl/_rels/workbook.xml.rels"
+      ],
+      "reason": "Native acceptance differed in group identity after VBA removal; original native package required."
+    },
+    "fixture_sha256": "ccd8f1c5e52efddf083978bdb89bcb06448899b5637f0baddff306f4d7ad40ab"
+  },
+  "overlap-union-stat-first-priority-51.xlsx": {
+    "native_sha256": "af3a19fc6e48e462bc72fd1c8197fb672f031ed941b140d6a9ee6a2ae8fe3659",
+    "native_path": "<folder>\\overlap-union-stat-first-priority-51.xlsx",
+    "fixture_sha256": "af3a19fc6e48e462bc72fd1c8197fb672f031ed941b140d6a9ee6a2ae8fe3659"
+  },
+  "overlap-union-stat-first-priority-52.xlsm": {
+    "native_sha256": "7b3347ddf889bc2f29521c8f72d05a74c51473d23cfde0bbcf0b60be290daae1",
+    "native_path": "<folder>\\overlap-union-stat-first-priority-52.xlsm",
+    "rejected_derivation": {
+      "fixture_sha256": "21a187f49f6864b4e0430a418d83aa31acb5fdf08f0749095832ec52d9bfc1ef",
+      "derivation": "Native input with VBA parts and their relationships/content-type entries removed; workbook format52 content type, workbook, worksheets and styles unchanged.",
+      "removed_parts": [
+        "xl/vbaProject.bin"
+      ],
+      "rewritten_package_metadata": [
+        "[Content_Types].xml",
+        "xl/_rels/workbook.xml.rels"
+      ],
+      "reason": "Native acceptance differed in group identity after VBA removal; original native package required."
+    },
+    "fixture_sha256": "7b3347ddf889bc2f29521c8f72d05a74c51473d23cfde0bbcf0b60be290daae1"
+  },
+  "overlap-union-expression-first-priority-51.xlsx": {
+    "native_sha256": "15d2586f6c157bb9801555fa3dba472b7b74add0fa1417313772cd5ae1438cde",
+    "native_path": "<folder>\\overlap-union-expression-first-priority-51.xlsx",
+    "fixture_sha256": "15d2586f6c157bb9801555fa3dba472b7b74add0fa1417313772cd5ae1438cde"
+  },
+  "overlap-union-expression-first-priority-52.xlsm": {
+    "native_sha256": "208afd2d39a5ec91419131a619ab68fe2c2afbd21a4e2822a6390d2713bb0464",
+    "native_path": "<folder>\\overlap-union-expression-first-priority-52.xlsm",
+    "rejected_derivation": {
+      "fixture_sha256": "7fa6c17b7c59aa890d0e980aeb8e8ebf85b8a94770baeef470155ac40aba36e5",
+      "derivation": "Native input with VBA parts and their relationships/content-type entries removed; workbook format52 content type, workbook, worksheets and styles unchanged.",
+      "removed_parts": [
+        "xl/vbaProject.bin"
+      ],
+      "rewritten_package_metadata": [
+        "[Content_Types].xml",
+        "xl/_rels/workbook.xml.rels"
+      ],
+      "reason": "Native acceptance differed in group identity after VBA removal; original native package required."
+    },
+    "fixture_sha256": "208afd2d39a5ec91419131a619ab68fe2c2afbd21a4e2822a6390d2713bb0464"
+  },
+  "crisscross-union-expression-first-priority-51.xlsx": {
+    "native_sha256": "8b56967791aeebe3dbdaddf8bfc84b175abd6aa0759eecef74b1df1fb71cf1ce",
+    "native_path": "<folder>\\crisscross-union-expression-first-priority-51.xlsx",
+    "fixture_sha256": "8b56967791aeebe3dbdaddf8bfc84b175abd6aa0759eecef74b1df1fb71cf1ce"
+  },
+  "crisscross-union-expression-first-priority-52.xlsm": {
+    "native_sha256": "5b00c263fac49b68869aed2e878749793dd3f4a6e903f233458f91726b011267",
+    "native_path": "<folder>\\crisscross-union-expression-first-priority-52.xlsm",
+    "rejected_derivation": {
+      "fixture_sha256": "e765eadf7c00212e91d96674941f2cf41dc2aff694e3c4c5120d76d193cdce8c",
+      "derivation": "Native input with VBA parts and their relationships/content-type entries removed; workbook format52 content type, workbook, worksheets and styles unchanged.",
+      "removed_parts": [
+        "xl/vbaProject.bin"
+      ],
+      "rewritten_package_metadata": [
+        "[Content_Types].xml",
+        "xl/_rels/workbook.xml.rels"
+      ],
+      "reason": "Native acceptance differed in group identity after VBA removal; original native package required."
+    },
+    "fixture_sha256": "5b00c263fac49b68869aed2e878749793dd3f4a6e903f233458f91726b011267"
+  },
+  "three-mixed-clipped.xlsx": {
+    "native_sha256": "c0bc2bcf3e0efa2348980b0a2609a8d168b80618b7a56ee2e807c0640e4604cb",
+    "native_path": "<folder>\\three-mixed-clipped.xlsx",
+    "fixture_sha256": "c0bc2bcf3e0efa2348980b0a2609a8d168b80618b7a56ee2e807c0640e4604cb"
+  },
+  "three-mixed-clipped.xlsm": {
+    "native_sha256": "5cefa3358d3944215381cf65975836e7a4ed52ea3c3b3f6755a15ab70c978c0f",
+    "native_path": "<folder>\\three-mixed-clipped.xlsm",
+    "rejected_derivation": {
+      "fixture_sha256": "a5f983d8a90051bc2d6fd71fada9bdfafcbfe0b6fff6aa72e98efd07174ffdd4",
+      "derivation": "Native input with VBA parts and their relationships/content-type entries removed; workbook format52 content type, workbook, worksheets and styles unchanged.",
+      "removed_parts": [
+        "xl/vbaProject.bin"
+      ],
+      "rewritten_package_metadata": [
+        "[Content_Types].xml",
+        "xl/_rels/workbook.xml.rels"
+      ],
+      "reason": "Native acceptance differed in group identity after VBA removal; original native package required."
+    },
+    "fixture_sha256": "5cefa3358d3944215381cf65975836e7a4ed52ea3c3b3f6755a15ab70c978c0f"
+  },
+  "right-before-top-51.xlsx": {
+    "native_sha256": "d777910876c29b395b95a36422e90a6ea640d2f18258848e40d38134316e04e3",
+    "native_path": "<folder>\\right-before-top-51.xlsx",
+    "fixture_sha256": "d777910876c29b395b95a36422e90a6ea640d2f18258848e40d38134316e04e3"
+  },
+  "right-before-top-52.xlsm": {
+    "native_sha256": "319b557a189f84fa1b8013b1b8188c84576b65985daa92bfbd0f68fca8718c30",
+    "native_path": "<folder>\\right-before-top-52.xlsm",
+    "rejected_derivation": {
+      "fixture_sha256": "feb92a20247248262c5e6b29d354e08c74b1d267c6a9d151548967f7ef7c9c30",
+      "derivation": "Native input with VBA parts and their relationships/content-type entries removed; workbook format52 content type, workbook, worksheets and styles unchanged.",
+      "removed_parts": [
+        "xl/vbaProject.bin"
+      ],
+      "rewritten_package_metadata": [
+        "[Content_Types].xml",
+        "xl/_rels/workbook.xml.rels"
+      ],
+      "reason": "Native acceptance differed in group identity after VBA removal; original native package required."
+    },
+    "fixture_sha256": "319b557a189f84fa1b8013b1b8188c84576b65985daa92bfbd0f68fca8718c30"
+  },
+  "same-start-shorter-bottom-51.xlsx": {
+    "native_sha256": "6b6e6f875ea639a6c09eba812008364f0a176f34736a915ccffdb1b0b5820931",
+    "native_path": "<folder>\\same-start-shorter-bottom-51.xlsx",
+    "fixture_sha256": "6b6e6f875ea639a6c09eba812008364f0a176f34736a915ccffdb1b0b5820931"
+  },
+  "same-start-shorter-bottom-52.xlsm": {
+    "native_sha256": "31f7f7d9bfa132d8a493dbc6fe9379eac602f9c4b22cbf38d3dd26d8d3787d90",
+    "native_path": "<folder>\\same-start-shorter-bottom-52.xlsm",
+    "rejected_derivation": {
+      "fixture_sha256": "ca6e579f4750807960164efb5a06d36ea02fd8093c5809af1a2f9f62ba6cddfe",
+      "derivation": "Native input with VBA parts and their relationships/content-type entries removed; workbook format52 content type, workbook, worksheets and styles unchanged.",
+      "removed_parts": [
+        "xl/vbaProject.bin"
+      ],
+      "rewritten_package_metadata": [
+        "[Content_Types].xml",
+        "xl/_rels/workbook.xml.rels"
+      ],
+      "reason": "Native acceptance differed in group identity after VBA removal; original native package required."
+    },
+    "fixture_sha256": "31f7f7d9bfa132d8a493dbc6fe9379eac602f9c4b22cbf38d3dd26d8d3787d90"
+  },
+  "union-first-interval-not-bounding-51.xlsx": {
+    "native_sha256": "3d9106e551a4dfb552dd6369558667ec4ff736989d26b1e0bfc1d6454bc308bf",
+    "native_path": "<folder>\\union-first-interval-not-bounding-51.xlsx",
+    "fixture_sha256": "3d9106e551a4dfb552dd6369558667ec4ff736989d26b1e0bfc1d6454bc308bf"
+  },
+  "union-first-interval-not-bounding-52.xlsm": {
+    "native_sha256": "7e920a1afa2ea5af4c65a2541903d6b1720c777cc095589095c7ce80e018858b",
+    "native_path": "<folder>\\union-first-interval-not-bounding-52.xlsm",
+    "rejected_derivation": {
+      "fixture_sha256": "bd09c09c30bd87681240d332b5916732f8ff976243c6cfd9bd4f5c03e26dee83",
+      "derivation": "Native input with VBA parts and their relationships/content-type entries removed; workbook format52 content type, workbook, worksheets and styles unchanged.",
+      "removed_parts": [
+        "xl/vbaProject.bin"
+      ],
+      "rewritten_package_metadata": [
+        "[Content_Types].xml",
+        "xl/_rels/workbook.xml.rels"
+      ],
+      "reason": "Native acceptance differed in group identity after VBA removal; original native package required."
+    },
+    "fixture_sha256": "7e920a1afa2ea5af4c65a2541903d6b1720c777cc095589095c7ce80e018858b"
+  },
+  "identical-first-area-different-tail-51.xlsx": {
+    "native_sha256": "562646ed0bae4a39d76caa4af895c5290bba5fd30d47d3c1ba77d16ddb42477e",
+    "native_path": "<folder>\\identical-first-area-different-tail-51.xlsx",
+    "fixture_sha256": "562646ed0bae4a39d76caa4af895c5290bba5fd30d47d3c1ba77d16ddb42477e"
+  },
+  "identical-first-area-different-tail-52.xlsm": {
+    "native_sha256": "f1527065f5d1210831df6d1afb50bd6dcc6a059cad451f3e76eec6aba8f2a022",
+    "native_path": "<folder>\\identical-first-area-different-tail-52.xlsm",
+    "rejected_derivation": {
+      "fixture_sha256": "9f181a3b21b05baeae18fa93fd8788c77b8540c0c00b8b4efaf68be78bfb48b7",
+      "derivation": "Native input with VBA parts and their relationships/content-type entries removed; workbook format52 content type, workbook, worksheets and styles unchanged.",
+      "removed_parts": [
+        "xl/vbaProject.bin"
+      ],
+      "rewritten_package_metadata": [
+        "[Content_Types].xml",
+        "xl/_rels/workbook.xml.rels"
+      ],
+      "reason": "Native acceptance differed in group identity after VBA removal; original native package required."
+    },
+    "fixture_sha256": "f1527065f5d1210831df6d1afb50bd6dcc6a059cad451f3e76eec6aba8f2a022"
+  },
+  "same-first-different-tail-priority-flipped-51.xlsx": {
+    "native_sha256": "242108d3c7427da5aa0863e59d313e59d175639728affe02cbb5c6edf986df39",
+    "native_path": "<folder>\\same-first-different-tail-priority-flipped-51.xlsx",
+    "fixture_sha256": "242108d3c7427da5aa0863e59d313e59d175639728affe02cbb5c6edf986df39"
+  },
+  "same-first-different-tail-priority-flipped-52.xlsm": {
+    "native_sha256": "e23c2279277114e7b71e71105ccd6af90f9ef06f8e753682c087202ea0e54b3e",
+    "native_path": "<folder>\\same-first-different-tail-priority-flipped-52.xlsm",
+    "rejected_derivation": {
+      "fixture_sha256": "dd1bf810ad4a0705a38d866ec59a0fc6b0ececaef5c1872eb71d492f04821d0e",
+      "derivation": "Native input with VBA parts and their relationships/content-type entries removed; workbook format52 content type, workbook, worksheets and styles unchanged.",
+      "removed_parts": [
+        "xl/vbaProject.bin"
+      ],
+      "rewritten_package_metadata": [
+        "[Content_Types].xml",
+        "xl/_rels/workbook.xml.rels"
+      ],
+      "reason": "Native acceptance differed in group identity after VBA removal; original native package required."
+    },
+    "fixture_sha256": "e23c2279277114e7b71e71105ccd6af90f9ef06f8e753682c087202ea0e54b3e"
+  },
+  "same-complete-statistical-population-51.xlsx": {
+    "native_sha256": "cfcb30e339040b2f052b857d0f134ad7ab9f68892eee82fadb1c53f6db2e15f1",
+    "native_path": "<folder>\\same-complete-statistical-population-51.xlsx",
+    "fixture_sha256": "cfcb30e339040b2f052b857d0f134ad7ab9f68892eee82fadb1c53f6db2e15f1"
+  },
+  "same-complete-statistical-population-52.xlsm": {
+    "native_sha256": "b617f41b3e0fbee8e2989601c69f4c12e5bd707230a2235b8cd4c58e34e7466e",
+    "native_path": "<folder>\\same-complete-statistical-population-52.xlsm",
+    "rejected_derivation": {
+      "fixture_sha256": "9e2057f8ef39fc913303a18c5b25a5909cf33faf2d6f4b38bb803e06894b5598",
+      "derivation": "Native input with VBA parts and their relationships/content-type entries removed; workbook format52 content type, workbook, worksheets and styles unchanged.",
+      "removed_parts": [
+        "xl/vbaProject.bin"
+      ],
+      "rewritten_package_metadata": [
+        "[Content_Types].xml",
+        "xl/_rels/workbook.xml.rels"
+      ],
+      "reason": "Native acceptance differed in group identity after VBA removal; original native package required."
+    },
+    "fixture_sha256": "b617f41b3e0fbee8e2989601c69f4c12e5bd707230a2235b8cd4c58e34e7466e"
+  },
+  "different-tail-reversed-creation-51.xlsx": {
+    "native_sha256": "e4a3fc609035adcd2d4a1561fb4d5f403d6b490a05d2c7443b1c1405ecdbc0a3",
+    "native_path": "<folder>\\different-tail-reversed-creation-51.xlsx",
+    "fixture_sha256": "e4a3fc609035adcd2d4a1561fb4d5f403d6b490a05d2c7443b1c1405ecdbc0a3"
+  },
+  "different-tail-reversed-creation-52.xlsm": {
+    "native_sha256": "125e64dfb91d54182b32c8281c9a334c8ea2d663010fd9e2a66d852a2288f587",
+    "native_path": "<folder>\\different-tail-reversed-creation-52.xlsm",
+    "rejected_derivation": {
+      "fixture_sha256": "dc2e4adab635a0fba8ae578703fc64e11aef26310e18f451eada1245f5a24c01",
+      "derivation": "Native input with VBA parts and their relationships/content-type entries removed; workbook format52 content type, workbook, worksheets and styles unchanged.",
+      "removed_parts": [
+        "xl/vbaProject.bin"
+      ],
+      "rewritten_package_metadata": [
+        "[Content_Types].xml",
+        "xl/_rels/workbook.xml.rels"
+      ],
+      "reason": "Native acceptance differed in group identity after VBA removal; original native package required."
+    },
+    "fixture_sha256": "125e64dfb91d54182b32c8281c9a334c8ea2d663010fd9e2a66d852a2288f587"
+  },
+  "statistical-ordered-tail-permutation-51.xlsx": {
+    "native_sha256": "7643287b3ed7b8b950142ef4c1f0a7bbb1f7893761309efcc454f4a92c6941be",
+    "native_path": "<folder>\\statistical-ordered-tail-permutation-51.xlsx",
+    "fixture_sha256": "7643287b3ed7b8b950142ef4c1f0a7bbb1f7893761309efcc454f4a92c6941be"
+  },
+  "statistical-ordered-tail-permutation-52.xlsm": {
+    "native_sha256": "9323120839f0d3721d92ddf177299918670f95d78657b7da05c0e3b03488e236",
+    "native_path": "<folder>\\statistical-ordered-tail-permutation-52.xlsm",
+    "rejected_derivation": {
+      "fixture_sha256": "ad9f5d641f9c179ba3aec486ebc2ee8a6a74a6749f9c11e6461b30f3868b1c80",
+      "derivation": "Native input with VBA parts and their relationships/content-type entries removed; workbook format52 content type, workbook, worksheets and styles unchanged.",
+      "removed_parts": [
+        "xl/vbaProject.bin"
+      ],
+      "rewritten_package_metadata": [
+        "[Content_Types].xml",
+        "xl/_rels/workbook.xml.rels"
+      ],
+      "reason": "Native acceptance differed in group identity after VBA removal; original native package required."
+    },
+    "fixture_sha256": "9323120839f0d3721d92ddf177299918670f95d78657b7da05c0e3b03488e236"
+  },
+  "generic-ordered-tail-permutation-51.xlsx": {
+    "native_sha256": "5b87e9d7cbd850ac2bb4e3e4db522600ec8e0bf73544626a61849c32a51d654b",
+    "native_path": "<folder>\\generic-ordered-tail-permutation-51.xlsx",
+    "fixture_sha256": "5b87e9d7cbd850ac2bb4e3e4db522600ec8e0bf73544626a61849c32a51d654b"
+  },
+  "generic-ordered-tail-permutation-52.xlsm": {
+    "native_sha256": "43eb3d9d7c816bdf319bc3bf2fb8ecf7c5bee1dc3962aaa29213b9709f83c33e",
+    "native_path": "<folder>\\generic-ordered-tail-permutation-52.xlsm",
+    "rejected_derivation": {
+      "fixture_sha256": "7e5b4b370097de95df418b51e48ee53ab5865386cdb282e90d825c19fc39f7d7",
+      "derivation": "Native input with VBA parts and their relationships/content-type entries removed; workbook format52 content type, workbook, worksheets and styles unchanged.",
+      "removed_parts": [
+        "xl/vbaProject.bin"
+      ],
+      "rewritten_package_metadata": [
+        "[Content_Types].xml",
+        "xl/_rels/workbook.xml.rels"
+      ],
+      "reason": "Native acceptance differed in group identity after VBA removal; original native package required."
+    },
+    "fixture_sha256": "43eb3d9d7c816bdf319bc3bf2fb8ecf7c5bee1dc3962aaa29213b9709f83c33e"
+  },
+  "short-first-priority-reversed-51.xlsx": {
+    "native_sha256": "e1ecb449cd293d41463779ce723da03181ca5f92eb3846ad4ce01f7c58dec25f",
+    "native_path": "<folder>\\short-first-priority-reversed-51.xlsx",
+    "fixture_sha256": "e1ecb449cd293d41463779ce723da03181ca5f92eb3846ad4ce01f7c58dec25f"
+  },
+  "short-first-priority-reversed-52.xlsm": {
+    "native_sha256": "8acb2c254742fbb77463ff8788db8dc8f5223ab4b9216795cc196d3bafdfb180",
+    "native_path": "<folder>\\short-first-priority-reversed-52.xlsm",
+    "rejected_derivation": {
+      "fixture_sha256": "1df54d30217d1d2644a41d716d1d8c9dcdb8a3b1c855428b2127967918322506",
+      "derivation": "Native input with VBA parts and their relationships/content-type entries removed; workbook format52 content type, workbook, worksheets and styles unchanged.",
+      "removed_parts": [
+        "xl/vbaProject.bin"
+      ],
+      "rewritten_package_metadata": [
+        "[Content_Types].xml",
+        "xl/_rels/workbook.xml.rels"
+      ],
+      "reason": "Native acceptance differed in group identity after VBA removal; original native package required."
+    },
+    "fixture_sha256": "8acb2c254742fbb77463ff8788db8dc8f5223ab4b9216795cc196d3bafdfb180"
+  },
+  "long-first-priority-reversed-51.xlsx": {
+    "native_sha256": "0dcd54751433d37e2b8022f82fdd4e90df6e03bf58a2673e55e5bc0038843881",
+    "native_path": "<folder>\\long-first-priority-reversed-51.xlsx",
+    "fixture_sha256": "0dcd54751433d37e2b8022f82fdd4e90df6e03bf58a2673e55e5bc0038843881"
+  },
+  "long-first-priority-reversed-52.xlsm": {
+    "native_sha256": "0be6cff70e864307e5398fc1b26c6262f258e2f45a2a21f594f40b4e393f3fcb",
+    "native_path": "<folder>\\long-first-priority-reversed-52.xlsm",
+    "rejected_derivation": {
+      "fixture_sha256": "6261285c462a5db753791712ff814879660e09bb0fe9b32511e67a6b3df25525",
+      "derivation": "Native input with VBA parts and their relationships/content-type entries removed; workbook format52 content type, workbook, worksheets and styles unchanged.",
+      "removed_parts": [
+        "xl/vbaProject.bin"
+      ],
+      "rewritten_package_metadata": [
+        "[Content_Types].xml",
+        "xl/_rels/workbook.xml.rels"
+      ],
+      "reason": "Native acceptance differed in group identity after VBA removal; original native package required."
+    },
+    "fixture_sha256": "0be6cff70e864307e5398fc1b26c6262f258e2f45a2a21f594f40b4e393f3fcb"
+  },
+  "reverse-priority-two.xlsx": {
+    "native_sha256": "a3a605c5213204222b768f04c9b156a529807dff18b8a964c37dbd4bab0d22f3",
+    "native_path": "<folder>\\reverse-priority-two.xlsx",
+    "fixture_sha256": "a3a605c5213204222b768f04c9b156a529807dff18b8a964c37dbd4bab0d22f3"
+  },
+  "reverse-priority-two.xlsm": {
+    "native_sha256": "71c6a9e3ddf22099ff5ebbbfc7ee062d464c263e59781498f84005550591ac5b",
+    "native_path": "<folder>\\reverse-priority-two.xlsm",
+    "rejected_derivation": {
+      "fixture_sha256": "70e37ce729d02bf8a9a5cebb6cd5228f97483d8da3effdaa3f340e282f26c1df",
+      "derivation": "Native input with VBA parts and their relationships/content-type entries removed; workbook format52 content type, workbook, worksheets and styles unchanged.",
+      "removed_parts": [
+        "xl/vbaProject.bin"
+      ],
+      "rewritten_package_metadata": [
+        "[Content_Types].xml",
+        "xl/_rels/workbook.xml.rels"
+      ],
+      "reason": "Native acceptance differed in group identity after VBA removal; original native package required."
+    },
+    "fixture_sha256": "71c6a9e3ddf22099ff5ebbbfc7ee062d464c263e59781498f84005550591ac5b"
+  },
+  "three-crosssheet.xlsx": {
+    "native_sha256": "43e1424bc9e2304a9203423fcd83af4f2ee41fbcc0d3e71d5f0b119ea1615867",
+    "native_path": "<folder>\\three-crosssheet.xlsx",
+    "fixture_sha256": "43e1424bc9e2304a9203423fcd83af4f2ee41fbcc0d3e71d5f0b119ea1615867"
+  },
+  "three-crosssheet.xlsm": {
+    "native_sha256": "d00bbe6a8a675d06531f62a71adf5ad4af510615fdbd6a03ed9eba9f8d1b12b9",
+    "native_path": "<folder>\\three-crosssheet.xlsm",
+    "rejected_derivation": {
+      "fixture_sha256": "a12d1d49b2e2564e958d58d4a4ea89304283499b87cbc57c408ea073691baea2",
+      "derivation": "Native input with VBA parts and their relationships/content-type entries removed; workbook format52 content type, workbook, worksheets and styles unchanged.",
+      "removed_parts": [
+        "xl/vbaProject.bin"
+      ],
+      "rewritten_package_metadata": [
+        "[Content_Types].xml",
+        "xl/_rels/workbook.xml.rels"
+      ],
+      "reason": "Native acceptance differed in group identity after VBA removal; original native package required."
+    },
+    "fixture_sha256": "d00bbe6a8a675d06531f62a71adf5ad4af510615fdbd6a03ed9eba9f8d1b12b9"
+  },
+  "three-shared-51.xlsx": {
+    "native_path": "<folder>\\three-shared-51.xlsx",
+    "native_sha256": "548c4276b674d75d8f45071b6f5bb1032bea775e2caf4c70b74f2dde7f8b3034",
+    "fixture_sha256": "548c4276b674d75d8f45071b6f5bb1032bea775e2caf4c70b74f2dde7f8b3034"
+  },
+  "three-shared-52.xlsm": {
+    "native_path": "<folder>\\three-shared-52.xlsm",
+    "native_sha256": "1621627cd272a20991cfcd6957a7faf4cf63ee0c3e4dae790245cd805bd631fc",
+    "fixture_sha256": "1621627cd272a20991cfcd6957a7faf4cf63ee0c3e4dae790245cd805bd631fc"
+  },
+  "novba52/overlap-union-stat-first-priority-52.xlsm": {
+    "native_path": "<folder>\\overlap-union-stat-first-priority-52.xlsm",
+    "native_sha256": "7b3347ddf889bc2f29521c8f72d05a74c51473d23cfde0bbcf0b60be290daae1",
+    "fixture_sha256": "21a187f49f6864b4e0430a418d83aa31acb5fdf08f0749095832ec52d9bfc1ef",
+    "derivation": "Native input with VBA parts and their relationships/content-type entries removed; workbook format52 content type, workbook, worksheets and styles unchanged.",
+    "removed_parts": [
+      "xl/vbaProject.bin"
+    ],
+    "rewritten_package_metadata": [
+      "[Content_Types].xml",
+      "xl/_rels/workbook.xml.rels"
+    ],
+    "separate_native_mode": true
+  },
+  "novba52/crisscross-union-expression-first-priority-52.xlsm": {
+    "native_path": "<folder>\\crisscross-union-expression-first-priority-52.xlsm",
+    "native_sha256": "5b00c263fac49b68869aed2e878749793dd3f4a6e903f233458f91726b011267",
+    "fixture_sha256": "e765eadf7c00212e91d96674941f2cf41dc2aff694e3c4c5120d76d193cdce8c",
+    "derivation": "Native input with VBA parts and their relationships/content-type entries removed; workbook format52 content type, workbook, worksheets and styles unchanged.",
+    "removed_parts": [
+      "xl/vbaProject.bin"
+    ],
+    "rewritten_package_metadata": [
+      "[Content_Types].xml",
+      "xl/_rels/workbook.xml.rels"
+    ],
+    "separate_native_mode": true
+  },
+  "novba52/different-tail-reversed-creation-52.xlsm": {
+    "native_path": "<folder>\\different-tail-reversed-creation-52.xlsm",
+    "native_sha256": "125e64dfb91d54182b32c8281c9a334c8ea2d663010fd9e2a66d852a2288f587",
+    "fixture_sha256": "dc2e4adab635a0fba8ae578703fc64e11aef26310e18f451eada1245f5a24c01",
+    "derivation": "Native input with VBA parts and their relationships/content-type entries removed; workbook format52 content type, workbook, worksheets and styles unchanged.",
+    "removed_parts": [
+      "xl/vbaProject.bin"
+    ],
+    "rewritten_package_metadata": [
+      "[Content_Types].xml",
+      "xl/_rels/workbook.xml.rels"
+    ],
+    "separate_native_mode": true
+  },
+  "novba52/generic-generic-low-far-52.xlsm": {
+    "native_path": "<folder>\\generic-generic-low-far-52.xlsm",
+    "native_sha256": "87397220ef10bda07be60c4301e272424b9d5aad2258f72d7618aeebfc91b9e1",
+    "fixture_sha256": "0e973ebea79ca25e0db0634d1c4cb74c1de6096e9d409f6b62d91d5e6fbd1af5",
+    "derivation": "Native input with VBA parts and their relationships/content-type entries removed; workbook format52 content type, workbook, worksheets and styles unchanged.",
+    "removed_parts": [
+      "xl/vbaProject.bin"
+    ],
+    "rewritten_package_metadata": [
+      "[Content_Types].xml",
+      "xl/_rels/workbook.xml.rels"
+    ],
+    "separate_native_mode": true
+  },
+  "novba52/generic-ordered-tail-permutation-52.xlsm": {
+    "native_path": "<folder>\\generic-ordered-tail-permutation-52.xlsm",
+    "native_sha256": "43eb3d9d7c816bdf319bc3bf2fb8ecf7c5bee1dc3962aaa29213b9709f83c33e",
+    "fixture_sha256": "7e5b4b370097de95df418b51e48ee53ab5865386cdb282e90d825c19fc39f7d7",
+    "derivation": "Native input with VBA parts and their relationships/content-type entries removed; workbook format52 content type, workbook, worksheets and styles unchanged.",
+    "removed_parts": [
+      "xl/vbaProject.bin"
+    ],
+    "rewritten_package_metadata": [
+      "[Content_Types].xml",
+      "xl/_rels/workbook.xml.rels"
+    ],
+    "separate_native_mode": true
+  },
+  "novba52/generic-stat-low-far-52.xlsm": {
+    "native_path": "<folder>\\generic-stat-low-far-52.xlsm",
+    "native_sha256": "cf25dec51d6fa5eb790a9c20aab786f42d60c0c1db37b39788d65afdbc9e5c51",
+    "fixture_sha256": "4196b88f5371d43cbeb17921c1a156a9573920af8388067297c080392c596b44",
+    "derivation": "Native input with VBA parts and their relationships/content-type entries removed; workbook format52 content type, workbook, worksheets and styles unchanged.",
+    "removed_parts": [
+      "xl/vbaProject.bin"
+    ],
+    "rewritten_package_metadata": [
+      "[Content_Types].xml",
+      "xl/_rels/workbook.xml.rels"
+    ],
+    "separate_native_mode": true
+  },
+  "novba52/identical-first-area-different-tail-52.xlsm": {
+    "native_path": "<folder>\\identical-first-area-different-tail-52.xlsm",
+    "native_sha256": "f1527065f5d1210831df6d1afb50bd6dcc6a059cad451f3e76eec6aba8f2a022",
+    "fixture_sha256": "9f181a3b21b05baeae18fa93fd8788c77b8540c0c00b8b4efaf68be78bfb48b7",
+    "derivation": "Native input with VBA parts and their relationships/content-type entries removed; workbook format52 content type, workbook, worksheets and styles unchanged.",
+    "removed_parts": [
+      "xl/vbaProject.bin"
+    ],
+    "rewritten_package_metadata": [
+      "[Content_Types].xml",
+      "xl/_rels/workbook.xml.rels"
+    ],
+    "separate_native_mode": true
+  },
+  "novba52/long-first-priority-reversed-52.xlsm": {
+    "native_path": "<folder>\\long-first-priority-reversed-52.xlsm",
+    "native_sha256": "0be6cff70e864307e5398fc1b26c6262f258e2f45a2a21f594f40b4e393f3fcb",
+    "fixture_sha256": "6261285c462a5db753791712ff814879660e09bb0fe9b32511e67a6b3df25525",
+    "derivation": "Native input with VBA parts and their relationships/content-type entries removed; workbook format52 content type, workbook, worksheets and styles unchanged.",
+    "removed_parts": [
+      "xl/vbaProject.bin"
+    ],
+    "rewritten_package_metadata": [
+      "[Content_Types].xml",
+      "xl/_rels/workbook.xml.rels"
+    ],
+    "separate_native_mode": true
+  },
+  "novba52/overlap-union-expression-first-priority-52.xlsm": {
+    "native_path": "<folder>\\overlap-union-expression-first-priority-52.xlsm",
+    "native_sha256": "208afd2d39a5ec91419131a619ab68fe2c2afbd21a4e2822a6390d2713bb0464",
+    "fixture_sha256": "7fa6c17b7c59aa890d0e980aeb8e8ebf85b8a94770baeef470155ac40aba36e5",
+    "derivation": "Native input with VBA parts and their relationships/content-type entries removed; workbook format52 content type, workbook, worksheets and styles unchanged.",
+    "removed_parts": [
+      "xl/vbaProject.bin"
+    ],
+    "rewritten_package_metadata": [
+      "[Content_Types].xml",
+      "xl/_rels/workbook.xml.rels"
+    ],
+    "separate_native_mode": true
+  },
+  "novba52/reverse-priority-two.xlsm": {
+    "native_path": "<folder>\\reverse-priority-two.xlsm",
+    "native_sha256": "71c6a9e3ddf22099ff5ebbbfc7ee062d464c263e59781498f84005550591ac5b",
+    "fixture_sha256": "70e37ce729d02bf8a9a5cebb6cd5228f97483d8da3effdaa3f340e282f26c1df",
+    "derivation": "Native input with VBA parts and their relationships/content-type entries removed; workbook format52 content type, workbook, worksheets and styles unchanged.",
+    "removed_parts": [
+      "xl/vbaProject.bin"
+    ],
+    "rewritten_package_metadata": [
+      "[Content_Types].xml",
+      "xl/_rels/workbook.xml.rels"
+    ],
+    "separate_native_mode": true
+  },
+  "novba52/right-before-top-52.xlsm": {
+    "native_path": "<folder>\\right-before-top-52.xlsm",
+    "native_sha256": "319b557a189f84fa1b8013b1b8188c84576b65985daa92bfbd0f68fca8718c30",
+    "fixture_sha256": "feb92a20247248262c5e6b29d354e08c74b1d267c6a9d151548967f7ef7c9c30",
+    "derivation": "Native input with VBA parts and their relationships/content-type entries removed; workbook format52 content type, workbook, worksheets and styles unchanged.",
+    "removed_parts": [
+      "xl/vbaProject.bin"
+    ],
+    "rewritten_package_metadata": [
+      "[Content_Types].xml",
+      "xl/_rels/workbook.xml.rels"
+    ],
+    "separate_native_mode": true
+  },
+  "novba52/same-complete-statistical-population-52.xlsm": {
+    "native_path": "<folder>\\same-complete-statistical-population-52.xlsm",
+    "native_sha256": "b617f41b3e0fbee8e2989601c69f4c12e5bd707230a2235b8cd4c58e34e7466e",
+    "fixture_sha256": "9e2057f8ef39fc913303a18c5b25a5909cf33faf2d6f4b38bb803e06894b5598",
+    "derivation": "Native input with VBA parts and their relationships/content-type entries removed; workbook format52 content type, workbook, worksheets and styles unchanged.",
+    "removed_parts": [
+      "xl/vbaProject.bin"
+    ],
+    "rewritten_package_metadata": [
+      "[Content_Types].xml",
+      "xl/_rels/workbook.xml.rels"
+    ],
+    "separate_native_mode": true
+  },
+  "novba52/same-first-different-tail-priority-flipped-52.xlsm": {
+    "native_path": "<folder>\\same-first-different-tail-priority-flipped-52.xlsm",
+    "native_sha256": "e23c2279277114e7b71e71105ccd6af90f9ef06f8e753682c087202ea0e54b3e",
+    "fixture_sha256": "dd1bf810ad4a0705a38d866ec59a0fc6b0ececaef5c1872eb71d492f04821d0e",
+    "derivation": "Native input with VBA parts and their relationships/content-type entries removed; workbook format52 content type, workbook, worksheets and styles unchanged.",
+    "removed_parts": [
+      "xl/vbaProject.bin"
+    ],
+    "rewritten_package_metadata": [
+      "[Content_Types].xml",
+      "xl/_rels/workbook.xml.rels"
+    ],
+    "separate_native_mode": true
+  },
+  "novba52/same-start-shorter-bottom-52.xlsm": {
+    "native_path": "<folder>\\same-start-shorter-bottom-52.xlsm",
+    "native_sha256": "31f7f7d9bfa132d8a493dbc6fe9379eac602f9c4b22cbf38d3dd26d8d3787d90",
+    "fixture_sha256": "ca6e579f4750807960164efb5a06d36ea02fd8093c5809af1a2f9f62ba6cddfe",
+    "derivation": "Native input with VBA parts and their relationships/content-type entries removed; workbook format52 content type, workbook, worksheets and styles unchanged.",
+    "removed_parts": [
+      "xl/vbaProject.bin"
+    ],
+    "rewritten_package_metadata": [
+      "[Content_Types].xml",
+      "xl/_rels/workbook.xml.rels"
+    ],
+    "separate_native_mode": true
+  },
+  "novba52/short-first-priority-reversed-52.xlsm": {
+    "native_path": "<folder>\\short-first-priority-reversed-52.xlsm",
+    "native_sha256": "8acb2c254742fbb77463ff8788db8dc8f5223ab4b9216795cc196d3bafdfb180",
+    "fixture_sha256": "1df54d30217d1d2644a41d716d1d8c9dcdb8a3b1c855428b2127967918322506",
+    "derivation": "Native input with VBA parts and their relationships/content-type entries removed; workbook format52 content type, workbook, worksheets and styles unchanged.",
+    "removed_parts": [
+      "xl/vbaProject.bin"
+    ],
+    "rewritten_package_metadata": [
+      "[Content_Types].xml",
+      "xl/_rels/workbook.xml.rels"
+    ],
+    "separate_native_mode": true
+  },
+  "novba52/stat-generic-low-far-52.xlsm": {
+    "native_path": "<folder>\\stat-generic-low-far-52.xlsm",
+    "native_sha256": "ccd8f1c5e52efddf083978bdb89bcb06448899b5637f0baddff306f4d7ad40ab",
+    "fixture_sha256": "68a3150a0dcbc0fb04b0de6ad3a5752ea561ee6ee0657c296d3a9cc665d03bb1",
+    "derivation": "Native input with VBA parts and their relationships/content-type entries removed; workbook format52 content type, workbook, worksheets and styles unchanged.",
+    "removed_parts": [
+      "xl/vbaProject.bin"
+    ],
+    "rewritten_package_metadata": [
+      "[Content_Types].xml",
+      "xl/_rels/workbook.xml.rels"
+    ],
+    "separate_native_mode": true
+  },
+  "novba52/statistical-ordered-tail-permutation-52.xlsm": {
+    "native_path": "<folder>\\statistical-ordered-tail-permutation-52.xlsm",
+    "native_sha256": "9323120839f0d3721d92ddf177299918670f95d78657b7da05c0e3b03488e236",
+    "fixture_sha256": "ad9f5d641f9c179ba3aec486ebc2ee8a6a74a6749f9c11e6461b30f3868b1c80",
+    "derivation": "Native input with VBA parts and their relationships/content-type entries removed; workbook format52 content type, workbook, worksheets and styles unchanged.",
+    "removed_parts": [
+      "xl/vbaProject.bin"
+    ],
+    "rewritten_package_metadata": [
+      "[Content_Types].xml",
+      "xl/_rels/workbook.xml.rels"
+    ],
+    "separate_native_mode": true
+  },
+  "novba52/three-crosssheet.xlsm": {
+    "native_path": "<folder>\\three-crosssheet.xlsm",
+    "native_sha256": "d00bbe6a8a675d06531f62a71adf5ad4af510615fdbd6a03ed9eba9f8d1b12b9",
+    "fixture_sha256": "a12d1d49b2e2564e958d58d4a4ea89304283499b87cbc57c408ea073691baea2",
+    "derivation": "Native input with VBA parts and their relationships/content-type entries removed; workbook format52 content type, workbook, worksheets and styles unchanged.",
+    "removed_parts": [
+      "xl/vbaProject.bin"
+    ],
+    "rewritten_package_metadata": [
+      "[Content_Types].xml",
+      "xl/_rels/workbook.xml.rels"
+    ],
+    "separate_native_mode": true
+  },
+  "novba52/three-mixed-clipped.xlsm": {
+    "native_path": "<folder>\\three-mixed-clipped.xlsm",
+    "native_sha256": "5cefa3358d3944215381cf65975836e7a4ed52ea3c3b3f6755a15ab70c978c0f",
+    "fixture_sha256": "a5f983d8a90051bc2d6fd71fada9bdfafcbfe0b6fff6aa72e98efd07174ffdd4",
+    "derivation": "Native input with VBA parts and their relationships/content-type entries removed; workbook format52 content type, workbook, worksheets and styles unchanged.",
+    "removed_parts": [
+      "xl/vbaProject.bin"
+    ],
+    "rewritten_package_metadata": [
+      "[Content_Types].xml",
+      "xl/_rels/workbook.xml.rels"
+    ],
+    "separate_native_mode": true
+  },
+  "novba52/union-first-interval-not-bounding-52.xlsm": {
+    "native_path": "<folder>\\union-first-interval-not-bounding-52.xlsm",
+    "native_sha256": "7e920a1afa2ea5af4c65a2541903d6b1720c777cc095589095c7ce80e018858b",
+    "fixture_sha256": "bd09c09c30bd87681240d332b5916732f8ff976243c6cfd9bd4f5c03e26dee83",
+    "derivation": "Native input with VBA parts and their relationships/content-type entries removed; workbook format52 content type, workbook, worksheets and styles unchanged.",
+    "removed_parts": [
+      "xl/vbaProject.bin"
+    ],
+    "rewritten_package_metadata": [
+      "[Content_Types].xml",
+      "xl/_rels/workbook.xml.rels"
+    ],
+    "separate_native_mode": true
+  },
+  "novba52/three-reverse-areas-novba.xlsm": {
+    "native_path": "<folder>\\three-reverse-areas-original.xlsm",
+    "fixture_sha256": "c6a5796c9e764979923be6b7531dd35a83807a69d3415594be8e689e555dd5a9",
+    "native_sha256": "56bb1b876fc57bb05f6971959825012dd59c07eb34ebbf2c1801e549d8192cf0",
+    "separate_native_mode": true,
+    "derivation": "Native macro-bearing52 input stripped only VBA parts/relationships/content-type entries; all worksheet/style/workbook bytes retained.",
+    "removed_parts": [
+      "xl/vbaProject.bin"
+    ],
+    "rewritten_package_metadata": [
+      "[Content_Types].xml",
+      "xl/_rels/workbook.xml.rels"
+    ]
+  },
+  "novba52/two-reverse-areas-novba.xlsm": {
+    "native_path": "<folder>\\two-reverse-areas-original.xlsm",
+    "fixture_sha256": "0ff46d033838fde58aceacca117920b61d2d5c807247a5d018cbda2c678766d8",
+    "native_sha256": "609971d89a3d7c588b79fd7728db797ff5396e7b29414e6cf18d059ad4a87806",
+    "separate_native_mode": true,
+    "derivation": "Native macro-bearing52 input stripped only VBA parts/relationships/content-type entries; all worksheet/style/workbook bytes retained.",
+    "removed_parts": [
+      "xl/vbaProject.bin"
+    ],
+    "rewritten_package_metadata": [
+      "[Content_Types].xml",
+      "xl/_rels/workbook.xml.rels"
+    ]
+  }
+}

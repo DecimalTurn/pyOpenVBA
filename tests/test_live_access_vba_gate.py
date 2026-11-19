@@ -1,0 +1,384 @@
+"""Live Access gate for the VBA module writers (opt-in).
+
+Everything else about a written module can be checked from the file and
+still be wrong: the dir stream can list a module Access refuses to name,
+the storage rows can be complete and `\\x03DirData` still name a folder
+the module is not in.  Defects of that kind were caught only here -- the
+folder `\\x03DirData` names, and a folder left behind by a delete -- and
+a project whose protection records are keyed to another project's ID,
+which Access takes for a protected one.  So this gate asks Access itself,
+and asks for the strongest answer available: **run the code and compare
+the value it returns**.
+
+Opt-in: set ``RUN_LIVE_ACCESS_VBA=1`` on a Windows machine with desktop
+Access and ``pyvbaharness`` installed.  Skipped everywhere else,
+including CI.  ``pyvbaharness`` is a test-time oracle only; pyOpenVBA
+never uses COM.
+"""
+
+from __future__ import annotations
+
+import os
+import shutil
+import sys
+from collections.abc import Callable
+from pathlib import Path
+
+import pytest
+
+from pyopenvba.access import AccessDatabase
+
+pytestmark = pytest.mark.skipif(
+    os.environ.get("RUN_LIVE_ACCESS_VBA") != "1" or sys.platform != "win32",
+    reason="live Access VBA gate: set RUN_LIVE_ACCESS_VBA=1 on Windows with Access installed",
+)
+
+_TEMPLATE = (
+    Path(__file__).parents[1]
+    / "src"
+    / "pyopenvba"
+    / "_templates"
+    / "blank_files"
+    / "blank_database.accdb"
+)
+_TIMEOUT = 120.0
+
+#: Injected into the database under test so every probe runs inside
+#: Access's own VBA.  Over a bare COM boundary Access refuses half of
+#: these verbs, and a failure there would say nothing.
+_PROBES = """
+Public Function CallProc(ByVal name As String) As Variant
+    CallProc = Application.Run(name)
+End Function
+
+Public Function AccessModules() As Variant
+    Dim i As Long, s As String
+    For i = 0 To CurrentProject.AllModules.Count - 1
+        s = s & CurrentProject.AllModules(i).Name & ";"
+    Next i
+    AccessModules = s
+End Function
+
+Public Function ReadLines(ByVal moduleName As String) As Variant
+    Dim c As Object
+    Set c = Application.VBE.ActiveVBProject.VBComponents(moduleName)
+    ReadLines = c.CodeModule.Lines(1, c.CodeModule.CountOfLines)
+End Function
+
+Public Function ReferenceNames() As Variant
+    Dim r As Object, s As String
+    For Each r In Application.VBE.ActiveVBProject.References
+        s = s & r.Name & ";"
+    Next r
+    ReferenceNames = s
+End Function
+
+Public Function AddProcedure(ByVal moduleName As String) As Variant
+    Dim c As Object
+    Set c = Application.VBE.ActiveVBProject.VBComponents(moduleName)
+    c.CodeModule.AddFromString "Public Function Probe9() As Variant" & vbCrLf & _
+        "    Probe9 = 999" & vbCrLf & "End Function"
+    AddProcedure = c.CodeModule.CountOfLines
+End Function
+"""
+
+
+def ask(path: Path, proc: str, *args: str) -> object:
+    """Open the database in Access and run one probe against it."""
+    harness = pytest.importorskip("pyvbaharness")
+
+    with harness.AccessSession() as access:
+        access.open_document(path, read_only=False)
+        result = access.run_vba(_PROBES, proc=proc, args=tuple(args), timeout=_TIMEOUT)
+        assert result.outcome == "passed", (
+            f"{proc}{tuple(args)}: {result.outcome} {getattr(result, 'error', None)}"
+        )
+        return result.value
+
+
+def modules(path: Path) -> set[str]:
+    """The names `CurrentProject.AllModules` reports.  Its order is not
+    the order modules were added, so only the set is asserted."""
+    return {name for name in str(ask(path, "AccessModules")).split(";") if name}
+
+
+@pytest.fixture
+def blank(tmp_path: Path) -> Path:
+    """A fresh copy of the shipped template, which holds one module."""
+    if not _TEMPLATE.exists():  # pragma: no cover - the template ships with the package
+        pytest.skip("blank template not present")
+    out = tmp_path / "blank.accdb"
+    shutil.copyfile(_TEMPLATE, out)
+    return out
+
+
+ADDER = (
+    "Option Compare Database\n"
+    "\n"
+    "Public Function AdderGo() As Variant\n"
+    "    AdderGo = 4242\n"
+    "End Function"
+)
+
+
+def written(blank: Path, out: Path, build: Callable[[AccessDatabase], object]) -> Path:
+    """Apply `build` to the template and save it under `out`."""
+    database = AccessDatabase(blank)
+    build(database)
+    database.save(out)
+    return out
+
+
+class TestAccessRunsWhatWeCreate:
+    def test_a_created_module_is_listed_and_its_code_runs(
+        self, blank: Path, tmp_path: Path
+    ) -> None:
+        out = written(blank, tmp_path / "created.accdb", lambda db: db.create_module("Adder", ADDER))
+
+        assert modules(out) == {"Module1", "Adder"}
+        assert ask(out, "CallProc", "AdderGo") == 4242
+        # the VBE reports the source without the attribute lines
+        read_back = str(ask(out, "ReadLines", "Adder")).replace(chr(13) + chr(10), chr(10))
+        assert read_back.strip() == ADDER.strip()
+
+    def test_two_creates_without_access_in_between(self, blank: Path, tmp_path: Path) -> None:
+        def build(db: AccessDatabase) -> None:
+            db.create_module("Adder", ADDER)
+            db.create_module(
+                "Doubler",
+                "Public Function DoublerGo() As Variant\n    DoublerGo = 77\nEnd Function",
+            )
+
+        out = written(blank, tmp_path / "two.accdb", build)
+
+        assert modules(out) == {"Module1", "Adder", "Doubler"}
+        assert ask(out, "CallProc", "DoublerGo") == 77
+
+    def test_a_created_class_can_be_instantiated(self, blank: Path, tmp_path: Path) -> None:
+        def build(db: AccessDatabase) -> None:
+            db.create_module(
+                "Widget",
+                "Option Compare Database\n"
+                "\n"
+                "Private spun As Long\n"
+                "\n"
+                "Public Function Spin() As Variant\n"
+                "    spun = spun + 5\n"
+                "    Spin = spun\n"
+                "End Function",
+                kind="class",
+            )
+            db.create_module(
+                "Driver",
+                "Option Compare Database\n"
+                "\n"
+                "Public Function UseWidget() As Variant\n"
+                "    Dim w As Widget\n"
+                "    Set w = New Widget\n"
+                "    UseWidget = w.Spin() + w.Spin()\n"
+                "End Function",
+            )
+
+        out = written(blank, tmp_path / "widget.accdb", build)
+
+        assert ask(out, "CallProc", "UseWidget") == 15
+
+    def test_modules_in_two_digit_folders_are_listed_and_run(
+        self, blank: Path, tmp_path: Path
+    ) -> None:
+        """Eleven modules take the template's folders `1` to `11`, the last
+        two named as Access names them, where the library once wrote `:`
+        and `;` (GitHub issue #34)."""
+        names = [f"Extra{i}" for i in range(11)]
+
+        def build(db: AccessDatabase) -> None:
+            for i, name in enumerate(names):
+                db.create_module(
+                    name, f"Public Function {name}Go() As Variant\n    {name}Go = {100 + i}\nEnd Function"
+                )
+
+        out = written(blank, tmp_path / "past_nine.accdb", build)
+
+        assert modules(out) == {"Module1", *names}
+        assert ask(out, "CallProc", "Extra9Go") == 109
+        assert ask(out, "CallProc", "Extra10Go") == 110
+
+    def test_the_project_still_takes_an_edit_afterwards(
+        self, blank: Path, tmp_path: Path
+    ) -> None:
+        """A created project that Access will not let you edit is the
+        failure this whole route exists to avoid."""
+        out = written(blank, tmp_path / "edited.accdb", lambda db: db.create_module("Adder", ADDER))
+
+        assert int(str(ask(out, "AddProcedure", "Module1"))) > 0
+
+
+class TestRenameAndDelete:
+    def test_a_created_module_can_be_renamed(self, blank: Path, tmp_path: Path) -> None:
+        def build(db: AccessDatabase) -> None:
+            db.create_module("Adder", ADDER)
+            db.rename_module("Adder", "Summer")
+
+        out = written(blank, tmp_path / "renamed.accdb", build)
+
+        assert modules(out) == {"Module1", "Summer"}
+        assert ask(out, "CallProc", "AdderGo") == 4242
+
+    def test_a_created_module_can_be_deleted(self, blank: Path, tmp_path: Path) -> None:
+        def build(db: AccessDatabase) -> None:
+            db.create_module("Adder", ADDER)
+            db.delete_module("Adder")
+
+        out = written(blank, tmp_path / "deleted.accdb", build)
+
+        assert modules(out) == {"Module1"}
+
+    def test_a_module_created_after_a_delete_still_resolves(
+        self, blank: Path, tmp_path: Path
+    ) -> None:
+        """A delete that leaves the storage folder behind makes the next
+        create pick a name Access will not look under, and `AllModules`
+        then fails on it while the VBE still runs the code."""
+
+        def build(db: AccessDatabase) -> None:
+            db.create_module("First", ADDER)
+            db.create_module("Second", "Option Compare Database")
+            db.delete_module("First")
+            db.create_module(
+                "Third",
+                "Public Function ThirdGo() As Variant\n    ThirdGo = 33\nEnd Function",
+            )
+
+        out = written(blank, tmp_path / "recycled.accdb", build)
+
+        assert modules(out) == {"Module1", "Second", "Third"}
+        assert ask(out, "CallProc", "ThirdGo") == 33
+
+
+class TestReplacingSource:
+    def test_source_a_pcode_writer_could_not_emit_still_runs(
+        self, blank: Path, tmp_path: Path
+    ) -> None:
+        """`Const`, a module-level array, `Static` and a fixed-length
+        string, none of which a p-code writer can produce."""
+        code = (
+            "Option Compare Database\n"
+            "Option Explicit\n"
+            "\n"
+            'Private Const Greeting As String = "hi"\n'
+            "Private Cache(1 To 3) As Long\n"
+            "\n"
+            "Public Function Grown() As Variant\n"
+            "    Static calls As Long\n"
+            "    Dim total As Long, i As Long\n"
+            "    Dim label As String * 5\n"
+            "    label = Greeting\n"
+            "    calls = calls + 1\n"
+            "    For i = 1 To 3\n"
+            "        Cache(i) = i * i\n"
+            "        total = total + Cache(i)\n"
+            "    Next i\n"
+            '    Grown = total & "/" & calls & "/" & Trim(label)\n'
+            "End Function"
+        )
+        out = written(
+            blank, tmp_path / "replaced.accdb", lambda db: db.set_module_source("Module1", code)
+        )
+
+        assert ask(out, "CallProc", "Grown") == "14/1/hi"
+
+
+class TestReferences:
+    def test_a_reference_we_add_is_one_access_uses(
+        self, blank: Path, tmp_path: Path
+    ) -> None:
+        """Listing it proves Access read it; compiling code against it
+        proves Access resolved it."""
+        out = tmp_path / "referenced.accdb"
+        database = AccessDatabase(blank)
+        database.add_reference(
+            "Scripting",
+            "420B2830-E718-11CF-893D-00A0C9054228",
+            1,
+            0,
+            path="C:/Windows/System32/scrrun.dll",
+            description="Microsoft Scripting Runtime",
+        )
+        database.create_module(
+            "UsesIt",
+            "Option Compare Database\n\n"
+            "Public Function Counted() As Variant\n"
+            "    Dim d As Scripting.Dictionary\n"
+            "    Set d = New Scripting.Dictionary\n"
+            "    d.Add \"a\", 1\n"
+            "    d.Add \"b\", 2\n"
+            "    Counted = d.Count\n"
+            "End Function",
+        )
+        database.save(out)
+
+        assert "Scripting" in str(ask(out, "ReferenceNames")).split(";")
+        assert ask(out, "CallProc", "Counted") == 2
+
+
+def test_code_page_punctuation_reaches_access_intact(blank: Path, tmp_path: Path) -> None:
+    """The half of GitHub issue #18 that reaches ordinary English projects.
+
+    The writer encoded every ANSI string as latin-1 and read no
+    PROJECTCODEPAGE, so a module carrying an em dash, a curly quote, an
+    ellipsis or a euro sign could not be written at all.  latin-1 and
+    cp1252 differ exactly over 0x80-0x9F, which is where those live.
+    Access reading the characters back is what says the bytes are the
+    code page's and not latin-1's.
+    """
+    sample = "em dash — quotes “q” ellipsis … euro €"
+    out = tmp_path / "punctuation.accdb"
+    database = AccessDatabase(blank)
+    database.create_module(
+        "Punctuation",
+        "Option Compare Database\n\n"
+        f"' {sample}\n"
+        "Public Function Punctuated() As Variant\n"
+        f'    Punctuated = "{sample}"\n'
+        "End Function",
+    )
+    database.save(out)
+
+    assert ask(out, "CallProc", "Punctuated") == sample
+    assert sample in str(ask(out, "ReadLines", "Punctuation"))
+
+
+_NO_PROJECT = Path(__file__).parent / "live_access_test" / "no_project.accdb"
+
+
+class TestAFirstProject:
+    """A database Access made and never gave code, given its first project
+    by `add_vba_project` rather than by Access."""
+
+    def test_its_modules_are_listed_and_run(self, tmp_path: Path) -> None:
+        out = tmp_path / "first.accdb"
+        shutil.copyfile(_NO_PROJECT, out)
+        database = AccessDatabase(out)
+        database.add_vba_project()
+        database.add_module("Adder", ADDER)
+        database.add_module(
+            "Doubler", "Public Function DoublerGo() As Variant\n    DoublerGo = 77\nEnd Function"
+        )
+        database.save()
+
+        assert modules(out) == {"Adder", "Doubler"}
+        assert ask(out, "CallProc", "AdderGo") == 4242
+        assert ask(out, "CallProc", "DoublerGo") == 77
+
+    def test_a_project_with_no_modules_takes_access_s_own(self, tmp_path: Path) -> None:
+        """The harness adds its own modules to the project it runs code
+        in, so a probe running at all is Access adding modules to the
+        empty project this wrote."""
+        out = tmp_path / "empty.accdb"
+        shutil.copyfile(_NO_PROJECT, out)
+        database = AccessDatabase(out)
+        database.add_vba_project()
+        database.save()
+
+        assert modules(out) == set()
+        assert "stdole" in str(ask(out, "ReferenceNames")).split(";")

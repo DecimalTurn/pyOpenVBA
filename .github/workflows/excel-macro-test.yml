@@ -1,0 +1,97 @@
+name: Excel macro test
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'tests/fixtures/excel/**'
+      - 'scripts/build_excel_fixtures.py'
+      - 'scripts/run_excel_fixtures.py'
+      - 'scripts/utils/**'
+      - '.github/workflows/excel-macro-test.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'tests/fixtures/excel/**'
+      - 'scripts/build_excel_fixtures.py'
+      - 'scripts/run_excel_fixtures.py'
+      - 'scripts/utils/**'
+      - '.github/workflows/excel-macro-test.yml'
+
+permissions:
+  contents: read
+
+# A new push to a pull request cancels the run it replaces.
+concurrency:
+  group: excel-macro-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  test:
+    name: Build and test Excel fixtures
+    runs-on: windows-2025
+    timeout-minutes: 15
+    env:
+      PYTHONPATH: src
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          # The newest 3.12 with a Windows build: 3.12 ships security fixes as
+          # source only, so actions/python-versions has none past 3.12.10.
+          python-version: "3.12.10"
+          cache: pip
+
+      - name: Build Excel fixtures
+        run: python scripts/build_excel_fixtures.py
+
+      - name: Setup VBA
+        uses: DecimalTurn/setup-vba@797e4a232699a98507cb4411d5bea3697427ad57 # v0.3.0
+        with:
+          office-apps: Excel
+
+      - name: Install pywin32
+        shell: pwsh
+        run: |
+          python -m pip install --require-hashes -r .github/requirements/excel.txt
+          python -m Scripts.pywin32_postinstall -install
+
+      - name: Run Excel macros and verify output
+        timeout-minutes: 1
+        run: python scripts/run_excel_fixtures.py
+
+      - name: Take screenshot on failure
+        if: failure()
+        shell: pwsh
+        run: |
+          . "$env:GITHUB_WORKSPACE/scripts/utils/Screenshot.ps1"
+          . "$env:GITHUB_WORKSPACE/scripts/utils/Minimize.ps1"
+          . "$env:GITHUB_WORKSPACE/scripts/utils/MinimizeCurrentWindow.ps1"
+          . "$env:GITHUB_WORKSPACE/scripts/utils/ListVisibleWindows.ps1"
+          
+          $screenshotDir = "$env:GITHUB_WORKSPACE/screenshots"
+          if (!(Test-Path -Path $screenshotDir)) {
+            New-Item -ItemType Directory -Path $screenshotDir -Force | Out-Null
+          }
+
+          Write-VisibleWindowsReport -OutputPath "$screenshotDir/failure_visible_windows_before.txt" -Header "Visible windows before failure screenshot"
+          
+          Minimize-Window "HostedComputeAgent"
+          Minimize-Window "Administrator"
+          Minimize-CurrentWindow
+          Start-Sleep -Seconds 1
+          Take-Screenshot -OutputPath "$screenshotDir/failure_screenshot.png"
+
+      - name: Upload failure screenshots
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: failure-screenshots
+          path: ./screenshots/
+          if-no-files-found: warn
+

@@ -1,0 +1,237 @@
+{
+  "excel_version_build": "16.0|20430",
+  "measured_at": "2026-10-12T23:03:24.481588+00:00",
+  "classes": {},
+  "probes": [
+    {
+      "name": "sheet_name_00",
+      "macro": "\nFunction Probe() As String\nDim ws As Worksheet\nSet ws = Worksheets.Add\nOn Error Resume Next\nws.Name = \"\"\nProbe = Err.Number & \"|\" & (ws.Name = \"\")\nEnd Function\n",
+      "result": "1004|False"
+    },
+    {
+      "name": "sheet_name_01",
+      "macro": "\nFunction Probe() As String\nDim ws As Worksheet\nSet ws = Worksheets.Add\nOn Error Resume Next\nws.Name = \"a/b\"\nProbe = Err.Number & \"|\" & (ws.Name = \"a/b\")\nEnd Function\n",
+      "result": "1004|False"
+    },
+    {
+      "name": "sheet_name_02",
+      "macro": "\nFunction Probe() As String\nDim ws As Worksheet\nSet ws = Worksheets.Add\nOn Error Resume Next\nws.Name = \"a\\b\"\nProbe = Err.Number & \"|\" & (ws.Name = \"a\\b\")\nEnd Function\n",
+      "result": "1004|False"
+    },
+    {
+      "name": "sheet_name_03",
+      "macro": "\nFunction Probe() As String\nDim ws As Worksheet\nSet ws = Worksheets.Add\nOn Error Resume Next\nws.Name = \"a?b\"\nProbe = Err.Number & \"|\" & (ws.Name = \"a?b\")\nEnd Function\n",
+      "result": "1004|False"
+    },
+    {
+      "name": "sheet_name_04",
+      "macro": "\nFunction Probe() As String\nDim ws As Worksheet\nSet ws = Worksheets.Add\nOn Error Resume Next\nws.Name = \"a*b\"\nProbe = Err.Number & \"|\" & (ws.Name = \"a*b\")\nEnd Function\n",
+      "result": "1004|False"
+    },
+    {
+      "name": "sheet_name_05",
+      "macro": "\nFunction Probe() As String\nDim ws As Worksheet\nSet ws = Worksheets.Add\nOn Error Resume Next\nws.Name = \"a[b\"\nProbe = Err.Number & \"|\" & (ws.Name = \"a[b\")\nEnd Function\n",
+      "result": "1004|False"
+    },
+    {
+      "name": "sheet_name_06",
+      "macro": "\nFunction Probe() As String\nDim ws As Worksheet\nSet ws = Worksheets.Add\nOn Error Resume Next\nws.Name = \"a]b\"\nProbe = Err.Number & \"|\" & (ws.Name = \"a]b\")\nEnd Function\n",
+      "result": "1004|False"
+    },
+    {
+      "name": "sheet_name_07",
+      "macro": "\nFunction Probe() As String\nDim ws As Worksheet\nSet ws = Worksheets.Add\nOn Error Resume Next\nws.Name = \"a:b\"\nProbe = Err.Number & \"|\" & (ws.Name = \"a:b\")\nEnd Function\n",
+      "result": "1004|False"
+    },
+    {
+      "name": "sheet_name_08",
+      "macro": "\nFunction Probe() As String\nDim ws As Worksheet\nSet ws = Worksheets.Add\nOn Error Resume Next\nws.Name = \"'ab\"\nProbe = Err.Number & \"|\" & (ws.Name = \"'ab\")\nEnd Function\n",
+      "result": "1004|False"
+    },
+    {
+      "name": "sheet_name_09",
+      "macro": "\nFunction Probe() As String\nDim ws As Worksheet\nSet ws = Worksheets.Add\nOn Error Resume Next\nws.Name = \"ab'\"\nProbe = Err.Number & \"|\" & (ws.Name = \"ab'\")\nEnd Function\n",
+      "result": "1004|False"
+    },
+    {
+      "name": "sheet_name_10",
+      "macro": "\nFunction Probe() As String\nDim ws As Worksheet\nSet ws = Worksheets.Add\nOn Error Resume Next\nws.Name = \"a'b\"\nProbe = Err.Number & \"|\" & (ws.Name = \"a'b\")\nEnd Function\n",
+      "result": "0|True"
+    },
+    {
+      "name": "sheet_name_11",
+      "macro": "\nFunction Probe() As String\nDim ws As Worksheet\nSet ws = Worksheets.Add\nOn Error Resume Next\nws.Name = \"History\"\nProbe = Err.Number & \"|\" & (ws.Name = \"History\")\nEnd Function\n",
+      "result": "1004|False"
+    },
+    {
+      "name": "sheet_name_12",
+      "macro": "\nFunction Probe() As String\nDim ws As Worksheet\nSet ws = Worksheets.Add\nOn Error Resume Next\nws.Name = \"history\"\nProbe = Err.Number & \"|\" & (ws.Name = \"history\")\nEnd Function\n",
+      "result": "1004|False"
+    },
+    {
+      "name": "sheet_name_13",
+      "macro": "\nFunction Probe() As String\nDim ws As Worksheet\nSet ws = Worksheets.Add\nOn Error Resume Next\nws.Name = \"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\"\nProbe = Err.Number & \"|\" & (ws.Name = \"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\")\nEnd Function\n",
+      "result": "0|True"
+    },
+    {
+      "name": "sheet_name_14",
+      "macro": "\nFunction Probe() As String\nDim ws As Worksheet\nSet ws = Worksheets.Add\nOn Error Resume Next\nws.Name = \"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\"\nProbe = Err.Number & \"|\" & (ws.Name = \"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\")\nEnd Function\n",
+      "result": "1004|False"
+    },
+    {
+      "name": "sheet_name_15",
+      "macro": "\nFunction Probe() As String\nDim ws As Worksheet\nSet ws = Worksheets.Add\nOn Error Resume Next\nws.Name = \" lead\"\nProbe = Err.Number & \"|\" & (ws.Name = \" lead\")\nEnd Function\n",
+      "result": "0|True"
+    },
+    {
+      "name": "sheet_name_16",
+      "macro": "\nFunction Probe() As String\nDim ws As Worksheet\nSet ws = Worksheets.Add\nOn Error Resume Next\nws.Name = \"trail \"\nProbe = Err.Number & \"|\" & (ws.Name = \"trail \")\nEnd Function\n",
+      "result": "0|True"
+    },
+    {
+      "name": "sheet_name_17",
+      "macro": "\nFunction Probe() As String\nDim ws As Worksheet\nSet ws = Worksheets.Add\nOn Error Resume Next\nws.Name = \"a.b\"\nProbe = Err.Number & \"|\" & (ws.Name = \"a.b\")\nEnd Function\n",
+      "result": "0|True"
+    },
+    {
+      "name": "sheet_name_18",
+      "macro": "\nFunction Probe() As String\nDim ws As Worksheet\nSet ws = Worksheets.Add\nOn Error Resume Next\nws.Name = \"a,b\"\nProbe = Err.Number & \"|\" & (ws.Name = \"a,b\")\nEnd Function\n",
+      "result": "0|True"
+    },
+    {
+      "name": "sheet_name_19",
+      "macro": "\nFunction Probe() As String\nDim ws As Worksheet\nSet ws = Worksheets.Add\nOn Error Resume Next\nws.Name = \"a;b\"\nProbe = Err.Number & \"|\" & (ws.Name = \"a;b\")\nEnd Function\n",
+      "result": "0|True"
+    },
+    {
+      "name": "sheet_name_20",
+      "macro": "\nFunction Probe() As String\nDim ws As Worksheet\nSet ws = Worksheets.Add\nOn Error Resume Next\nws.Name = \"a#b\"\nProbe = Err.Number & \"|\" & (ws.Name = \"a#b\")\nEnd Function\n",
+      "result": "0|True"
+    },
+    {
+      "name": "range_call_one",
+      "macro": "\nFunction Probe() As String\nDim ws As Worksheet\nSet ws = Worksheets.Add\nOn Error Resume Next\nProbe = ws.Range(\"B2:C3\")(1).Address & \"|\" & ws.Range(\"B2:C3\")(4).Address & \"|\" & ws.Range(\"B2:C3\")(5).Address\nEnd Function\n",
+      "result": "$B$2|$C$3|$B$4"
+    },
+    {
+      "name": "range_call_two",
+      "macro": "\nFunction Probe() As String\nDim ws As Worksheet\nSet ws = Worksheets.Add\nOn Error Resume Next\nProbe = ws.Range(\"B2:C3\")(2, 2).Address & \"|\" & ws.Range(\"B2:C3\")(0, 0).Address\nEnd Function\n",
+      "result": "$C$3|$A$1"
+    },
+    {
+      "name": "range_call_value",
+      "macro": "\nFunction Probe() As String\nDim ws As Worksheet\nSet ws = Worksheets.Add\nOn Error Resume Next\nws.Range(\"B2\").Value = 7\nDim x As Variant\nx = ws.Range(\"B2:C3\")(1)\nProbe = TypeName(x) & \"|\" & x\nEnd Function\n",
+      "result": "Double|7"
+    },
+    {
+      "name": "cells_call",
+      "macro": "\nFunction Probe() As String\nDim ws As Worksheet\nSet ws = Worksheets.Add\nOn Error Resume Next\nProbe = ws.Cells(2, 2)(2).Address & \"|\" & ws.Cells(1)(3).Address\nEnd Function\n",
+      "result": "$B$3|$A$3"
+    },
+    {
+      "name": "cells_item_index",
+      "macro": "\nFunction Probe() As String\nDim ws As Worksheet\nSet ws = Worksheets.Add\nOn Error Resume Next\nProbe = ws.Range(\"B2:C3\").Cells(2, 2).Address & \"|\" & ws.Range(\"B2:C3\").Cells(3).Address & \"|\" & ws.Range(\"B2:C3\")(1).Address & \"|\" & ws.Range(\"B2:C3\").Item(2, 1).Address\nEnd Function\n",
+      "result": "$C$3|$B$3|$B$2|$B$3"
+    },
+    {
+      "name": "value_of_empty_cells",
+      "macro": "\nFunction Probe() As String\nDim ws As Worksheet\nSet ws = Worksheets.Add\nOn Error Resume Next\nDim v\nv = ws.Range(\"A1:B2\").Value\nProbe = TypeName(v) & \"|\" & UBound(v, 1) & UBound(v, 2) & \"|\" & IsEmpty(v(2, 2))\nEnd Function\n",
+      "result": "Variant()|22|True"
+    },
+    {
+      "name": "value_past_used_cells",
+      "macro": "\nFunction Probe() As String\nDim ws As Worksheet\nSet ws = Worksheets.Add\nOn Error Resume Next\nws.Range(\"A1\").Value = 1\nDim v\nv = ws.Range(\"A1:C3\").Value\nProbe = UBound(v, 1) & UBound(v, 2) & \"|\" & v(1, 1) & \"|\" & IsEmpty(v(3, 3)) & \"|\" & UBound(ws.Range(\"D5:E6\").Value, 1)\nEnd Function\n",
+      "result": "33|1|True|2"
+    },
+    {
+      "name": "value_error_cells",
+      "macro": "\nFunction Probe() As String\nDim ws As Worksheet\nSet ws = Worksheets.Add\nOn Error Resume Next\nws.Range(\"A1\").Formula = \"=1/0\"\nws.Range(\"A2\").Formula = \"=NA()\"\nDim v\nv = ws.Range(\"A1:A2\").Value\nProbe = IsError(v(1, 1)) & \"|\" & CStr(v(1, 1)) & \"|\" & (v(2, 1) = CVErr(xlErrNA)) & \"|\" & ws.Range(\"A1\").Text\nEnd Function\n",
+      "result": "True|Error 2007|True|#DIV/0!"
+    },
+    {
+      "name": "listrow_range_item",
+      "macro": "\nFunction Probe() As String\nDim ws As Worksheet\nSet ws = Worksheets.Add\nOn Error Resume Next\nws.Range(\"A1:B2\").Value = 1\nDim lo As ListObject\nSet lo = ws.ListObjects.Add(xlSrcRange, ws.Range(\"A1:B2\"), , xlYes)\nDim r As ListRow\nSet r = lo.ListRows.Add\nr.Range(1, 2).Value = \"c\"\nProbe = lo.ListRows.Count & \"|\" & r.Range(1, 2).Address & \"|\" & ws.Range(\"B3\").Value\nEnd Function\n",
+      "result": "2|$B$3|c"
+    },
+    {
+      "name": "match_not_found",
+      "macro": "\nFunction Probe() As String\nDim ws As Worksheet\nSet ws = Worksheets.Add\nOn Error Resume Next\nws.Range(\"A1:A3\").Value = 1\nDim v\nv = Application.Match(\"zz\", ws.Range(\"A1:A3\"), 0)\nProbe = IsError(v) & \"|\" & (v = CVErr(xlErrNA)) & \"|\" & TypeName(v)\nEnd Function\n",
+      "result": "True|True|Error"
+    },
+    {
+      "name": "resize_past_the_sheet",
+      "macro": "\nFunction Probe() As String\nDim ws As Worksheet\nSet ws = Worksheets.Add\nOn Error Resume Next\nOn Error Resume Next\nDim r As Range, s As String\nSet r = ws.Range(\"A1048576\").Resize(2)\ns = Err.Number & \";\"\nErr.Clear\nSet r = ws.Range(\"XFD1\").Resize(1, 2)\ns = s & Err.Number & \";\"\nErr.Clear\nSet r = ws.Range(\"A1048575\").Resize(2)\ns = s & Err.Number & r.Address\nProbe = s\nEnd Function\n",
+      "result": "1004;1004;0$A$1048575:$A$1048576"
+    },
+    {
+      "name": "union_00",
+      "macro": "\nFunction Probe() As String\nDim ws As Worksheet\nSet ws = Worksheets.Add\nOn Error Resume Next\nProbe = Application.Union(ws.Range(\"A1\"), ws.Range(\"A2\")).Address\nEnd Function\n",
+      "result": "$A$1:$A$2"
+    },
+    {
+      "name": "union_01",
+      "macro": "\nFunction Probe() As String\nDim ws As Worksheet\nSet ws = Worksheets.Add\nOn Error Resume Next\nProbe = Application.Union(ws.Range(\"A1\"), ws.Range(\"A2\"), ws.Range(\"A3\")).Address\nEnd Function\n",
+      "result": "$A$1:$A$3"
+    },
+    {
+      "name": "union_02",
+      "macro": "\nFunction Probe() As String\nDim ws As Worksheet\nSet ws = Worksheets.Add\nOn Error Resume Next\nProbe = Application.Union(ws.Range(\"A1:A2\"), ws.Range(\"B1:B2\")).Address\nEnd Function\n",
+      "result": "$A$1:$B$2"
+    },
+    {
+      "name": "union_03",
+      "macro": "\nFunction Probe() As String\nDim ws As Worksheet\nSet ws = Worksheets.Add\nOn Error Resume Next\nProbe = Application.Union(ws.Range(\"A1\"), ws.Range(\"B2\")).Address\nEnd Function\n",
+      "result": "$A$1,$B$2"
+    },
+    {
+      "name": "union_04",
+      "macro": "\nFunction Probe() As String\nDim ws As Worksheet\nSet ws = Worksheets.Add\nOn Error Resume Next\nProbe = Application.Union(ws.Range(\"A1:A3\"), ws.Range(\"A2:A4\")).Address\nEnd Function\n",
+      "result": "$A$1:$A$4"
+    },
+    {
+      "name": "union_05",
+      "macro": "\nFunction Probe() As String\nDim ws As Worksheet\nSet ws = Worksheets.Add\nOn Error Resume Next\nProbe = Application.Union(ws.Range(\"A1:B1\"), ws.Range(\"A2\")).Address\nEnd Function\n",
+      "result": "$A$1:$B$1,$A$2"
+    },
+    {
+      "name": "union_06",
+      "macro": "\nFunction Probe() As String\nDim ws As Worksheet\nSet ws = Worksheets.Add\nOn Error Resume Next\nProbe = Application.Union(ws.Range(\"A1:B2\"), ws.Range(\"A1\")).Address\nEnd Function\n",
+      "result": "$A$1:$B$2"
+    },
+    {
+      "name": "union_07",
+      "macro": "\nFunction Probe() As String\nDim ws As Worksheet\nSet ws = Worksheets.Add\nOn Error Resume Next\nProbe = Application.Union(ws.Range(\"A1\"), ws.Range(\"A1:B2\")).Address\nEnd Function\n",
+      "result": "$A$1:$B$2"
+    },
+    {
+      "name": "union_08",
+      "macro": "\nFunction Probe() As String\nDim ws As Worksheet\nSet ws = Worksheets.Add\nOn Error Resume Next\nProbe = Application.Union(ws.Range(\"B1\"), ws.Range(\"A1\")).Address\nEnd Function\n",
+      "result": "$A$1:$B$1"
+    },
+    {
+      "name": "union_09",
+      "macro": "\nFunction Probe() As String\nDim ws As Worksheet\nSet ws = Worksheets.Add\nOn Error Resume Next\nProbe = Application.Union(ws.Range(\"A1\"), ws.Range(\"C1\"), ws.Range(\"B1\")).Address\nEnd Function\n",
+      "result": "$A$1:$C$1"
+    },
+    {
+      "name": "union_10",
+      "macro": "\nFunction Probe() As String\nDim ws As Worksheet\nSet ws = Worksheets.Add\nOn Error Resume Next\nProbe = Application.Union(ws.Range(\"A1:A2\"), ws.Range(\"B1:B3\")).Address\nEnd Function\n",
+      "result": "$A$1:$A$2,$B$1:$B$3"
+    },
+    {
+      "name": "union_11",
+      "macro": "\nFunction Probe() As String\nDim ws As Worksheet\nSet ws = Worksheets.Add\nOn Error Resume Next\nProbe = Application.Union(ws.Range(\"A1:B2\"), ws.Range(\"A3:B3\"), ws.Range(\"A4:B4\")).Address\nEnd Function\n",
+      "result": "$A$1:$B$4"
+    },
+    {
+      "name": "union_12",
+      "macro": "\nFunction Probe() As String\nDim ws As Worksheet\nSet ws = Worksheets.Add\nOn Error Resume Next\nProbe = Application.Union(ws.Range(\"A1:A2,C1\"), ws.Range(\"A3\")).Address\nEnd Function\n",
+      "result": "$C$1,$A$1:$A$3"
+    },
+    {
+      "name": "union_13",
+      "macro": "\nFunction Probe() As String\nDim ws As Worksheet\nSet ws = Worksheets.Add\nOn Error Resume Next\nProbe = Application.Union(ws.Range(\"A1:B2\"), ws.Range(\"B2:C3\")).Address\nEnd Function\n",
+      "result": "$A$1:$B$2,$B$2:$C$3"
+    }
+  ]
+}

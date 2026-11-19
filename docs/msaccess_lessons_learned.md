@@ -1,8 +1,18 @@
 # MS Access VBA: Lessons Learned
 
+**Historical.** This chronicle ends, in August 2026, with a read-only
+`AccessReader` and the conclusion that a pure-Python writer was out of
+reach. That conclusion no longer stands: since September 2026
+`AccessDatabase` writes Access databases, VBA included, through a
+pure-Python implementation of the storage engine, and the module
+operations this document could not reach (create, rename, delete) are
+done and checked in live Access. See [access_engine.md](access_engine.md)
+for the engine and the top-level README for the API. The account below
+is kept for what it found along the way.
+
 This document chronicles pyOpenVBA's attempt to extend its
 read-and-write VBA support from Excel, Word, and PowerPoint to
-Access `.accdb` databases, and the reasons we ultimately shipped only
+Access `.accdb` databases, and the reasons it shipped, at the time, only
 a read-only `AccessReader` API.
 
 The work spanned multiple reverse-engineering phases (referred to as
@@ -82,6 +92,112 @@ The pattern is consistent: as soon as Access's own state machine has
 to reconcile the cache with its compiled module table, our edits get
 discarded or the database is rejected.
 
+### 3.1 Follow-up (2026-08, p-code tooling + automated execution harness)
+
+The original matrix judged edits by opening the database in the Access
+GUI and looking. With the VBA7 p-code decoder/encoder now available and
+an automated harness -- build a module via COM (`RunCommand 126`,
+acCmdCompileAndSaveAllModules), edit bytes in Python, reopen and *run*
+the macro via `pyvbaharness.AccessSession`, and read a sentinel file the
+macro writes -- edits can be judged by what actually **executes**, not
+just what displays. Three results sharpen the picture:
+
+| Experiment                                   | Executes as edited? |
+|----------------------------------------------|---------------------|
+| Same-length interned-string (`B9`) edit      | YES                 |
+| Same-length p-code literal edit (`LitDI2`)   | YES                 |
+| `_VBA_PROJECT` version-cookie bump            | NO -- runner-error  |
+
+The first two are the important additions. Access executes p-code that
+references interned string-literal rows by index; a same-length edit to
+either the p-code stream or a `B9` literal row changes the value the
+compiled code produces. `5 + 3` re-encoded to `5 + 9` returns 14 from
+real Access; `"ORIGINALSTR"` overwritten with `"CHANGEDXSTR"` prints the
+new string. So a bounded but genuinely **executable** write already
+works, and this is the first validation of the p-code assembler (built
+and previously checked only against Excel) against Access's own runtime.
+
+The version-cookie result is the useful negative. Excel treats a
+`_VBA_PROJECT` version mismatch as "discard p-code, recompile from
+source"; Access does not. Bumping the cookie yields a runner-error, not
+a recompile. There is no load-time recompile-from-source trigger to
+exploit -- confirming, with a cleaner test than the p-code tombstones
+above, that arbitrary writing must produce correct p-code rather than
+lean on Access to regenerate it.
+
+The remaining barrier is unchanged and is about **size, not
+correctness**: every edit above is length-preserving. Growing a row --
+which any real source change needs -- still requires reproducing
+Access's LVAL page allocator and `MSysObjects` chunk-pointer mutation
+(section 5).
+
+### 3.2 Breakthrough (2026-08): executable pure-Python writes
+
+The barrier in 3.1 was stated as "size, not correctness". That was right
+about the symptom and wrong about the cause. Growing a row does not need
+Access's page allocator at all; it needs one field.
+
+Every VBA long-value is described by an `MSysAccessStorage` catalog row
+holding `<u16 length> 00 40 <slot><page>`, and Access trusts that length
+over the page slot table. Resizing a row while that length still reads the
+old value makes Access fault while loading the project -- which is exactly
+the "soft error on save" the phase-5 resize experiment hit. Updating it
+makes resizing work. **This field is the "internal index binding a module
+name to its compiled rows" that section 5 lists as never located.**
+
+Three further results follow from it:
+
+| Experiment | Result |
+|---|---|
+| Edit only the canonical `0xCAFE` p-code, leave every `rU@` row stale | Access returns the **new** value -- the CAFE region is what executes |
+| Edit only the source text, leave p-code alone | Access returns the **old** value -- source is display-only |
+| Grow a module row by 12 bytes and fix the catalog length | Runs correctly; `compile_project` succeeds |
+
+The second row settles a question 3.1 left open. There is no load-time
+recompile-from-source trigger, so writing source text alone yields a
+module that displays one thing and does another. Any Access writer must
+generate correct p-code.
+
+Generating it turned out to be tractable because **VBA p-code control flow
+is structured rather than jump-based**: `IfBlock`/`ElseBlock`/`EndIfBlock`,
+`DoWhile`/`Loop` and `For`/`NextVar` carry no branch offsets, so there are
+no jump targets to fix up. Implicit (undeclared) variables also need no
+declaration record. A compiler covering full operator precedence,
+assignment, `If`/`ElseIf`/`Else`, `Do While`/`Loop` and `For`/`Next` now
+re-emits **33 of 33 statements byte-for-byte identically to Microsoft's
+own compiler**, and a module whose logic was rewritten entirely in Python
+computes the right answer in real Access.
+
+The statement count can change too. That looked blocked by a table of
+24-byte slot records in the pre-`0xCAFE` header, but the comparison behind
+that reading was confounded: holding variables and control flow constant
+while varying only the statement count leaves the header size and the slot
+table **identical**. Slot records track variables and control-flow blocks,
+not statements. The real constraint was two u16 fields at `+516`/`+518`
+holding the procedure's line count; patched by the line delta, a module
+regrown from 3 statements to 13 compiles and runs (the per-line frame-size
+hint turned out to be advisory).
+
+New **identifiers** can be added too. That looked blocked by
+Access-generated "symbol buckets" in the `_VBA_PROJECT` row, but building
+the same source twice changes those bytes as well, so they are per-build
+scratch state with nothing to reproduce. What Access validates is a pair
+of u16 counters just before the identifier table (record count at
+`table_start - 10`, slot count at `-12`); appending a record without
+bumping both makes Access hang on load. With them corrected, a name
+appended before the table sentinel resolves normally at `524 + 2*index`,
+using the already-solved `LHashValOfNameSysA` hash.
+
+What remains is larger than that summary once suggested, and the work is
+**parked as of 2026-08-19**: creating a procedure needs the `FuncDefn`
+declaration tables; module create, rename and delete need coordinated
+edits across six structures and do not work; `Const`, arrays, `Static`
+and fixed-length strings each reshape the module header differently and
+are refused; and growing a module past its 4 KB page needs the LVAL chain
+allocator. What does work is rewriting a procedure *body* -- arbitrary
+statements, arbitrary control flow, and `Dim` declarations added, removed
+or retyped. Code and the full status in `docs/research/access_write/`.
+
 ---
 
 ## 4. Why Access is different
@@ -147,9 +263,19 @@ boundary (rename, delete, add, anything that grows the source by more
 than the cache row can absorb) will either be silently reverted or
 will corrupt the database.
 
+**Update (2026-08).** Two of these four are resolved, and one was
+misdiagnosed. The p-code assembler exists and matches Microsoft's output
+byte-for-byte on every statement tested (section 3.2). The "internal
+index" is the `MSysAccessStorage` length field, and updating it is what
+lets a row grow -- no page allocator is involved, because a resized row
+still fits its existing page; the allocator only matters once a row
+outgrows one. What remains is the compiled header's temporary-slot table,
+which fixes the statement count, and the `_VBA_PROJECT` symbol buckets,
+which fix the identifier set.
+
 ---
 
-## 6. Final decision
+## 6. Final decision (superseded, see the note at the top)
 
 `AccessReader` ships as a **read-only** class. The library cleanly
 extracts every VBA module, attribute block, identifier list, and

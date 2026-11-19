@@ -20,7 +20,7 @@ Sectors        : fixed-size blocks that follow the header
 from __future__ import annotations
 
 import struct
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import BinaryIO
 
@@ -38,11 +38,20 @@ _FATSECT: int = 0xFFFF_FFFD    # sector is part of the FAT
 _DIFSECT: int = 0xFFFF_FFFC    # sector is part of the DIFAT
 _NOSTREAM: int = 0xFFFF_FFFF   # no sibling / no child
 
+# FAT sector numbers the header lists, and a 512-byte DIFAT sector's after it
+# (the sector's last four bytes hold the next DIFAT sector's number).
+_HEADER_DIFAT = 109
+_DIFAT_PER_SECTOR = 127
+
 # Directory entry object types
 _OBJTYPE_EMPTY: int = 0
 _OBJTYPE_STORAGE: int = 1
 _OBJTYPE_STREAM: int = 2
 _OBJTYPE_ROOT: int = 5
+
+# Directory entry colours in a storage's red-black tree ([MS-CFB] 2.6.4)
+_RED: int = 0
+_BLACK: int = 1
 
 # Spec field order: sig(8), CLSID(16), minorVer(2), majorVer(2), byteOrder(2),
 # sectorShift(2), miniSectorShift(2), reserved(6), then nine DWORDs, then DIFAT(436)
@@ -69,8 +78,10 @@ class DirEntry:
     start_sector: int
     size: int
     is_mini: bool = False  # True when size < mini-stream cutoff
-    # Preserved verbatim for round-trip writes (CLSID, state, timestamps, color, etc.)
+    # Preserved verbatim for round-trip writes (CLSID, state, timestamps, etc.)
     raw: bytes = b""
+    # Red or black in the parent storage's tree; a rebuilt tree recolours its entries.
+    color: int = _BLACK
 
 
 class CFB:
@@ -146,6 +157,50 @@ class CFB:
             raise KeyError(f"Stream {name!r} not found in storage {storage!r}")
         return self._read_stream(self._directory[child_idx])
 
+    def list_storages_at(self, path: Sequence[str] = ()) -> list[str]:
+        """Return the storages directly inside the storage at ``path``.
+
+        ``path`` is a sequence of storage names from the root, so nested
+        storages that share a name -- a UserForm's ``i06`` and another
+        form's ``i06`` -- stay distinct.  An empty path means the root.
+        """
+        parent_idx = self._resolve_path(path)
+        return [
+            self._directory[i].name
+            for i in sorted(self._collect_subtree(self._directory[parent_idx].child_id))
+            if self._directory[i].obj_type == _OBJTYPE_STORAGE
+        ]
+
+    def list_streams_at(self, path: Sequence[str] = ()) -> list[str]:
+        """Return the streams directly inside the storage at ``path``."""
+        parent_idx = self._resolve_path(path)
+        return [
+            self._directory[i].name
+            for i in sorted(self._collect_subtree(self._directory[parent_idx].child_id))
+            if self._directory[i].obj_type == _OBJTYPE_STREAM
+        ]
+
+    def get_stream_at(self, path: Sequence[str], name: str) -> bytes:
+        """Return a stream that is a direct child of the storage at ``path``."""
+        parent_idx = self._resolve_path(path)
+        child_idx = self._find_child_stream_index(parent_idx, name)
+        if child_idx is None:
+            joined = "/".join(path)
+            raise KeyError(f"Stream {name!r} not found in storage {joined!r}")
+        return self._read_stream(self._directory[child_idx])
+
+    def write_stream_at(self, path: Sequence[str], name: str, data: bytes) -> None:
+        """Replace a stream that is a direct child of the storage at ``path``.
+
+        The change is held in memory until :meth:`to_bytes`.
+        """
+        parent_idx = self._resolve_path(path)
+        child_idx = self._find_child_stream_index(parent_idx, name)
+        if child_idx is None:
+            joined = "/".join(path)
+            raise KeyError(f"Stream {name!r} not found in storage {joined!r}")
+        self._stream_overrides[child_idx] = bytes(data)
+
     def list_storages(self) -> list[str]:
         """Return the names of all storage entries (excluding the root)."""
         return [
@@ -205,6 +260,12 @@ class CFB:
 
         if major_ver not in (3, 4):
             raise CFBError(f"Unsupported CFB major version: {major_ver}")
+        # [MS-CFB] 2.2: 512-byte sectors in version 3, 4096 in version 4, and
+        # 64-byte mini sectors in both.
+        if sector_size_pow != (9 if major_ver == 3 else 12) or mini_sector_size_pow != 6:
+            raise CFBError(
+                f"Unsupported CFB sector sizes: shift {sector_size_pow}, mini shift {mini_sector_size_pow}."
+            )
 
         self.sector_size = 1 << sector_size_pow          # 512 or 4096
         self.mini_sector_size = 1 << mini_sector_size_pow  # 64
@@ -215,11 +276,22 @@ class CFB:
 
         # Follow DIFAT chain for large files (> 109 FAT sectors)
         if difat_start != _ENDOFCHAIN and num_difat_sectors > 0:
+            # The header's count is only a claim: a file cannot hold more
+            # sectors than its size allows, and a chain that returns to a
+            # sector it has visited would otherwise loop for that count.
+            if num_difat_sectors > max(0, len(self._data) // self.sector_size - 1):
+                raise CFBError(f"The header claims {num_difat_sectors} DIFAT sectors; the file is too short.")
             sector = difat_start
+            seen: set[int] = set()
             for _ in range(num_difat_sectors):
                 if sector in (_ENDOFCHAIN, _FREESECT):
                     break
+                if sector in seen:
+                    raise CFBError(f"The DIFAT chain returns to sector {sector}.")
+                seen.add(sector)
                 sector_data = self._sector(sector)
+                if len(sector_data) < self.sector_size:
+                    raise CFBError(f"DIFAT sector {sector} lies past the end of the file.")
                 entries_per_difat = (self.sector_size // 4) - 1
                 extra = [int(x) for x in struct.unpack_from(f"<{entries_per_difat}I", sector_data)]
                 difat.extend(extra)
@@ -261,7 +333,10 @@ class CFB:
                 self._mini_stream = bytes(ms_raw)
 
     def _sector(self, index: int) -> bytes:
-        offset = _HEADER_SIZE + index * self.sector_size
+        # The header takes the whole first sector: 512 bytes in version 3, and
+        # 512 bytes padded to 4096 in version 4 ([MS-CFB] 2.2), so sector n
+        # starts at (n + 1) * sector_size, not after the 512 header bytes.
+        offset = (index + 1) * self.sector_size
         return self._data[offset: offset + self.sector_size]
 
     def _chain(self, start: int) -> list[int]:
@@ -295,7 +370,7 @@ class CFB:
             name_raw,
             name_len,
             obj_type,
-            _color,
+            color,
             left_id,
             right_id,
             child_id,
@@ -321,6 +396,7 @@ class CFB:
             start_sector=start_sector,
             size=size,
             raw=entry_raw,
+            color=color,
         )
 
     def _read_stream(self, entry: DirEntry) -> bytes:
@@ -375,6 +451,127 @@ class CFB:
         if child_idx is None:
             raise KeyError(f"Stream {name!r} not found in storage {storage!r}")
         self._stream_overrides[child_idx] = bytes(data)
+
+    def add_stream_at(self, path: Sequence[str], name: str, data: bytes) -> None:
+        """Create a stream inside the storage at ``path``, seeded with ``data``.
+
+        The path form of :meth:`add_stream_to_storage`, for storages whose
+        name repeats -- a UserForm's containers all own an ``f``.
+        """
+        if not name:
+            raise ValueError("stream name must be non-empty")
+        parent_idx = self._resolve_path(path)
+        if self._find_child_stream_index(parent_idx, name) is not None:
+            joined = "/".join(path)
+            raise ValueError(f"Stream {name!r} already exists in {joined!r}")
+        self._attach_child(parent_idx, self._claim_slot(name, _OBJTYPE_STREAM))
+        self._stream_overrides[self._find_child_stream_index(parent_idx, name) or 0] = (
+            bytes(data)
+        )
+
+    def add_substorage_at(
+        self, path: Sequence[str], name: str, clsid: bytes = b""
+    ) -> None:
+        """Create a storage inside the storage at ``path``.
+
+        ``clsid`` is the 16-byte class id the entry carries.  It is not
+        decoration: a UserForm container's storage is bound by its CLSID,
+        and one written without it is silently not bound.
+        """
+        if not name:
+            raise ValueError("storage name must be non-empty")
+        if clsid and len(clsid) != 16:
+            raise ValueError(f"CLSID must be 16 bytes, got {len(clsid)}")
+        parent_idx = self._resolve_path(path)
+        needle = name.casefold()
+        for child_idx in self._collect_subtree(self._directory[parent_idx].child_id):
+            sibling = self._directory[child_idx]
+            if (
+                sibling.obj_type == _OBJTYPE_STORAGE
+                and sibling.name.casefold() == needle
+            ):
+                joined = "/".join(path)
+                raise ValueError(f"Storage {name!r} already exists under {joined!r}")
+        target_idx = self._claim_slot(name, _OBJTYPE_STORAGE)
+        if clsid:
+            entry = self._directory[target_idx]
+            raw = bytearray(self._synth_dir_entry_bytes(entry))
+            raw[80:96] = clsid
+            entry.raw = bytes(raw)
+        self._attach_child(parent_idx, target_idx)
+
+    def remove_storage_at(self, path: Sequence[str], name: str) -> None:
+        """Delete a storage inside ``path``, and everything under it.
+
+        Recursive on purpose: a UserForm container's storage holds its
+        children's storages, and leaving one behind orphans a whole
+        subtree that the next read would refuse.
+        """
+        parent_idx = self._resolve_path(path)
+        needle = name.casefold()
+        target_idx = None
+        for child_idx in self._collect_subtree(self._directory[parent_idx].child_id):
+            entry = self._directory[child_idx]
+            if entry.obj_type == _OBJTYPE_STORAGE and entry.name.casefold() == needle:
+                target_idx = child_idx
+                break
+        if target_idx is None:
+            joined = "/".join(path)
+            raise KeyError(f"Storage {name!r} not found under {joined!r}")
+
+        def clear(idx: int) -> None:
+            entry = self._directory[idx]
+            if entry.obj_type == _OBJTYPE_STORAGE:
+                for grandchild in self._collect_subtree(entry.child_id):
+                    clear(grandchild)
+            self._stream_overrides.pop(idx, None)
+            entry.name = ""
+            entry.obj_type = _OBJTYPE_EMPTY
+            entry.child_id = _NOSTREAM
+            entry.left_sibling_id = _NOSTREAM
+            entry.right_sibling_id = _NOSTREAM
+            entry.start_sector = _FREESECT
+            entry.size = 0
+            entry.raw = b""
+
+        siblings = [
+            i
+            for i in self._collect_subtree(self._directory[parent_idx].child_id)
+            if i != target_idx
+        ]
+        clear(target_idx)
+        self._directory[parent_idx].child_id = self._rebuild_balanced_subtree(siblings)
+
+    def _claim_slot(self, name: str, obj_type: int) -> int:
+        """Recycle an empty directory slot, or append a fresh entry."""
+        for idx, entry in enumerate(self._directory):
+            if entry.obj_type == _OBJTYPE_EMPTY:
+                entry.name = name
+                entry.obj_type = obj_type
+                entry.child_id = _NOSTREAM
+                entry.left_sibling_id = _NOSTREAM
+                entry.right_sibling_id = _NOSTREAM
+                entry.start_sector = _ENDOFCHAIN
+                entry.size = 0
+                entry.raw = b""
+                return idx
+        self._directory.append(DirEntry(
+            name=name,
+            obj_type=obj_type,
+            child_id=_NOSTREAM,
+            left_sibling_id=_NOSTREAM,
+            right_sibling_id=_NOSTREAM,
+            start_sector=_ENDOFCHAIN,
+            size=0,
+            raw=b"",
+        ))
+        return len(self._directory) - 1
+
+    def _attach_child(self, parent_idx: int, child_idx: int) -> None:
+        """Splice a new entry into a storage's child subtree and rebalance."""
+        siblings = self._collect_subtree(self._directory[parent_idx].child_id)
+        siblings.append(child_idx)
+        self._directory[parent_idx].child_id = self._rebuild_balanced_subtree(siblings)
 
     def add_stream_to_storage(self, storage: str, name: str, data: bytes) -> None:
         """
@@ -558,6 +755,30 @@ class CFB:
     # Directory tree helpers
     # ------------------------------------------------------------------
 
+    def _resolve_path(self, path: Sequence[str]) -> int:
+        """Resolve a root-relative sequence of storage names to its index.
+
+        Each step searches only the previous storage's own children, which
+        is what keeps two forms' identically named substorages apart.
+        """
+        idx = 0  # the root entry
+        for step in path:
+            needle = step.casefold()
+            found = None
+            for child_idx in self._collect_subtree(self._directory[idx].child_id):
+                entry = self._directory[child_idx]
+                if (
+                    entry.obj_type == _OBJTYPE_STORAGE
+                    and entry.name.casefold() == needle
+                ):
+                    found = child_idx
+                    break
+            if found is None:
+                joined = "/".join(path)
+                raise KeyError(f"Storage not found: {joined!r} (at {step!r})")
+            idx = found
+        return idx
+
     def _find_storage_index(self, storage: str) -> int:
         needle = storage.casefold()
         for idx, entry in enumerate(self._directory):
@@ -598,7 +819,13 @@ class CFB:
         Build a balanced BST from ``indices`` sorted by ``([MS-CFB] 2.6.4)``
         ordering: ``(len(name), upper(name))``.  Returns the new root id, or
         ``_NOSTREAM`` if empty.  Side-effect: rewrites the participating
-        entries' left/right sibling pointers.
+        entries' left/right sibling pointers and colours.
+
+        The colours matter as much as the order.  Reading never notices them,
+        but Windows' compound-file code inserts into the tree it reads and
+        refuses with STG_E_DOCFILECORRUPT on runs of red entries: that is the
+        "Device I/O error" Excel's editor gave adding a module to a project
+        of 66 sheets this wrote, when every entry it placed was left red.
         """
         if not indices:
             return _NOSTREAM
@@ -606,16 +833,58 @@ class CFB:
             indices,
             key=lambda i: (len(self._directory[i].name), self._directory[i].name.upper()),
         )
-        return self._build_from_sorted(ordered)
+        # Halving the sorted run fills every level but the deepest, so black
+        # above it and red on it gives every path the same black count with
+        # no red node above another.
+        full_levels = (len(ordered) + 1).bit_length() - 1
+        return self._build_from_sorted(ordered, 0, full_levels)
 
-    def _build_from_sorted(self, ordered: list[int]) -> int:
+    def _build_from_sorted(self, ordered: list[int], depth: int, full_levels: int) -> int:
         if not ordered:
             return _NOSTREAM
         mid = len(ordered) // 2
         root = ordered[mid]
-        self._directory[root].left_sibling_id = self._build_from_sorted(ordered[:mid])
-        self._directory[root].right_sibling_id = self._build_from_sorted(ordered[mid + 1:])
+        entry = self._directory[root]
+        entry.color = _RED if depth >= full_levels else _BLACK
+        entry.left_sibling_id = self._build_from_sorted(ordered[:mid], depth + 1, full_levels)
+        entry.right_sibling_id = self._build_from_sorted(ordered[mid + 1:], depth + 1, full_levels)
         return root
+
+    def _red_under_red(self, root: int) -> bool:
+        """Whether the tree under ``root`` holds a red entry under a red one.
+
+        That is the fault Windows refuses to insert into, and the one this
+        writer used to leave.  Measured with ole32 on balanced trees of up
+        to 300 entries: all red, it refused at 226 sizes; all black, so
+        that paths hold different numbers of black entries, or red only at
+        the top, it refused none.  Word and PowerPoint write such all-black
+        trees into .doc and .ppt files, and those are left as they are.
+        """
+        seen: set[int] = set()
+        stack = [(root, False)]
+        while stack:
+            node, parent_red = stack.pop()
+            if node == _NOSTREAM or node >= len(self._directory) or node in seen:
+                continue
+            seen.add(node)
+            entry = self._directory[node]
+            red = entry.color != _BLACK
+            if red and parent_red:
+                return True
+            stack.append((entry.left_sibling_id, red))
+            stack.append((entry.right_sibling_id, red))
+        return False
+
+    def _mend_trees(self) -> None:
+        """Rebuild every storage's child tree that holds a red entry under a red one.
+
+        Office never writes one, so its files pass through as they are.  This
+        mends the trees earlier versions of this writer left red, the bundled
+        blank templates among them.
+        """
+        for entry in self._directory:
+            if entry.obj_type in (_OBJTYPE_STORAGE, _OBJTYPE_ROOT) and self._red_under_red(entry.child_id):
+                entry.child_id = self._rebuild_balanced_subtree(self._collect_subtree(entry.child_id))
 
     def _unlink_and_clear(self, parent_idx: int, target_idx: int) -> None:
         parent = self._directory[parent_idx]
@@ -644,20 +913,25 @@ class CFB:
 
         Output uses major version 3 (512-byte sectors, 64-byte mini-sectors,
         4096-byte mini-stream cutoff).  Preserves the original directory-tree
-        topology and per-entry metadata (CLSID, state, color, timestamps).
+        topology and per-entry metadata (CLSID, state, color, timestamps),
+        except that a storage whose tree holds a red entry under a red one
+        gets a rebuilt one: Windows refuses to add a stream to it.
 
         Layout, in sector order:
-            [mini-stream data] [regular stream data] [directory] [mini-FAT] [FAT]
+            [mini-stream data] [regular stream data] [directory] [mini-FAT] [FAT] [DIFAT]
 
-        Files large enough to require a DIFAT chain (more than 109 FAT sectors,
-        about 27 MB of total payload) are rejected — vbaProject.bin is always
-        well under this limit.
+        The header lists the first 109 FAT sectors, which cover 109 x 128
+        sectors of 512 bytes, about 7.1 MB.  A larger file lists the rest in
+        DIFAT sectors ([MS-CFB] 2.5): 127 FAT sector numbers each, then the
+        number of the next DIFAT sector, the last one ending the chain.
         """
         SECTOR = 512
         MINI = 64
         CUTOFF = 4096
         ENTRIES_PER_SECTOR = SECTOR // 4              # 128 FAT entries / sector
         DIR_ENTRIES_PER_SECTOR = SECTOR // _DIR_ENTRY_SIZE  # 4 dir entries / sector
+
+        self._mend_trees()
 
         # ---- 1. Snapshot every directory entry's stream data ----
         stream_bytes: list[bytes] = []
@@ -763,22 +1037,22 @@ class CFB:
             minifat_first = _ENDOFCHAIN
             n_minifat_sectors = 0
 
-        # ---- 4. Decide how many FAT sectors we need (fixed-point) ----
+        # ---- 4. Decide how many FAT and DIFAT sectors we need (fixed-point) ----
+        # The FAT maps every sector, its own and the DIFAT's included, and the
+        # DIFAT lists the FAT sectors the header has no room for.
         n_data = len(sector_payloads)
         n_fat = 1
         while True:
-            needed = ((n_data + n_fat) + ENTRIES_PER_SECTOR - 1) // ENTRIES_PER_SECTOR
+            n_difat = -(-max(0, n_fat - _HEADER_DIFAT) // _DIFAT_PER_SECTOR)
+            needed = -(-(n_data + n_fat + n_difat) // ENTRIES_PER_SECTOR)
             if needed <= n_fat:
                 break
             n_fat = needed
-        if n_fat > 109:
-            raise CFBError(
-                "CFB writer requires DIFAT chain support for files this large; "
-                "not implemented."
-            )
 
         fat_first = n_data
         fat_sector_ids = list(range(fat_first, fat_first + n_fat))
+        difat_first = fat_first + n_fat
+        difat_sector_ids = list(range(difat_first, difat_first + n_difat))
 
         # ---- 5. Build the FAT ----
         fat = [_FREESECT] * (n_fat * ENTRIES_PER_SECTOR)
@@ -800,14 +1074,26 @@ class CFB:
             chain(minifat_first, n_minifat_sectors)
         for s in fat_sector_ids:
             fat[s] = _FATSECT
+        for s in difat_sector_ids:
+            fat[s] = _DIFSECT
 
         fat_bytes = struct.pack(f"<{len(fat)}I", *fat)
         for k in range(n_fat):
             sector_payloads.append(fat_bytes[k * SECTOR:(k + 1) * SECTOR])
 
+        # The FAT sectors past the header's 109, 127 to a DIFAT sector, each
+        # sector ending with the next one's number.
+        rest = fat_sector_ids[_HEADER_DIFAT:]
+        for k in range(n_difat):
+            listed = rest[k * _DIFAT_PER_SECTOR:(k + 1) * _DIFAT_PER_SECTOR]
+            listed += [_FREESECT] * (_DIFAT_PER_SECTOR - len(listed))
+            following = difat_sector_ids[k + 1] if k + 1 < n_difat else _ENDOFCHAIN
+            sector_payloads.append(struct.pack(f"<{_DIFAT_PER_SECTOR + 1}I", *listed, following))
+
         # ---- 6. Build the header ----
-        difat = list(fat_sector_ids) + [_FREESECT] * (109 - len(fat_sector_ids))
-        difat_bytes = struct.pack("<109I", *difat)
+        difat = fat_sector_ids[:_HEADER_DIFAT]
+        difat += [_FREESECT] * (_HEADER_DIFAT - len(difat))
+        difat_bytes = struct.pack(f"<{_HEADER_DIFAT}I", *difat)
 
         header = struct.pack(
             _HEADER_FMT,
@@ -826,8 +1112,8 @@ class CFB:
             CUTOFF,               # mini-stream cutoff size
             minifat_first,        # first mini-FAT sector
             n_minifat_sectors,    # num mini-FAT sectors
-            _ENDOFCHAIN,          # first DIFAT sector (none)
-            0,                    # num DIFAT sectors
+            difat_first if n_difat else _ENDOFCHAIN,  # first DIFAT sector
+            n_difat,              # num DIFAT sectors
             difat_bytes,          # 436-byte DIFAT array
         )
 
@@ -851,8 +1137,9 @@ class CFB:
         idx: int,
     ) -> bytes:
         """
-        Re-emit a 128-byte directory entry, patching in updated start_sector and
-        size while preserving the original CLSID, color, state, and timestamps.
+        Re-emit a 128-byte directory entry, patching in updated start_sector,
+        size and colour while preserving the original CLSID, state, and
+        timestamps.
         """
         CUTOFF = 4096
 
@@ -889,7 +1176,7 @@ class CFB:
             raise CFBError(f"Directory entry name too long: {entry.name!r}")
         name_bytes = name_utf16 + b"\x00" * (64 - len(name_utf16))
         struct.pack_into("<64sHBB", buf, 0,
-                         name_bytes, len(name_utf16), entry.obj_type, buf[67])
+                         name_bytes, len(name_utf16), entry.obj_type, entry.color)
         struct.pack_into("<III", buf, 68,
                          entry.left_sibling_id,
                          entry.right_sibling_id,
@@ -908,7 +1195,7 @@ class CFB:
             b"\x00" * 64,             # name (patched in by caller)
             0,                        # name_len
             entry.obj_type,
-            0,                        # color (red)
+            entry.color,
             entry.left_sibling_id,
             entry.right_sibling_id,
             entry.child_id,

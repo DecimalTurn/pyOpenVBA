@@ -1,0 +1,360 @@
+"""Worksheet PivotTable record aggregation and populated report construction."""
+from __future__ import annotations
+
+import math
+import datetime as dt
+from copy import deepcopy
+from decimal import Decimal
+from typing import TYPE_CHECKING
+
+from pyopenvba._a1 import Area, MAX_COLUMNS, MAX_ROWS, parse_area
+from pyopenvba.apps.excel._charts_file import XmlElement, xml_tree
+from pyopenvba.apps.excel._model import Range
+from pyopenvba.apps.excel._typing import Typed
+from pyopenvba.apps.excel._pivot_create import encoded, node
+from pyopenvba.apps.excel._pivots import NS, PivotField, decode_text, related_parts
+from pyopenvba.exceptions import VBAUnsupportedError
+from pyopenvba.formula._values import ExcelError
+from pyopenvba.interpreter._values import EMPTY, MISSING, NULL, error
+
+if TYPE_CHECKING:
+    from pyopenvba.apps.excel._pivots import PivotCache, PivotTable
+
+FUNCTIONS = {-4157: ('sum', 'Sum'), -4112: ('count', 'Count'), -4113: ('countNums', 'Count'),
+             -4106: ('average', 'Average'), -4139: ('min', 'Min'), -4136: ('max', 'Max'),
+             -4149: ('product', 'Product'), -4155: ('stdDev', 'StdDev'), -4156: ('stdDevp', 'StdDevp'),
+             -4164: ('var', 'Var'), -4165: ('varp', 'Varp')}
+
+
+X14_MAIN = 'http://schemas.microsoft.com/office/spreadsheetml/2009/9/main'
+XM_MAIN = 'http://schemas.microsoft.com/office/excel/2006/main'
+#: Excel 2016's extension holding a table's default layout, which every table Excel makes carries, empty.
+DEFAULT_LAYOUT = '{747A6164-185A-40DC-8AA5-F01512510D54}'
+XPDL = 'http://schemas.microsoft.com/office/spreadsheetml/2016/pivotdefaultlayout'
+
+
+def default_layout(root: XmlElement) -> None:
+    """Give a new table Excel 2016's default-layout extension as Excel does (tests/fixtures/pivot_layouts/)."""
+    extensions = root.find(NS + 'extLst')
+    if extensions is None:
+        extensions = node('extLst')
+        root.append(extensions)
+    extension = node('ext', {'uri': DEFAULT_LAYOUT, 'xmlns:xpdl': XPDL})
+    extension.append(XmlElement(f'{{{XPDL}}}pivotTableDefinition16'))
+    extensions.append(extension)
+
+
+def hide_values_row(root: XmlElement) -> None:
+    """Preserve the native header geometry when Excel reopens the report."""
+    extensions = root.find(NS + 'extLst')
+    if extensions is None:
+        extensions = node('extLst')
+        root.append(extensions)
+    identifier = '{962EF5D1-5CA2-4c93-8EF4-DBF5C05439D2}'
+    extension = next((entry for entry in extensions if entry.get('uri') == identifier), None)
+    if extension is None:
+        # Spelled as Excel spells it, ahead of the default-layout extension (tests/fixtures/pivot_layouts/).
+        extension = node('ext', {'uri': identifier, 'xmlns:x14': X14_MAIN})
+        extensions.insert(0, extension)
+    tag = f'{{{X14_MAIN}}}pivotTableDefinition'
+    options = extension.find(tag)
+    if options is None:
+        options = XmlElement(tag, {'hideValuesRow': '1', 'xmlns:xm': XM_MAIN})
+        extension.append(options)
+    # Without this native default, Excel infers an extra Values-header row for
+    # data-field ranges after reopening even though cached cells use two rows.
+    options.set('hideValuesRow', '1')
+
+
+def records(cache: PivotCache) -> list[list[XmlElement]]:
+    """Resolve cached shared-item references, never rereading worksheet source cells."""
+    from pyopenvba.apps.excel._pivots import refuse_1904_dates
+
+    refuse_1904_dates(cache)
+    root = cache.records
+    if root is None:
+        package = cache.book.package
+        parts = related_parts(package, cache.part, 'richPivotRecords' if cache.rich_records else 'pivotCacheRecords')
+        if not parts:
+            raise VBAUnsupportedError('Pivot aggregation requires saved cache records')
+        cache.records_part = parts[0][1]
+        root = xml_tree(package.read(cache.records_part))
+        cache.records = root
+    from pyopenvba.apps.excel._pivot_calculated import source_count
+
+    # A record holds a value for each field of the source, and none for the calculated fields after them.
+    fields = cache.root.findall(f'{NS}cacheFields/{NS}cacheField')
+    fields = fields[:source_count(fields)]
+    shared: list[list[XmlElement]] = []
+    for field in fields:
+        items = field.find(NS + 'sharedItems')
+        shared.append(list(items) if items is not None else [])
+    rows: list[list[XmlElement]] = []
+    for record in root.findall(NS + 'r'):
+        if len(record) != len(fields):
+            raise VBAUnsupportedError('This pivot cache record shape is not implemented')
+        row: list[XmlElement] = []
+        for column, entry in enumerate(record):
+            if entry.tag == NS + 'x':
+                index = int(entry.get('v', '-1'))
+                if not 0 <= index < len(shared[column]):
+                    raise VBAUnsupportedError('Invalid pivot shared-item reference')
+                entry = shared[column][index]
+            if entry.tag[len(NS):] not in ('n', 'm', 'b', 'd', 'e', 's'):
+                raise VBAUnsupportedError('This pivot cached value type is not implemented')
+            row.append(entry)
+        rows.append(row)
+    return rows
+
+
+def aggregate(values: list[XmlElement], function: str) -> object:
+    present = [entry for entry in values if entry.tag != NS + 'm']
+    if not present:
+        return EMPTY
+    numbers: list[float] = []
+    for entry in present:
+        if entry.tag == NS + 'n':
+            numbers.append(float(entry.get('v', '0')))
+        elif entry.tag == NS + 'd':
+            clock = dt.datetime.fromisoformat(entry.get('v', ''))
+            numbers.append((clock - dt.datetime(1899, 12, 30)).total_seconds() / 86400)
+    if function == 'count':
+        return float(len(present))
+    if function == 'countNums':
+        return float(len(numbers))
+    for entry in present:
+        if entry.tag == NS + 'e':
+            return ExcelError(entry.get('v', '#VALUE!'))
+    result = 0.0
+    if function in ('sum', 'average'):
+        # Python 3.12+ sum compensates cancellation; native pivots accumulate
+        # doubles in record order (the 1E16, 1, -1E16 control returns zero).
+        for value in numbers:
+            result += value
+        if function == 'average':
+            if not numbers:
+                return ExcelError('#DIV/0!')
+            result /= len(numbers)
+    elif function in ('min', 'max'):
+        result = (min(numbers) if function == 'min' else max(numbers)) if numbers else 0.0
+    elif function == 'product':
+        result = 1.0 if numbers else 0.0
+        for value in numbers:
+            result *= value
+            if not math.isfinite(result):
+                return ExcelError('#NUM!')
+    else:
+        sample = function in ('stdDev', 'var')
+        if len(numbers) < (2 if sample else 1):
+            return ExcelError('#DIV/0!')
+        # From the sum and the sum of squares, in record order, none below 0: a sample's sum of squares less the
+        # square of the sum over the count, a whole population's the count times the sum of squares less the square
+        # of the sum, over the count squared. What native pivots give bit for bit, where two passes keep digits
+        # Excel loses (tests/fixtures/pivot_variance/, tests/fixtures/pivot_layouts/ all_functions,
+        # tests/fixtures/pivots/aggregation.json underflow).
+        total = squares = 0.0
+        for value in numbers:
+            total += value
+            squares += value * value
+        count = float(len(numbers))
+        if sample:
+            result = max(0.0, squares - total * total / count) / (count - 1)
+        else:
+            result = max(0.0, count * squares - total * total) / (count * count)
+        if not math.isfinite(result):
+            return ExcelError('#NUM!')
+        if function in ('stdDev', 'stdDevp'):
+            result = math.sqrt(max(0.0, result))
+    return (0.0 if result == 0 else result) if math.isfinite(result) else ExcelError('#NUM!')
+
+
+def set_function(field: PivotField, value: object) -> None:
+    """PivotField.Function on a data field: the function it sums its values by, and a name the function gives it,
+    whatever it was called (tests/fixtures/pivot_layouts/ count_data_sum_subtotal, function_custom_name); error
+    1004 on another field or for a function Excel does not know (function_errors)."""
+    from pyopenvba.apps.excel._pivot_filters import rerender
+
+    if not field.data:
+        raise error(1004)
+    chosen = value if isinstance(value, (int, float, Decimal)) and not isinstance(value, bool) else None
+    if chosen not in FUNCTIONS:
+        raise error(1004)
+    table = field.table.entry
+    kind, label = FUNCTIONS[int(chosen)]
+    from pyopenvba.apps.excel._pivot_items import REFUSED_FUNCTIONS, has_items
+
+    if kind in REFUSED_FUNCTIONS and has_items(table.cache):
+        # A table showing calculated items shows no average, standard deviation or variance (tests/fixtures/
+        # pivot_calculated_items/ function_after).
+        raise error(1004)
+    sources = table.cache.root.findall(f'{NS}cacheFields/{NS}cacheField')
+    source = decode_text(sources[field.index].get('name', '')) if field.index < len(sources) else ''
+    if kind == 'sum':
+        # The schema's default, which Excel leaves out (tests/fixtures/pivot_calculations/ normal).
+        field.root.attrib.pop('subtotal', None)
+    else:
+        from pyopenvba.apps.excel._pivot_calculations import set_data_attribute
+
+        set_data_attribute(field.root, 'subtotal', kind)
+    others = [entry for entry in table.root.findall(f'{NS}dataFields/{NS}dataField') if entry is not field.root]
+    used = {decode_text(entry.get('name', '')).casefold() for entry in [*sources, *others]}
+    base = f'{label} of {source}'
+    name, suffix = base, 2
+    while name.casefold() in used:
+        name, suffix = base + str(suffix), suffix + 1
+    field.root.set('name', encoded(name))
+    rerender(table, deepcopy(table.root))
+    table.sheet.book.saved = False
+
+
+def add_data_field(table: PivotTable, source: object, caption: object, function: object,
+                   *, keep_source_axis: bool = False) -> PivotField:
+    table = table.entry
+    if int(table.cache.SourceType()) != 1:
+        raise VBAUnsupportedError('Aggregating external or consolidated pivot sources is not implemented')
+    axes = table.root.findall(f'{NS}rowFields/{NS}field') + table.root.findall(f'{NS}pageFields/{NS}pageField')
+    axes += [entry for entry in table.root.findall(f'{NS}colFields/{NS}field') if entry.get('x') != '-2']
+    if isinstance(source, Range):
+        index = 0
+    elif isinstance(source, PivotField):
+        if source.table.cache is not table.cache or source.index < 0:
+            raise error(1004)
+        index = source.index
+    else:
+        raise error(13)
+    from pyopenvba.apps.excel._pivot_calculated import is_calculated
+
+    rows = records(table.cache)
+    fields = table.cache.root.findall(f'{NS}cacheFields/{NS}cacheField')
+    if not 0 <= index < len(fields):
+        raise error(1004)
+    if function is MISSING or function is NULL:
+        # A calculated field sums, as Excel's does (tests/fixtures/pivot_calculated_fields/ margin).
+        values = [] if is_calculated(fields[index]) else [row[index] for row in rows]
+        numeric = is_calculated(fields[index]) or any(entry.tag == NS + 'n' for entry in values)
+        numeric = numeric and all(entry.tag in (NS + 'n', NS + 'm') for entry in values)
+        chosen = -4157 if numeric else -4112
+    elif not isinstance(function, (int, float, Decimal)) or isinstance(function, bool):
+        raise error(5)
+    elif function not in FUNCTIONS:
+        raise error(9)
+    else:
+        chosen = int(function)
+    kind, label = FUNCTIONS[chosen]
+    data = table.root.find(NS + 'dataFields')
+    previous = list(data) if data is not None else []
+    source_name = decode_text(fields[index].get('name', ''))
+    used = {decode_text(entry.get('name', '')).casefold() for entry in [*fields, *previous]}
+    if caption is MISSING or caption is NULL:
+        base = label + ' of ' + source_name
+        name, suffix = base, 2
+        while name.casefold() in used:
+            name, suffix = base + str(suffix), suffix + 1
+    elif not isinstance(caption, str):
+        raise error(5)
+    else:
+        name = caption
+        if name.casefold() in used:
+            raise error(1004)
+    if len(name.encode('utf-16-le', 'surrogatepass')) // 2 > 255:
+        raise error(5)
+    # A sum is the schema's default, which Excel leaves out (tests/fixtures/pivot_calculations/ normal).
+    new = node('dataField', {'name': encoded(name), 'fld': str(index), **({'subtotal': kind} if kind != 'sum' else {}),
+                             'baseField': '0', 'baseItem': '0'})
+    # A data field shows its values in its source's format, whatever it works out (tests/fixtures/
+    # pivot_date_filters/ money_count).
+    if fields[index].get('numFmtId', '0') != '0':
+        new.set('numFmtId', fields[index].get('numFmtId', '0'))
+    reports = [*previous, new]
+    if axes:
+        from pyopenvba.apps.excel._pivot_layout import render
+
+        definition = deepcopy(table.root)
+        if not keep_source_axis:
+            # AddDataField moves its source off a label/filter axis. Assigning
+            # Orientation=xlDataField instead leaves that source axis intact.
+            for axis, attribute in (('rowFields', 'x'), ('colFields', 'x'), ('pageFields', 'fld')):
+                container = definition.find(NS + axis)
+                if container is not None:
+                    container[:] = [entry for entry in container if int(entry.get(attribute, '0')) != index]
+                    container.set('count', str(len(container)))
+            pivot_fields = definition.find(NS + 'pivotFields')
+            assert pivot_fields is not None
+            pivot_fields[index].attrib.pop('axis', None)
+        render(table, definition, reports)
+        return PivotField(table, index, new, True)
+    from pyopenvba.apps.excel._pivot_calculated import Measures
+
+    measures = Measures(fields, table.sheet)
+    results = [measures.value(entry, rows) for entry in reports]
+    location = table.root.find(NS + 'location')
+    assert location is not None
+    old = parse_area(location.get('ref', 'A1'))
+    area = Area(old.top, old.left, old.top + 1, old.left + len(reports) - 1, table.sheet.name)
+    if area.bottom > MAX_ROWS or area.right > MAX_COLUMNS:
+        raise error(1004)
+    for other in table.sheet.pivot_tables:
+        other_location = other.root.find(NS + 'location')
+        if other is not table and other_location is not None:
+            block = parse_area(other_location.get('ref', 'A1'))
+            if area.top <= block.bottom and block.top <= area.bottom and area.left <= block.right and block.left <= area.right:
+                raise error(1004)
+    from pyopenvba.apps.excel._pivot_layout import unformat
+
+    cleared = Range(table.sheet, [old, area])
+    cleared.clear_contents_checked()
+    # The empty table's placeholder borders go with it, as Excel's do (tests/fixtures/pivot_names/ data_no_axes).
+    unformat(table.sheet, [old, area])
+    for child in list(table.root):
+        if child.tag in {NS + part for part in ('rowItems', 'colFields', 'colItems', 'dataFields')}:
+            table.root.remove(child)
+    pivot_fields = table.root.find(NS + 'pivotFields')
+    assert pivot_fields is not None
+    data_indexes = {int(entry.get('fld', '0')) for entry in reports}
+    for column, field in enumerate(pivot_fields):
+        field.set('dataField', str(int(column in data_indexes)))
+    children = [node('rowItems', {'count': '1'})]
+    children[0].append(node('i'))
+    if len(reports) > 1:
+        columns = node('colFields', {'count': '1'})
+        columns.append(node('field', {'x': '-2'}))
+        children.append(columns)
+    columns = node('colItems', {'count': str(len(reports))})
+    for value_index in range(len(reports)):
+        item = node('i', {'i': str(value_index)})
+        if len(reports) > 1:
+            item.append(node('x', {'v': str(value_index)}))
+        columns.append(item)
+    children.append(columns)
+    data = node('dataFields', {'count': str(len(reports))})
+    data.extend(reports)
+    children.append(data)
+    position = list(table.root).index(pivot_fields) + 1
+    for offset, child in enumerate(children):
+        table.root.insert(position + offset, child)
+    hide_values_row(table.root)
+    location.attrib.update(ref=area.address(absolute=False), firstHeaderRow=str(int(len(reports) == 1)),
+                           firstDataRow='1', firstDataCol='0')
+    output = Range(table.sheet, [area])
+    for offset, (entry, result) in enumerate(zip(reports, results)):
+        heading = decode_text(entry.get('name', ''))
+        output.store_typed(area.top, area.left + offset, Typed(heading if heading else EMPTY))
+        identifier = entry.get('numFmtId')
+        if identifier is not None and identifier.isdecimal():
+            code = table.sheet.book.stylesheet.number_formats.get(int(identifier), 'General')
+            output.store_typed(area.bottom, area.left + offset, Typed(result, code))
+        else:
+            output.put_as_value(area.bottom, area.left + offset, result)
+    table.changed = True
+    table.report_loaded = False
+    table.report_metadata = None
+    table.sheet.touched()
+    from pyopenvba.apps.excel import _events
+    from pyopenvba.apps.excel._pivot_fit import refit
+
+    # Its columns fit its captions and totals as any table's do (tests/fixtures/pivot_column_fit/
+    # no_columns_no_rows).
+    refit(table)
+    _events.after_edit(output)
+    _events.pivot_updated(table)
+    return PivotField(table, index, new, True)

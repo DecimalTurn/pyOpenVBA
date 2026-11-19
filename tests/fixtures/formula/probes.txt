@@ -1,0 +1,681 @@
+# One formula per line, optionally after setup statements and ``;;``.
+# Each probe gets a freshly added worksheet; its formula is written to
+# H1 and what that cell shows is recorded.  Setups write into A1:F10.
+#
+# Measured in live Excel by ``python scripts/measure_vba_semantics.py
+# formula`` and replayed against the engine by tests/test_formula.py.
+
+# --- operators and what they do to the types ---
+=1+2
+=1+2*3
+=(1+2)*3
+=2^3
+=2^3^2
+=-2^2
+=2^-1
+=10/4
+=10/0
+=5-"2"
+="5"+1
+="a"+1
+=1&2
+=1.5&"x"
+=TRUE&"x"
+="a"&""
+=50%
+=50%+1
+=2^3%
+=-3%
+=1=1
+=1="1"
+=1<"1"
+="a"="A"
+="a"<"b"
+="b"<"a"
+=TRUE>"z"
+=TRUE=1
+=TRUE+TRUE
+=1<>2
+="">""
+=1/3
+=(1/3)*3
+=0.1+0.2
+=0.1+0.2=0.3
+=1E+15
+=1E+16
+=1/3*3=1
+
+# --- an empty cell ---
+;; =A1
+;; =A1+1
+;; =A1&"x"
+;; =A1=0
+;; =A1=""
+;; =ISBLANK(A1)
+;; =COUNT(A1)
+;; =COUNTA(A1)
+;; =SUM(A1:A3)
+;; =AVERAGE(A1:A3)
+Range("A1").Value = 0 ;; =ISBLANK(A1)
+
+# --- what a range contributes, and what a literal does ---
+Range("A1").Value = 1: Range("A2").Value = "2" ;; =SUM(A1:A2)
+Range("A1").Value = 1: Range("A2").Value = TRUE ;; =SUM(A1:A2)
+Range("A1").Value = 1 ;; =SUM(A1,"2")
+Range("A1").Value = 1 ;; =SUM(A1,TRUE)
+Range("A1").Value = 1 ;; =SUM(A1,"x")
+Range("A1").Value = 1: Range("A2").Value = "2" ;; =COUNT(A1:A2)
+Range("A1").Value = 1: Range("A2").Value = "2" ;; =COUNTA(A1:A2)
+Range("A1:A3").Value = 2 ;; =PRODUCT(A1:A3)
+Range("A1").Value = 3: Range("A2").Value = 1: Range("A3").Value = 2 ;; =MAX(A1:A3)
+Range("A1").Value = 3: Range("A2").Value = 1: Range("A3").Value = 2 ;; =MIN(A1:A3)&"/"&MEDIAN(A1:A3)
+Range("A1").Value = 3: Range("A2").Value = 1: Range("A3").Value = 2 ;; =LARGE(A1:A3,2)&"/"&SMALL(A1:A3,2)
+Range("A1:A2").Value = 1 ;; =AVERAGE(A1:A2)
+;; =AVERAGE(A1:A2)
+Range("A1").Value = 1: Range("A2").Value = 3 ;; =STDEV(A1:A2)&"/"&STDEVP(A1:A2)
+;; =STDEV(1,6,7,8)
+;; =STDEVP(1,6,7,8,9)
+;; =VAR(0.1,0.2,0.3)
+;; =VARP(0.1,0.2,0.3,0.7)
+;; =STDEV(1,6,7,8)*1E+15
+;; =VAR(1,6,7,8)*1E+15
+;; =VAR(0.1,0.2,0.3)-0.01
+;; =VAR(0.3,0.2,0.1)-0.01
+;; =VARP(0.1,0.2,0.3)-0.0066666666666667
+;; =STDEV(1,6,7,8)-3.1091263510296
+;; =STDEV(0.1,0.2,0.3)-0.1
+;; =VAR(1000000001,1000000002,1000000003)-1
+;; =VAR(0.1,0.2,0.3,0.4)-0.0166666666666667
+;; =VAR(1.1,2.2,3.3)-1.21
+;; =VARP(1.1,2.2,3.3)-0.806666666666667
+;; =VAR(0.1,0.7)-0.18
+;; =VAR(10.1,10.2,10.3)-0.01
+;; =VAR(100.1,100.2,100.3)-0.01
+;; =VAR(1E+15+1,1E+15+2,1E+15+3)
+;; =VAR(0.1,0.2,0.3,0.7,1.1,1.3)-0.2
+;; =STDEVP(2.5,3.5,4.5,9.5)-2.7726341266023
+Range("A1").Value = 1: Range("B1").Value = 2: Range("A2").Value = 3: Range("B2").Value = 4 ;; =SUMPRODUCT(A1:A2,B1:B2)
+
+# --- rounding, which is not VBA's ---
+=ROUND(2.5,0)
+=ROUND(-2.5,0)
+=ROUND(0.5,0)
+=ROUND(1.5,0)
+=ROUND(2.675,2)
+=ROUND(1234.5678,-2)
+=ROUNDUP(1.1,0)
+=ROUNDDOWN(1.9,0)
+=ROUNDUP(-1.1,0)
+=ROUNDDOWN(-1.9,0)
+=INT(-1.5)
+=INT(1.5)
+=TRUNC(-1.9)
+=MOD(7,3)
+=MOD(-7,3)
+=MOD(7,-3)
+=MOD(7,0)
+=MROUND(7,3)
+=CEILING(7,3)
+=FLOOR(7,3)
+=ABS(-3)
+=SIGN(-3)
+=SQRT(9)
+=SQRT(-1)
+=POWER(2,10)
+=EXP(1)
+=LN(1)
+=LOG(8,2)
+=LOG10(100)
+=PI()
+
+# --- the criteria functions ---
+Range("A1").Value = 1: Range("A2").Value = 5: Range("A3").Value = 10 ;; =COUNTIF(A1:A3,">4")
+Range("A1").Value = 1: Range("A2").Value = 5: Range("A3").Value = 10 ;; =SUMIF(A1:A3,">4")
+Range("A1").Value = "a": Range("A2").Value = "b": Range("B1").Value = 1: Range("B2").Value = 2 ;; =SUMIF(A1:A2,"a",B1:B2)
+Range("A1").Value = "a": Range("A2").Value = "A" ;; =COUNTIF(A1:A2,"a")
+Range("A1").Value = "apple": Range("A2").Value = "apricot" ;; =COUNTIF(A1:A2,"ap*")
+Range("A1").Value = "apple": Range("A2").Value = "apricot" ;; =COUNTIF(A1:A2,"a?p*")
+Range("A1").Value = "a": Range("A2").Value = "b" ;; =COUNTIF(A1:A2,"<>a")
+Range("A1").Value = 1: Range("A2").Value = 2: Range("B1").Value = "x": Range("B2").Value = "y" ;; =SUMIFS(A1:A2,B1:B2,"y")
+Range("A1").Value = 1: Range("A2").Value = 2: Range("B1").Value = "x": Range("B2").Value = "x" ;; =COUNTIFS(A1:A2,">0",B1:B2,"x")
+Range("A1").Value = 1: Range("A2").Value = 3 ;; =AVERAGEIF(A1:A2,">2")
+Range("A1").Value = 1 ;; =COUNTIF(A1:A3,"")
+Range("A1").Value = 1 ;; =COUNTBLANK(A1:A3)
+
+# --- lookups ---
+Range("A1").Value = "a": Range("B1").Value = 1: Range("A2").Value = "b": Range("B2").Value = 2 ;; =VLOOKUP("b",A1:B2,2,FALSE)
+Range("A1").Value = "a": Range("B1").Value = 1: Range("A2").Value = "b": Range("B2").Value = 2 ;; =VLOOKUP("B",A1:B2,2,FALSE)
+Range("A1").Value = "a": Range("B1").Value = 1 ;; =VLOOKUP("z",A1:B2,2,FALSE)
+Range("A1").Value = 1: Range("B1").Value = "x": Range("A2").Value = 5: Range("B2").Value = "y" ;; =VLOOKUP(3,A1:B2,2)
+Range("A1").Value = 1: Range("B1").Value = "x": Range("A2").Value = 5: Range("B2").Value = "y" ;; =VLOOKUP(3,A1:B2,2,TRUE)
+Range("A1").Value = "a": Range("A2").Value = "b" ;; =MATCH("b",A1:A2,0)
+Range("A1").Value = 1: Range("A2").Value = 5 ;; =MATCH(3,A1:A2)
+Range("A1").Value = 1: Range("A2").Value = 5 ;; =MATCH(3,A1:A2,0)
+Range("A1").Value = "a": Range("B1").Value = "b" ;; =HLOOKUP("b",A1:B1,1,FALSE)
+Range("A1:B2").Value = 7 ;; =INDEX(A1:B2,2,2)
+Range("A1").Value = 1: Range("A2").Value = 2 ;; =INDEX(A1:A2,2)
+Range("A1").Value = 1: Range("A2").Value = 2 ;; =INDEX(A1:A2,3)
+Range("A1").Value = 1: Range("A2").Value = 2 ;; =SUM(INDEX(A1:A2,0))
+=CHOOSE(2,"a","b","c")
+=CHOOSE(0,"a")
+;; =ROW()
+;; =COLUMN()
+;; =ROWS(A1:A5)&"/"&COLUMNS(A1:C1)
+Range("A1").Value = 9 ;; =OFFSET(A1,0,0)
+Range("B2").Value = 9 ;; =OFFSET(A1,1,1)
+Range("A1:A3").Value = 2 ;; =SUM(OFFSET(A1,0,0,3,1))
+Range("A1").Value = 5 ;; =INDIRECT("A1")
+Range("A1").Value = 5 ;; =INDIRECT("A"&1)
+=INDIRECT("nonsense")
+
+# --- logic ---
+=IF(TRUE,"y","n")
+=IF(FALSE,"y","n")
+=IF(FALSE,"y")
+=IF(1,"y","n")
+=IF("x","y","n")
+=IF(TRUE,,"n")
+=AND(TRUE,1)
+=AND(TRUE,0)
+=OR(FALSE,0)
+=NOT(0)
+=XOR(TRUE,TRUE,TRUE)
+=AND(TRUE,"x")
+=AND(FALSE,"x")
+=AND("x")
+=AND("")
+=OR(FALSE,"x")
+=OR(TRUE,"x")
+=XOR(TRUE,"x")
+=AND(TRUE,"FALSE")
+=OR(FALSE,"TRUE")
+=AND("TRUE")
+=AND(TRUE,"1")
+=OR(FALSE,"1")
+=IF(TRUE,)&"x"
+=CHOOSE(1,)&"x"
+;; =AND(A1:A2)
+=IFERROR(1/0,"caught")
+=IFERROR(1,"caught")
+=IFNA(NA(),"gone")
+=IFNA(1/0,"gone")
+=ISERROR(1/0)
+=ISERR(NA())
+=ISNA(NA())
+=ERROR.TYPE(1/0)
+=NA()
+=IFS(FALSE,1,TRUE,2)
+=SWITCH(2,1,"a",2,"b","z")
+
+# --- text ---
+=LEN("abc")
+=LEN(123)
+=LEFT("abc",2)
+=LEFT("abc")
+=RIGHT("abc",5)
+=MID("abcdef",3,2)
+=MID("abc",5,2)
+=TRIM("  a   b  ")
+=UPPER("aB")&LOWER("aB")&PROPER("hello world")
+=CONCATENATE("a","b")
+=CONCAT("a","b")
+=TEXTJOIN("-",TRUE,"a","","b")
+=TEXTJOIN("-",FALSE,"a","","b")
+=SUBSTITUTE("aaa","a","b")
+=SUBSTITUTE("aaa","a","b",2)
+=REPLACE("abcdef",2,3,"X")
+=FIND("b","abc")
+=FIND("B","abc")
+=SEARCH("B","abc")
+=SEARCH("b*","abc")
+=FIND("z","abc")
+=REPT("ab",3)
+=EXACT("a","A")
+=CHAR(65)&CODE("A")
+=VALUE("1.5")
+=VALUE("x")
+=VALUE("50%")
+=TEXT(1234.5,"#,##0.00")
+=TEXT(0.5,"0%")
+=TEXT(44000,"yyyy-mm-dd")
+=T("a")&"|"&T(1)
+=N("a")&"|"&N(TRUE)
+=TYPE("a")&TYPE(1)&TYPE(TRUE)
+
+# --- dates ---
+=DATE(2021,3,4)
+=DATE(2021,13,1)
+=DATE(2021,1,0)
+=YEAR(44259)
+=MONTH(44259)&"/"&DAY(44259)
+=WEEKDAY(44259)
+=WEEKDAY(44259,2)
+=EOMONTH(44259,0)
+=EDATE(44259,1)
+=DAYS(44259,44258)
+=TIME(12,30,0)
+=HOUR(0.5)&":"&MINUTE(0.5)&":"&SECOND(0.5)
+=DATEVALUE("2021-03-04")
+=DATE(2021,3,4)-DATE(2021,3,1)
+
+# --- errors travelling ---
+=1/0+1
+=SUM(1/0,1)
+Range("A1").Formula = "=1/0" ;; =SUM(A1,1)
+Range("A1").Formula = "=1/0" ;; =COUNT(A1)
+Range("A1").Formula = "=1/0" ;; =ISERROR(A1)
+=#N/A
+=#REF!
+=1+#VALUE!
+=NONSENSEFUNCTION(1)
+=UNKNOWNNAME
+=SUM(Sheet999!A1)
+
+# --- arrays ---
+=SUM({1,2,3})
+=SUM({1,2;3,4})
+={1,2}+{10,20}
+=INDEX({1,2;3,4},2,1)
+=SUMPRODUCT({1,2},{3,4})
+Range("A1").Value = 1: Range("A2").Value = 2 ;; =SUM(A1:A2*2)
+Range("A1").Value = 1: Range("A2").Value = 2 ;; =SUMPRODUCT(A1:A2,{10;20})
+=TRANSPOSE({1,2})
+
+# --- how a formula moves when it is written to a block ---
+Range("A1").Value = 1: Range("A2").Value = 2: Range("B1:B2").Formula = "=A1*10" ;; =B2
+Range("A1").Value = 1: Range("A2").Value = 2: Range("B1:B2").Formula = "=$A$1*10" ;; =B2
+Range("A1").Value = 1: Range("B1").Value = 2: Range("A2:B2").Formula = "=A1*10" ;; =B2
+Range("A1").Value = 5: Range("B1").Formula = "=A1": Range("B1").Copy Range("C2") ;; =FORMULATEXT(C2)
+
+# --- a sixteenth digit that ties, as text and in a comparison ---
+# A number typed into a formula keeps fifteen significant digits, so the
+# ties themselves are written to cells from VBA, which keeps every bit.
+Range("A1").Value = 4503599627370495# ;; =A1&""
+Range("A1").Value = -4503599627370495# ;; =A1&""
+Range("A1").Value = 4503599627370505# ;; =A1&""
+Range("A1").Value = -4503599627370505# ;; =A1&""
+Range("A1").Value = 123456789012345.5 ;; =A1&""
+Range("A1").Value = -123456789012345.5 ;; =A1&""
+Range("A1").Value = 4503599627370505#: Range("A2").Value = 4503599627370510# ;; =A1=A2
+Range("A1").Value = -4503599627370505#: Range("A2").Value = -4503599627370510# ;; =A1=A2
+Range("A1").Value = 4503599627370495#: Range("A2").Value = 4503599627370500# ;; =A1=A2
+Range("A1").Value = -4503599627370495#: Range("A2").Value = -4503599627370500# ;; =A1=A2
+Range("A1").Value = 4503599627370495#: Range("A2").Value = 4503599627370490# ;; =A1=A2
+Range("A1").Value = -4503599627370495#: Range("A2").Value = -4503599627370490# ;; =A1=A2
+Range("A1").Value = 123456789012345.5: Range("A2").Value = 123456789012346# ;; =A1=A2
+Range("A1").Value = -123456789012345.5: Range("A2").Value = -123456789012346# ;; =A1=A2
+Range("A1").Value = 4503599627370495# ;; =A1=4503599627370490
+=""&4503599627370495
+=""&-4503599627370495
+=""&4503599627370505
+=""&-4503599627370505
+=""&123456789012345.5
+=""&-123456789012345.5
+=""&123456789012346.5
+=""&-123456789012346.5
+=EXACT(4503599627370495,4503599627370490)
+=4503599627370505=4503599627370510
+=-4503599627370505=-4503599627370510
+=4503599627370495=4503599627370500
+=-4503599627370495=-4503599627370500
+=123456789012345.5=123456789012346
+=-123456789012345.5=-123456789012346
+=123456789012346.5=123456789012347
+=-123456789012346.5=-123456789012347
+
+# --- a range or an array where a function wants one value ---
+# A range is cut to the cell in the formula's own row or column, as @A1:A3
+# would be; an array written out, or an array a function answers, is run
+# through item by item. The formulas sit in rows other than the probe's.
+Range("A1:A3").Value = Application.Transpose(Array("x", "yy", "zzz")): Range("H2").Formula = "=LEN(A1:A3)" ;; =H2
+Range("A1:A3").Value = Application.Transpose(Array("x", "yy", "zzz")): Range("H3").Formula = "=LEN(A1:A3)" ;; =H3
+Range("A1:A3").Value = Application.Transpose(Array("x", "yy", "zzz")): Range("H5").Formula = "=LEN(A1:A3)" ;; =H5
+Range("A1:C1").Value = Array("x", "yy", "zzz"): Range("B4").Formula = "=LEN(A1:C1)" ;; =B4
+Range("A1:A3").Value = Application.Transpose(Array("x", "yy", "zzz")): Range("H2").Formula = "=UPPER(A1:A3)" ;; =H2
+Range("A1:A3").Value = Application.Transpose(Array("x", "yy", "zzz")): Range("H2").Formula = "=SUM(LEN(A1:A3))" ;; =H2
+Range("A1:A3").Value = Application.Transpose(Array("x", "yy", "zzz")): Range("H2").Formula = "=SUMPRODUCT(LEN(A1:A3))" ;; =H2
+Range("A1:A3").Value = Application.Transpose(Array(1.4, 2.6, 3.5)): Range("H3").Formula = "=SUM(ROUND(A1:A3,0))" ;; =H3
+Range("A1:A3").Value = Application.Transpose(Array(1.4, 2.6, 3.5)): Range("H3").Formula = "=SUMPRODUCT(ROUND(A1:A3,0))" ;; =H3
+Range("A1:A3").Value = Application.Transpose(Array(1, 2, 3)): Range("H2").Formula = "=SUM(IF(A1:A3>1,A1:A3,0))" ;; =H2
+Range("A1:A3").Value = Application.Transpose(Array(1, 2, 3)): Range("H2").Formula = "=SUMPRODUCT((A1:A3>1)*A1:A3)" ;; =H2
+Range("A1:A3").Value = Application.Transpose(Array(1, 2, 3)): Range("H2").Formula = "=A1:A3*10" ;; =H2
+Range("A1:A3").Value = Application.Transpose(Array(1, 2, 3)): Range("H2").Formula = "=ABS(-A1:A3)" ;; =H2
+=SUM(LEN({"a","bb","ccc"}))
+=UPPER({"a","b"})
+=SUM(ROUND({1.4,2.6},0))
+=SUM(IF({TRUE,FALSE,TRUE},{1,2,3},0))
+=SUM(MID("123",{1,2,3},1)*1)
+=INDEX({1,2;3,4},{1,2},1)
+=SUM(ABS({-1,2,-3}))
+=COUNT(ROUND({1.5,"x",2.5},0))
+=SUM(LEN(TRANSPOSE({"a","bb"})))
+=SUM(VALUE({"1","2"}))
+=MAX(LEN({"a","bbbb","cc"}))
+Range("A1:A4").Value = Application.Transpose(Array("a", "b", "a", "c")) ;; =SUM(COUNTIF(A1:A4,{"a","c"}))
+Range("A1:A4").Value = Application.Transpose(Array(5, 9, 2, 7)) ;; =SUM(LARGE(A1:A4,{1,2}))
+Range("A1:A4").Value = Application.Transpose(Array(5, 9, 2, 7)) ;; =SUM(SMALL(A1:A4,{1,2,3}))
+Range("A1:B3").Value = Array(1, "one"): Range("A2:B2").Value = Array(2, "two"): Range("A3:B3").Value = Array(3, "three") ;; =VLOOKUP({2,3},A1:B3,2,FALSE)
+Range("A1:A3").Value = Application.Transpose(Array("x", "y", "z")) ;; =SUM(MATCH({"z","y"},A1:A3,0))
+=CONCATENATE({"a","b"},"x")
+=TEXT({1,2},"0.0")
+=SUM(IFERROR({1,#N/A,3},10))
+=SUM(ISNUMBER({1,"a",3})*1)
+=SUM(EXACT({"a","B"},"a")*1)
+=SUM(DATE(2020,{1,2},1))
+=SUM(SUMIF({1,2,3},{1,3}))
+Range("A1:A3").Value = Application.Transpose(Array(1, "a", 3)): Range("H2").Formula = "=ISNUMBER(A1:A3)" ;; =H2
+Range("A1:A3").Value = Application.Transpose(Array("a", "b", "a")): Range("H3").Formula = "=COUNTIF(A1:A3,A1:A3)" ;; =H3
+Range("A1:A3").Value = Application.Transpose(Array(1, 2, 3)): Range("H2").Formula = "=OFFSET(A1,0,0,3,1)*10" ;; =H2
+Range("A1:A3").Value = Application.Transpose(Array(1, 2, 3)): Range("H3").Formula = "=IF(A1:A3>2,""big"",""small"")" ;; =H3
+Range("A1:A3").Value = Application.Transpose(Array(1, 2, 3)): Range("H2").Formula = "=ROUND(A1:A3/3,1)" ;; =H2
+Range("A1:A3").Value = Application.Transpose(Array(1, 2, 3)): Range("H5").Formula = "=SUM(LEN(A1:A3))" ;; =H5
+Range("A1:A3").Value = Application.Transpose(Array(1, 2, 3)): Range("H5").Formula = "=ISERROR(A1:A3)" ;; =H5
+Range("A1:A3").Value = Application.Transpose(Array(1, 2, 3)): Range("H5").Formula = "=ISREF(A1:A3)" ;; =H5
+Range("A1:A3").Value = Application.Transpose(Array(1, 2, 3)): Range("H2").Formula = "=INDEX(A1:A3,A1:A3)" ;; =H2
+Range("A1:A3").Value = Application.Transpose(Array(1, 2, 3)): Range("H2").Formula = "=ROW(A1:A3)" ;; =H2
+=SUM(IF({TRUE,FALSE},{1,2,3},0))
+=SUM(IF({TRUE,TRUE},{1;2},0))
+=SUM(IF({TRUE,FALSE},{1,2},{10;20}))
+=COUNT(IF({TRUE,FALSE},1))
+=SUM(IF({1,0,2},{1,2,3},{10,20,30}))
+=SUM(IF({"a",1},1,2))
+=SUM(LEN(MID("abcdef",{1,2,3},{1,2})))
+=SUM(LEN(MID("abcdef",{1;2},{1,2,3})))
+=SUM(ROUND({1.25;2.5},{0,1}))
+=SUM(ISERROR(1/{1,0,2})*1)
+=SUM(INDEX({1,2;3,4},{1,2},{1,2}))
+=SUM(INDEX({1,2;3,4},{1;2},{1,2}))
+=MATCH(3,3,0)
+=MATCH(3,3)
+=SUMPRODUCT(INDEX({1,2;3,4},{1,2},1))
+=SUM(IF({TRUE,TRUE},1,{1,2,3}))
+=SUM(CHOOSE({1,2,3},10,20,30))
+=SUM(CHOOSE({1;2},{1,2},{10,20}))
+Range("A1:A3").Value = Application.Transpose(Array(1, 2, 3)): Range("B1:B3").Value = Application.Transpose(Array(10, 20, 30)) ;; =SUM(CHOOSE({1,2},A1:A3,B1:B3))
+Range("A1:A3").Value = Application.Transpose(Array(1, 2, 3)): Range("B1:B3").Value = Application.Transpose(Array(10, 20, 30)) ;; =SUM(CHOOSE({1,1},A1:A3,B1:B3))
+Range("A1:A3").Value = Application.Transpose(Array(1, 2, 3)): Range("B1:B3").Value = Application.Transpose(Array("one", "two", "three")) ;; =VLOOKUP("two",CHOOSE({1,2},B1:B3,A1:A3),2,FALSE)
+Range("A1:A3").Value = Application.Transpose(Array(1, 2, 3)): Range("B1:B3").Value = Application.Transpose(Array(10, 20, 30)) ;; =SUMPRODUCT(CHOOSE({1,2},A1:A3,B1:B3))
+Range("A1:A3").Value = Application.Transpose(Array(1, 2, 3)): Range("B1:B3").Value = Application.Transpose(Array(10, 20, 30)) ;; =ROWS(CHOOSE({1,2},A1:A3,B1:B3))&"x"&COLUMNS(CHOOSE({1,2},A1:A3,B1:B3))
+=SUM(IFNA({1,#N/A,3},10))
+Range("A1:A3").Value = Application.Transpose(Array(1, 2, 3)): Range("B1:B3").Value = Application.Transpose(Array("one", "two", "three")): Range("H3").Formula = "=VLOOKUP(A1:A3,A1:B3,2,FALSE)" ;; =H3
+Range("A1:C1").Value = Array(1, 2, 3): Range("A2:C2").Value = Array(10, 20, 30): Range("C4").Formula = "=HLOOKUP(A1:C1,A1:C2,2,FALSE)" ;; =C4
+Range("A1:A3").Value = Application.Transpose(Array(1, 2, 3)): Range("B1:B3").Value = Application.Transpose(Array(10, 20, 30)): Range("H3").Formula = "=XLOOKUP(A1:A3,A1:A3,B1:B3)" ;; =H3
+Range("A1:A3").Value = Application.Transpose(Array(0, 1, 0)): Range("H2").Formula = "=IFS(A1:A3,""yes"",TRUE,""no"")" ;; =H2
+Range("A1:A3").Value = Application.Transpose(Array(1, 2, 3)): Range("H2").Formula = "=SWITCH(A1:A3,2,""two"",""other"")" ;; =H2
+Range("A1:A3").Value = Application.Transpose(Array(1, 2, 3)): Range("H2").Formula = "=IFERROR(A1:A3,0)" ;; =H2
+Range("A1:A3").Value = Application.Transpose(Array(1, 2, 3)): Range("H2").Formula = "=IFNA(A1:A3,0)" ;; =H2
+# Each function run on an array where it wants one value, summed, so one
+# that took only the first item would come out different.
+=SUM(ABS({-1,-2}))
+=SUM(CEILING({1.2,2.2},1))
+=SUM(CEILING.MATH({1.2,2.2}))
+=SUM(FLOOR({1.2,2.2},1))
+=SUM(FLOOR.MATH({1.2,2.2}))
+=SUM(INT({1.5,2.5}))
+=SUM(TRUNC({1.5,2.5}))
+=SUM(ROUNDDOWN({1.5,2.5},0))
+=SUM(ROUNDUP({1.5,2.5},0))
+=SUM(MROUND({1,4},3))
+=SUM(MOD({5,7},3))
+=SUM(POWER({2,3},2))
+=SUM(SQRT({4,9}))
+=SUM(EXP({0,0}))
+=SUM(LN({1,2.718281828459045}))
+=SUM(LOG({10,100}))
+=SUM(LOG10({10,100}))
+=SUM(SIGN({-5,5,5}))
+=SUM(RANDBETWEEN({1,2},{1,2}))
+=SUM(LEN(CHAR({65,66})))
+=SUM(CODE({"A","B"}))
+=SUM(LEN(CONCATENATE({"a","bb"},"x")))
+=SUM(EXACT({"a","a"},"a")*1)
+=SUM(FIND({"a","b"},"ab"))
+=SUM(SEARCH({"a","b"},"ab"))
+=SUM(LEN(LEFT("abc",{1,2})))
+=SUM(LEN(RIGHT("abc",{1,2})))
+=SUM(LEN(LOWER({"A","BB"})))
+=SUM(LEN(UPPER({"a","bb"})))
+=SUM(LEN(PROPER({"a","bb"})))
+=SUM(LEN(REPLACE("abc",{1,2},1,"")))
+=SUM(LEN(REPT("a",{1,2})))
+=SUM(LEN(SUBSTITUTE({"aa","aaa"},"a","b")))
+=SUM(LEN(TEXT({1,22},"0.0")))
+=SUM(LEN(TRIM({" a","bb "})))
+=SUM(DATEVALUE({"1/1/2020","1/2/2020"}))
+=SUM(DAY({1,2}))
+=SUM(DAYS({10,20},1))
+=SUM(EDATE(45000,{0,1}))
+=SUM(EOMONTH(45000,{0,1}))
+=SUM(HOUR({0.5,0.75}))
+=SUM(MINUTE({0.0416666666666667,0.0423611111111111}))
+=SUM(SECOND({0.0000115740740740741,0.0000231481481481481}))
+=SUM(TIME({1,2},0,0))*24
+=SUM(MONTH({1,40}))
+=SUM(YEAR({1,400}))
+=SUM(WEEKDAY({1,2}))
+=SUM(ISBLANK({1,2})+1)
+=SUM(ISERR({1,#DIV/0!})*1)
+=SUM(ISLOGICAL({1,TRUE})*1)
+=SUM(ISNA({1,#N/A})*1)
+=SUM(ISNONTEXT({"a",1})*1)
+=SUM(ISTEXT({1,"a"})*1)
+=SUM(ERROR.TYPE({#DIV/0!,#N/A}))
+=SUM(NOT({TRUE,FALSE})*1)
+=SUM(LEN(ADDRESS({1,10},1)))
+Range("A1:A3").Value = Application.Transpose(Array(1, 2, 3)): Range("B1:B3").Value = Application.Transpose(Array("one", "two", "three")) ;; =SUM(LEN(VLOOKUP({2,3},A1:B3,2,FALSE)))
+Range("A1:C1").Value = Array(1, 10, 100): Range("A2:C2").Value = Array(2, 20, 200): Range("A3:C3").Value = Array(3, 30, 300) ;; =SUM(VLOOKUP(2,A1:C3,{2,3},FALSE))
+Range("A1:C1").Value = Array(1, 10, 100): Range("A2:C2").Value = Array(2, 20, 200): Range("A3:C3").Value = Array(3, 30, 300) ;; =SUM(VLOOKUP(2,A1:C3,2,{FALSE,TRUE}))
+Range("A1:C1").Value = Array(1, 2, 3): Range("A2:C2").Value = Array(10, 20, 30) ;; =SUM(HLOOKUP({2,3},A1:C2,2,FALSE))
+Range("A1:A3").Value = Application.Transpose(Array(1, 2, 3)) ;; =SUM(MATCH(2,A1:A3,{0,1}))
+Range("A1:A3").Value = Application.Transpose(Array(1, 2, 3)): Range("B1:B3").Value = Application.Transpose(Array(10, 20, 30)) ;; =SUM(XLOOKUP({2,3},A1:A3,B1:B3))
+Range("A1:A3").Value = Application.Transpose(Array(1, 2, 3)) ;; =SUM(SUMIF(A1:A3,{1,3}))
+Range("A1:A3").Value = Application.Transpose(Array(1, 2, 3)) ;; =SUM(AVERAGEIF(A1:A3,{1,3}))
+Range("A1:A3").Value = Application.Transpose(Array(1, 2, 3)) ;; =SUM(COUNTIFS(A1:A3,{1,3}))
+Range("A1:A3").Value = Application.Transpose(Array(1, 2, 3)) ;; =SUM(SUMIFS(A1:A3,A1:A3,{1,3}))
+
+# --- a formula whose whole answer is cells ---
+# The cell a formula sits in wants one value too.
+Range("A1:A3").Value = Application.Transpose(Array(1, 2, 3)): Range("H2").Formula = "=A1:A3" ;; =H2
+Range("A1:A3").Value = Application.Transpose(Array(1, 2, 3)): Range("H5").Formula = "=A1:A3" ;; =H5
+Range("A1:A3").Value = Application.Transpose(Array(1, 2, 3)): Range("H3").Formula = "=-A1:A3" ;; =H3
+Range("A1:A3").Value = Application.Transpose(Array(1, 2, 3)): Range("H3").Formula = "=A1:A3&""""" ;; =H3
+Range("A1:A3").Value = Application.Transpose(Array(1, 2, 3)): Range("H2").Formula = "=(A1:A3)" ;; =H2
+Range("A1:A3").Value = Application.Transpose(Array(1, 2, 3)): Range("H2").Formula = "=OFFSET(A1,0,0,3,1)" ;; =H2
+Range("A1:A3").Value = Application.Transpose(Array(1, 2, 3)): Range("H3").Formula = "=INDEX(A1:A3,0)" ;; =H3
+Range("A1:A3").Value = Application.Transpose(Array(1, 2, 3)): Range("H2").Formula = "=IF(TRUE,A1:A3)" ;; =H2
+Range("A1:A3").Value = Application.Transpose(Array(1, 2, 3)): Range("H2").Formula = "=CHOOSE(1,A1:A3)" ;; =H2
+Range("A1:C1").Value = Array(1, 2, 3): Range("B4").Formula = "=A1:C1" ;; =B4
+Range("A1:A3").Value = Application.Transpose(Array(1, 2, 3)): Range("H2").Formula = "=(A1:A3,A1)" ;; =H2
+Range("A1:A3").Value = Application.Transpose(Array(1, 2, 3)): Range("H3").Formula = "=SUM(A1:A3)+A1:A3" ;; =H3
+
+# --- an operator's answer where a function takes cells ---
+# In a cell an operator cuts its cells down first, so SUM(A1:A3*2) is
+# SUM(A2*2) in row 2; SUMPRODUCT works its arguments out as arrays.
+Range("A1:A3").Value = Application.Transpose(Array(1, 2, 3)): Range("H5").Formula = "=SUM(A1:A3*2)" ;; =H5
+Range("A1:A3").Value = Application.Transpose(Array(1, 2, 3)): Range("H2").Formula = "=SUM(A1:A3*2)" ;; =H2
+Range("A1:A3").Value = Application.Transpose(Array(1, 2, 3)): Range("H5").Formula = "=MAX(A1:A3*2)" ;; =H5
+Range("A1:A3").Value = Application.Transpose(Array(1, 2, 3)): Range("H5").Formula = "=COUNT(A1:A3*2)" ;; =H5
+Range("A1:A3").Value = Application.Transpose(Array(1, 2, 3)): Range("H5").Formula = "=COUNTA(A1:A3*2)" ;; =H5
+Range("A1:A3").Value = Application.Transpose(Array(1, 2, 3)): Range("H5").Formula = "=AVERAGE(A1:A3*2)" ;; =H5
+Range("A1:A3").Value = Application.Transpose(Array(1, 2, 3)): Range("H5").Formula = "=PRODUCT(A1:A3*2)" ;; =H5
+Range("A1:A3").Value = Application.Transpose(Array(1, 2, 3)): Range("H5").Formula = "=MEDIAN(A1:A3*2)" ;; =H5
+Range("A1:A3").Value = Application.Transpose(Array(1, 2, 3)): Range("H5").Formula = "=LARGE(A1:A3*2,1)" ;; =H5
+Range("A1:A3").Value = Application.Transpose(Array(1, 2, 3)): Range("H5").Formula = "=AND(A1:A3>0)" ;; =H5
+Range("A1:A3").Value = Application.Transpose(Array(1, 2, 3)): Range("H2").Formula = "=OR(A1:A3>2)" ;; =H2
+Range("A1:A3").Value = Application.Transpose(Array(1, 2, 3)): Range("H5").Formula = "=INDEX(A1:A3*2,2)" ;; =H5
+Range("A1:A3").Value = Application.Transpose(Array(1, 2, 3)): Range("H5").Formula = "=MATCH(4,A1:A3*2,0)" ;; =H5
+Range("A1:A3").Value = Application.Transpose(Array(1, 2, 3)): Range("H5").Formula = "=ROWS(A1:A3*2)" ;; =H5
+Range("A1:A3").Value = Application.Transpose(Array(1, 2, 3)): Range("H5").Formula = "=SUM(TRANSPOSE(A1:A3*2))" ;; =H5
+Range("A1:A3").Value = Application.Transpose(Array(1, 2, 3)): Range("H5").Formula = "=CONCAT(A1:A3&""x"")" ;; =H5
+Range("A1:A3").Value = Application.Transpose(Array(1, 2, 3)): Range("H5").Formula = "=TEXTJOIN("","",TRUE,A1:A3&""x"")" ;; =H5
+Range("A1:A3").Value = Application.Transpose(Array(1, 2, 3)): Range("H5").Formula = "=N(A1:A3)" ;; =H5
+Range("A1:A3").Value = Application.Transpose(Array(1, 2, 3)): Range("H5").Formula = "=SUMPRODUCT(IF(A1:A3>1,1,0))" ;; =H5
+Range("A1:A3").Value = Application.Transpose(Array(1, 2, 3)): Range("H2").Formula = "=SUMPRODUCT(IF(A1:A3>1,1,0))" ;; =H2
+Range("A1:A3").Value = Application.Transpose(Array(1, 2, 3)): Range("H5").Formula = "=SUMPRODUCT(--(A1:A3>1))" ;; =H5
+Range("A1:A3").Value = Application.Transpose(Array(1, 2, 3)): Range("H5").Formula = "=SUMPRODUCT(CHOOSE(1,A1:A3*2))" ;; =H5
+Range("A1:A3").Value = Application.Transpose(Array(1, 2, 3)): Range("H5").Formula = "=SUMPRODUCT(IFERROR(1/(A1:A3-2),0))" ;; =H5
+Range("A1:A3").Value = Application.Transpose(Array(1, 2, 3)): Range("H5").Formula = "=SUMPRODUCT(SUMIF(A1:A3,A1:A3))" ;; =H5
+Range("A1:A3").Value = Application.Transpose(Array("a", "b", "a")): Range("H5").Formula = "=SUMPRODUCT(1/COUNTIF(A1:A3,A1:A3))" ;; =H5
+Range("A1:A3").Value = Application.Transpose(Array(1, 2, 3)): Range("H5").Formula = "=SUMPRODUCT(INDEX(A1:A3*2,0))" ;; =H5
+Range("A1:A3").Value = Application.Transpose(Array(1, "a", 3)): Range("H5").Formula = "=SUMPRODUCT(ISNUMBER(A1:A3)*1)" ;; =H5
+Range("A1:A3").Value = Application.Transpose(Array(1, 2, 3)): Range("H5").Formula = "=SUMPRODUCT(MAX(A1:A3*2))" ;; =H5
+Range("A1:A3").Value = Application.Transpose(Array(1, 2, 3)): Range("H5").Formula = "=SUMPRODUCT(ROW(A1:A3))" ;; =H5
+Range("A1:A3").Value = Application.Transpose(Array(1, 2, 3)): Range("H5").Formula = "=SUMPRODUCT(IFERROR(A1:A3*2,0))" ;; =H5
+Range("A1:A3").Value = Application.Transpose(Array(1, 2, 3)): Range("H5").Formula = "=SUMPRODUCT(IF(TRUE,A1:A3*2))" ;; =H5
+Range("A1:A3").Value = Application.Transpose(Array(1, 2, 3)): Range("H5").Formula = "=INDEX(IF(A1:A3>1,A1:A3,0),2)" ;; =H5
+Range("A1:A3").Value = Application.Transpose(Array(1, 2, 3)): Range("H5").Formula = "=ROWS(IF(A1:A3>1,1,0))" ;; =H5
+Range("A1:C1").Value = Array(1, 2, 3): Range("E5").Formula = "=COLUMNS(A1:C1*2)" ;; =E5
+Range("A1:A3").Value = Application.Transpose(Array(1, 2, 3)): Range("H5").Formula = "=SUMPRODUCT(IFNA(A1:A3*2,0))" ;; =H5
+Range("A1:A3").Value = Application.Transpose(Array(1, 2, 3)): Range("H5").Formula = "=SUMPRODUCT(IFS(TRUE,A1:A3*2))" ;; =H5
+Range("A1:A3").Value = Application.Transpose(Array(1, 2, 3)): Range("H5").Formula = "=SUMPRODUCT(SWITCH(1,1,A1:A3*2))" ;; =H5
+Range("A1:A3").Value = Application.Transpose(Array(1, 2, 3)): Range("H5").Formula = "=SUMPRODUCT(LARGE(A1:A3,{1,2}))" ;; =H5
+Range("A1:A3").Value = Application.Transpose(Array(1, 2, 3)): Range("H5").Formula = "=SUM(ROW(A1:A3))" ;; =H5
+Range("A1:C1").Value = Array(1, 2, 3): Range("E5").Formula = "=SUM(COLUMN(A1:C1))" ;; =E5
+;; =ROWS(#REF!)
+;; =COLUMNS(#N/A)
+;; =ROWS({1,#N/A;2,3})
+;; =COLUMNS({1,#N/A})
+
+# --- a defined name for cells or for a formula ---
+Range("A1:A3").Value = Application.Transpose(Array(1, 2, 3)): ActiveWorkbook.Names.Add Name:="dbl", RefersTo:="=$A$1:$A$3*2": Range("H5").Formula = "=SUM(dbl)" ;; =H5
+Range("A1:A3").Value = Application.Transpose(Array(1, 2, 3)): ActiveWorkbook.Names.Add Name:="dbl", RefersTo:="=$A$1:$A$3*2": Range("H2").Formula = "=dbl" ;; =H2
+Range("A1:A3").Value = Application.Transpose(Array("x", "yy", "zzz")): ActiveWorkbook.Names.Add Name:="lens", RefersTo:="=LEN($A$1:$A$3)": Range("H5").Formula = "=SUM(lens)" ;; =H5
+Range("A1:A3").Value = Application.Transpose(Array(1, 2, 3)): ActiveWorkbook.Names.Add Name:="block", RefersTo:="=$A$1:$A$3": Range("H2").Formula = "=block" ;; =H2
+Range("A1:A3").Value = Application.Transpose(Array("x", "yy", "zzz")): ActiveWorkbook.Names.Add Name:="block", RefersTo:="=$A$1:$A$3": Range("H5").Formula = "=LEN(block)" ;; =H5
+Range("A1:A3").Value = Application.Transpose(Array(1, 2, 3)): ActiveWorkbook.Names.Add Name:="flags", RefersTo:="=IF($A$1:$A$3>1,1,0)": Range("H5").Formula = "=SUM(flags)" ;; =H5
+Range("A1:A3").Value = Application.Transpose(Array(1, 2, 3)): ActiveWorkbook.Names.Add Name:="dbl", RefersTo:="=$A$1:$A$3*2": Range("H5").Formula = "=COUNTIF(dbl,4)" ;; =H5
+
+# --- arguments that have to be cells ---
+# Excel will not take the formula at all (error 1004) when a value stands
+# where one of these functions reads cells.
+=COUNTIF({1,2,3},1)
+=COUNTIF(5,5)
+=COUNTIF("a","a")
+Range("A1:A3").Value = Application.Transpose(Array(1, 2, 3)) ;; =COUNTIF(A1:A3*1,1)
+Range("A1:A3").Value = Application.Transpose(Array(1, 2, 3)) ;; =SUMIF(A1:A3,1,{1,2,3})
+Range("A1:A3").Value = Application.Transpose(Array(1, 2, 3)) ;; =SUMIF(A1:A3*1,1)
+Range("A1:A3").Value = Application.Transpose(Array(1, 2, 3)) ;; =SUMIF(A1:A3,1,B1:B3*1)
+Range("A1:A3").Value = Application.Transpose(Array(1, 2, 3)) ;; =SUMIF(LEN(A1:A3),1)
+Range("A1:A3").Value = Application.Transpose(Array(1, 2, 3)) ;; =SUMIF((A1:A3),1)
+Range("A1:A3").Value = Application.Transpose(Array(1, 2, 3)) ;; =SUMIFS({1,2},A1:A2,1)
+Range("A1:A3").Value = Application.Transpose(Array(1, 2, 3)) ;; =SUMIFS(A1:A2,{1,2},1)
+Range("A1:A3").Value = Application.Transpose(Array(1, 2, 3)) ;; =SUMIFS(A1:A2,A1:A2,1,{1,2},1)
+=COUNTIFS({1,2},1)
+Range("A1:A3").Value = Application.Transpose(Array(1, 2, 3)) ;; =COUNTIFS(A1:A2,1,{1,2},1)
+=AVERAGEIF({1,2},1)
+Range("A1:A3").Value = Application.Transpose(Array(1, 2, 3)) ;; =AVERAGEIF(A1:A2,1,{1,2})
+Range("A1:A3").Value = Application.Transpose(Array(1, 2, 3)) ;; =AVERAGEIFS({1,2},A1:A2,1)
+Range("A1:A3").Value = Application.Transpose(Array(1, 2, 3)) ;; =AVERAGEIFS(A1:A2,{1,2},1)
+Range("A1:A3").Value = Application.Transpose(Array(1, 2, 3)) ;; =COUNTIF(OFFSET(A1,0,0,3,1),1)
+Range("A1:A3").Value = Application.Transpose(Array(1, 2, 3)) ;; =COUNTIF(IF(TRUE,A1:A3),1)
+Range("A1:A3").Value = Application.Transpose(Array(1, 2, 3)) ;; =COUNTIF(A1:A3 A2:A3,2)
+=COUNTBLANK({1,2})
+=OFFSET({1,2},0,0)
+=ROW({1,2})
+=AREAS({1,2})
+=COLUMN({1,2})
+Range("A1:A3").Value = Application.Transpose(Array(1, 2, 3)) ;; =SUBTOTAL(9,LEN(A1))
+Range("A1:A3").Value = Application.Transpose(Array(1, 2, 3)) ;; =COUNTIF(INDIRECT("A1:A3"),1)
+Range("A1:A3").Value = Application.Transpose(Array(1, 2, 3)) ;; =COUNTIF(INDEX(A1:A3,0),1)
+Range("A1:A3").Value = Application.Transpose(Array(1, 2, 3)) ;; =COUNTIF(CHOOSE(1,A1:A3),1)
+Range("A1:A3").Value = Application.Transpose(Array(1, 2, 3)) ;; =COUNTIF(XLOOKUP(2,A1:A3,A1:A3),2)
+Range("A1:A3").Value = Application.Transpose(Array(1, 2, 3)) ;; =COUNTIF(IFS(TRUE,A1:A3),1)
+Range("A1:A3").Value = Application.Transpose(Array(1, 2, 3)) ;; =COUNTIF(SWITCH(1,1,A1:A3),1)
+Range("A1:A3").Value = Application.Transpose(Array(1, 2, 3)) ;; =COUNTIF(IFERROR(A1:A3,A1:A3),1)
+Range("A1:A3").Value = Application.Transpose(Array(1, 2, 3)) ;; =COUNTIF(SUM(A1:A3),1)
+Range("A1:A3").Value = Application.Transpose(Array(1, 2, 3)) ;; =COUNTIF(IF(TRUE,5),5)
+Range("A1:A3").Value = Application.Transpose(Array(1, 2, 3)) ;; =COUNTIF(CHOOSE(1,5),5)
+
+# --- INDEX with one index over cells in rows and columns: #REF!, unless the column is written and left empty ---
+Range("A1").Value = 1: Range("B1").Value = 2: Range("A2").Value = 3: Range("B2").Value = 4 ;; =INDEX(A1:B2,2)
+Range("A1").Value = 1: Range("B1").Value = 2: Range("A2").Value = 3: Range("B2").Value = 4 ;; =SUM(INDEX(A1:B2,2))
+Range("A1").Value = 1: Range("B1").Value = 2: Range("A2").Value = 3: Range("B2").Value = 4 ;; =ISREF(INDEX(A1:B2,2))
+Range("A1").Value = 1: Range("B1").Value = 2: Range("A2").Value = 3: Range("B2").Value = 4 ;; =ROWS(INDEX(A1:B2,0))
+Range("A1").Value = 1: Range("B1").Value = 2: Range("A2").Value = 3: Range("B2").Value = 4 ;; =INDEX(A1:B2,2,)
+Range("A1").Value = 1: Range("B1").Value = 2: Range("A2").Value = 3: Range("B2").Value = 4 ;; =SUM(INDEX(A1:B2,2,))
+Range("A1").Value = 1: Range("B1").Value = 2: Range("A2").Value = 3: Range("B2").Value = 4 ;; =SUM(INDEX(A1:B2,,2))
+Range("A1").Value = 1: Range("B1").Value = 2: Range("A2").Value = 3: Range("B2").Value = 4 ;; =ROWS(INDEX(A1:B2,,2))
+Range("A1").Value = 1: Range("B1").Value = 2 ;; =INDEX(A1:B1,2)
+=INDEX({1,2;3,4},2)
+=SUM(INDEX({1,2;3,4},2))
+
+# --- a sign or brackets round a reference ---
+Range("A1:A3").Value = Application.Transpose(Array(1, 2, 3)) ;; =ISREF(+A1)
+Range("A1:A3").Value = Application.Transpose(Array(1, 2, 3)) ;; =ISREF(+A1:A3)
+Range("A1:A3").Value = Application.Transpose(Array(1, 2, 3)) ;; =ISREF((A1:A3))
+Range("A1:A3").Value = Application.Transpose(Array(1, 2, 3)) ;; =ISREF(-A1)
+Range("A1:A3").Value = Application.Transpose(Array(1, 2, 3)) ;; =COUNTIF(+A1:A3,1)
+Range("A1:A3").Value = Application.Transpose(Array(1, 2, 3)) ;; =COUNTIF((A1:A3),1)
+Range("A1:A3").Value = Application.Transpose(Array(1, 2, 3)) ;; =ROWS(+A1:A3)
+Range("A1:A3").Value = Application.Transpose(Array(1, 2, 3)) ;; =SUM(+A1:A3)
+Range("A1:A3").Value = Application.Transpose(Array(1, 2, 3)) ;; =+A1:A3
+Range("A1:A3").Value = Application.Transpose(Array(1, 2, 3)) ;; =INDEX(+A1:A3,2)
+Range("A1:A3").Value = Application.Transpose(Array(1, 2, 3)) ;; =OFFSET(+A1,1,0)
+Range("A1:A3").Value = Application.Transpose(Array(1, 2, 3)) ;; =ROW(+A2)
+Range("A1:A3").Value = Application.Transpose(Array(1, 2, 3)) ;; =SUMPRODUCT(+A1:A3)
+Range("A1:A3").Value = Application.Transpose(Array(1, 2, 3)) ;; =ISREF(++A1)
+Range("A1").Value = "x" ;; =+A1
+
+# --- database functions over a database or criteria of one row (cells_functions.json) ---
+Range("A1").Value = "h": Range("A2").Value = 5: Range("A3").Value = 7: Range("C1").Value = "h": Range("C2").Value = ">0" ;; =DSUM(A1:A3,1,C1:C2)
+Range("A1").Value = "h": Range("A2").Value = 5: Range("A3").Value = 7: Range("C1").Value = "h": Range("C2").Value = ">0" ;; =DSUM(A1:A3,1,C1)
+Range("A1").Value = "h": Range("A2").Value = 5: Range("A3").Value = 7: Range("C1").Value = "h": Range("C2").Value = ">0" ;; =DSUM(A1:A3,1,C1:C3)
+Range("A1").Value = "h": Range("A2").Value = 5: Range("A3").Value = 7: Range("C1").Value = "h": Range("C2").Value = ">0" ;; =DSUM(A1,1,C1:C2)
+Range("A1").Value = "h": Range("A2").Value = 5: Range("A3").Value = 7: Range("C1").Value = "h": Range("C2").Value = ">0" ;; =DSUM(A1:A3,"h",C1:C2)
+Range("A1").Value = "h": Range("A2").Value = 5: Range("A3").Value = 7: Range("C1").Value = "h": Range("C2").Value = ">0" ;; =DSUM(A1:A3,"x",C1:C2)
+Range("A1").Value = "h": Range("A2").Value = 5: Range("A3").Value = 7: Range("C1").Value = "h": Range("C2").Value = ">0" ;; =DSUM(A1:A3,2,C1:C2)
+Range("A1").Value = "h": Range("A2").Value = 5: Range("A3").Value = 7: Range("C1").Value = "h": Range("C2").Value = ">0" ;; =DCOUNT(A1:A3,,C1:C2)
+Range("A1").Value = "h": Range("A2").Value = 5: Range("A3").Value = 7: Range("C1").Value = "h": Range("C2").Value = ">0" ;; =DCOUNT(A1:A3,1,C1)
+Range("A1").Value = "h": Range("A2").Value = 5: Range("A3").Value = 7: Range("C1").Value = "h": Range("C2").Value = ">0" ;; =DAVERAGE(A1,1,C1:C2)
+Range("A1").Value = "h": Range("A2").Value = 5: Range("A3").Value = 7: Range("C1").Value = "h": Range("C2").Value = ">0" ;; =DGET(A1:A3,1,C1:C2)
+Range("E1").Value = 1: Range("E2").Value = 5: Range("F1").Value = 1 ;; =DSUM(E1:E2,1,F1:F2)
+Range("E1").Value = 1: Range("E2").Value = 5: Range("F1").Value = 1 ;; =DSUM(E1:E2,1,F1)
+Range("E1").Value = 1: Range("E2").Value = 5: Range("F1").Value = 1 ;; =DSUM(E1,1,F1:F2)
+Range("E1").Value = 1: Range("E2").Value = 5: Range("F1").Value = 1 ;; =DSUM(E1,1,F1)
+Range("E1").Value = "h": Range("E2").Value = 5: Range("F1").Value = "h" ;; =DSUM(E1,1,F1)
+Range("E1").Value = "h": Range("E2").Value = 5: Range("F1").Value = "h" ;; =DCOUNTA(E1:E2,1,F1)
+
+# --- DROP and TAKE of everything, XIRR, ACCRINTM, AMORDEGRC's life, CELL's info type, BINOM.INV's bounds ---
+=DROP(1,1)
+=DROP({1;2},2)
+=DROP({1;2},3)
+=DROP({1,2},,2)
+=DROP({1;2},-2)
+=TAKE({1;2},0)
+=DROP({1;2},1)
+=XIRR(1,1)
+=XIRR({-1,2},{1,2})
+=XIRR({1},{1})
+=XIRR({-1},{1})
+=XIRR({1,2},{1,2})
+=ACCRINTM(1,1,1,1)
+=ACCRINTM(1,2,1,1)
+=ACCRINTM(2,1,1,1)
+=AMORDEGRC(1,1,1,1,1,1)
+=AMORDEGRC(1000,1,100,100,1,2)
+=AMORDEGRC(1000,1,100,100,1,1)
+=AMORDEGRC(1000,1,100,100,1,0.5)
+=AMORDEGRC(1000,1,100,100,1,0.4)
+=AMORDEGRC(1000,1,100,100,1,0.3)
+=AMORDEGRC(1000,1,100,100,1,0.25)
+=AMORDEGRC(1000,1,100,100,1,0.22)
+=AMORDEGRC(1000,1,100,100,1,0.2)
+=AMORDEGRC(1000,1,100,100,1,0.15)
+=CELL(1)
+=CELL(TRUE)
+=CELL("foo")
+Range("A1").Value = 1 ;; =CELL("foo",A1)
+Range("A1").Value = 1 ;; =CELL("row",A1)
+=BINOM.INV(1,1,1)
+=BINOM.INV(1,1,0.5)
+=BINOM.INV(1,0.5,1)
+=BINOM.INV(1,0,0.5)
+=BINOM.INV(1,0.5,0)
+=BINOM.INV(2,1,0.5)
+=CRITBINOM(1,0.5,1)
+=CRITBINOM(1,1,0.5)
+
+# --- written as a call: a LAMBDA where it is made, ANCHORARRAY and SINGLE ---
+=LAMBDA(x,x*2)(5)
+Range("A1").Value = 5 ;; =ANCHORARRAY(A1)
+Range("A1").Value = 5 ;; =SINGLE(A1)

@@ -1,0 +1,229 @@
+"""What a chart reads from cells follows those cells as they move, as live Excel has it
+(tests/fixtures/chart_references.json).
+
+The movers work out what every reference becomes before anything moves, and carry it out afterwards. A point's look
+and label stay with its cell, and moved to another place they lose their unique ids. A series' values becoming #REF!
+take its points' looks and labels with them (tests/fixtures/chart_lost_cells.json). A chart read from a file keeps its
+part, with only the references in it rewritten (tests/fixtures/loaded_chart_references.json). Its points keep the
+numbers the part gives them, as Excel keeps them, and a reference whose cells all go reads #REF! in the part with its
+cached points kept, while the series still reads it as it was (tests/fixtures/chart_shift_losses.json). An error bar
+whose cells go reads #REF! too, in a chart made in the session as in one from a file."""
+from __future__ import annotations
+
+import re
+from collections.abc import Callable
+from typing import TYPE_CHECKING
+
+from pyopenvba._a1 import column_letter, parse_reference, quote_sheet
+from pyopenvba._xml import escape_text, unescape
+from pyopenvba.formula._parse import split_sheet, tokenize
+
+if TYPE_CHECKING:
+    from pyopenvba.apps.excel._charts import ChartState, SeriesState
+    from pyopenvba.apps.excel._model import Workbook, Worksheet
+
+#: A reference and the sheet whose formulas it reads as if it were one of, to what it becomes.
+Change = Callable[[str, str], str]
+Step = Callable[[], None]
+#: A point's label that has lost its unique id, and still has to be written.
+NO_ID = -2
+#: A reference where a chart part spells one.
+_PART_REFERENCE = re.compile(r'<((?:\w+:)?f|c15:sqref)>(.*?)</\1>', re.DOTALL)
+
+
+def renamed(formula: str, old: str, new: str) -> str:
+    """``formula`` with its references to the sheet ``old`` naming it ``new``."""
+    pieces: list[tuple[int, int, str]] = []
+    for token in tokenize(formula):
+        if token.kind != 'ref':
+            continue
+        sheet, reference = split_sheet(token.text)
+        if sheet and sheet.casefold() == old.casefold():
+            pieces.append((token.at, token.at + len(token.text), f'{quote_sheet(new)}!{reference}'))
+    for first, last, replacement in reversed(pieces):
+        formula = formula[:first] + replacement + formula[last:]
+    return formula
+
+
+def _slots(state: ChartState) -> list[tuple[object, str]]:
+    """Where a chart keeps references: its series', and its titles' links."""
+    slots: list[tuple[object, str]] = [(state.title_look, 'formula')]
+    for axis in state.axes.values():
+        if axis.title is not None:
+            slots.append((axis.title.look, 'formula'))
+    for entry in state.full_series or state.series:
+        slots += [(entry, 'name_reference'), (entry, 'category_reference'), (entry, 'value_reference')]
+    return slots
+
+
+def _single(reference: str) -> tuple[str, int, int, int, int] | None:
+    """A reference to one area, as its sheet's prefix and its corners; None for another."""
+    try:
+        areas = parse_reference(reference)
+    except ValueError:
+        return None
+    if len(areas) != 1 or '!' not in reference:
+        return None
+    area = areas[0]
+    return reference.rsplit('!', 1)[0] + '!', area.top, area.left, area.bottom, area.right
+
+
+def _points_step(state: ChartState, sheet: str, change: Change) -> Step | None:
+    """Each point's look and label going with its cell: to the place among a series' cells it lands on, that
+    series' or another's, and gone where it lands among none (tests/fixtures/chart_shift_losses*.json)."""
+    entries = state.full_series or state.series
+    if not any(entry.points for entry in entries):
+        return None
+    after = [_single(change(f'={entry.value_reference}', sheet)[1:]) if entry.value_reference else None
+             for entry in entries]
+    landings: list[tuple[SeriesState, int, SeriesState, int]] = []
+    for entry in entries:
+        before = _single(entry.value_reference) if entry.points else None
+        if before is None:
+            continue
+        prefix, top, left, bottom, right = before
+        down = bottom > top
+        for index in entry.points:
+            row, column = (top + index, left) if down else (top, left + index)
+            if row > bottom or column > right:
+                continue
+            cell = _single(change(f'={prefix}${column_letter(column)}${row}', sheet)[1:])
+            if cell is None:
+                continue
+            for target, area in zip(entries, after, strict=True):
+                if area is None or area[0] != cell[0]:
+                    continue
+                _, new_top, new_left, new_bottom, new_right = area
+                if new_top <= cell[1] <= new_bottom and new_left <= cell[2] <= new_right:
+                    place = cell[1] - new_top if new_bottom > new_top else cell[2] - new_left
+                    landings.append((entry, index, target, place))
+                    break
+    if len(landings) == sum(len(entry.points) for entry in entries) and all(
+            entry is target and index == place for entry, index, target, place in landings):
+        return None
+
+    def step() -> None:
+        moved = [(target, place, entry.points[index], entry is target and index == place)
+                 for entry, index, target, place in landings]
+        for entry in entries:
+            entry.points = {}
+        for target, place, point, kept in moved:
+            if not kept:
+                point.unique = -1
+                if point.label_unique >= 0:
+                    point.label_unique = NO_ID
+            target.points[place] = point
+    return step
+
+
+def _values_gone(entry: SeriesState) -> Step:
+    """What goes with a series' values: its points' looks and labels, its labels and its own look."""
+    def step() -> None:
+        entry.points = {}
+        entry.data_labels = False
+        entry.format_look = None
+    return step
+
+
+def _categories_gone(sheet: Worksheet, entry: SeriesState) -> Step:
+    from pyopenvba.apps.excel._charts import lost, referenced_values
+
+    numbers = not lost(entry.category_reference) and all(
+        isinstance(value, (int, float)) and not isinstance(value, bool)
+        for value in referenced_values(sheet, entry.category_reference))
+
+    def step() -> None:
+        entry.lost_numbers = numbers
+    return step
+
+
+def _part_step(state: ChartState, turned_text: Callable[[str], str]) -> Step | None:
+    """The references in the part of a chart read from a file going with their cells. The points the part numbers
+    keep their numbers, and the cached points of a reference turned #REF! stay, as Excel keeps them
+    (tests/fixtures/chart_shift_losses.json)."""
+    def follow(match: re.Match[str]) -> str:
+        text = unescape(match.group(2))
+        turned = turned_text(text)
+        if turned == text:
+            return match.group(0)
+        return f'<{match.group(1)}>{escape_text(turned)}</{match.group(1)}>'
+
+    rewritten = _PART_REFERENCE.sub(follow, state.original)
+    if rewritten == state.original:
+        return None
+
+    def step() -> None:
+        state.original = rewritten
+        state.dirty = True
+    return step
+
+
+def plan(book: Workbook, change: Change) -> list[Step]:
+    """All that moves, worked out before anything does; what cannot be done is refused here."""
+    steps: list[Step] = []
+    for sheet in book.sheets_:
+        for state in sheet.chart_states.values():
+            steps += _chart_plan(sheet, state, change)
+    for chart_sheet in book.chart_sheets:
+        steps += _chart_plan(chart_sheet.sheet, chart_sheet.state, change)
+    return steps
+
+
+def _chart_plan(sheet: Worksheet, state: ChartState, change: Change) -> list[Step]:
+    steps: list[Step] = []
+
+    def changed() -> None:
+        state.dirty = True
+        if not state.original:
+            sheet.drawing_changed()
+
+    def turned_text(text: str) -> str:
+        return change(f'={text}', sheet.name)[1:]
+
+    def setting(holder: object, field: str, value: str) -> Step:
+        def step() -> None:
+            setattr(holder, field, value)
+            changed()
+        return step
+
+    if not state.original:
+        # Points first: a series whose values go takes its points with it afterwards (_values_gone).
+        moving = _points_step(state, sheet.name, change)
+        if moving is not None:
+            steps += [moving, changed]
+    for holder, field in _slots(state):
+        text: str = getattr(holder, field)
+        if not text:
+            continue
+        turned = turned_text(text)
+        if turned == text or (state.original and '#REF!' in turned):
+            # A chart from a file goes on reading a reference whose cells went as it was; its part says #REF!.
+            continue
+        if field == 'category_reference' and '#REF!' in turned:
+            steps.append(_categories_gone(sheet, holder))  # pyright: ignore[reportArgumentType]
+        if field == 'value_reference' and '#REF!' in turned:
+            steps.append(_values_gone(holder))  # pyright: ignore[reportArgumentType]
+        steps.append(setting(holder, field, turned))
+    for entry in state.full_series or state.series:
+        for bar in entry.error_bars:
+            for field in ('plus', 'minus'):
+                reference, values = getattr(bar, field)
+                if reference:
+                    turned = turned_text(reference)
+                    if turned != reference and not (state.original and '#REF!' in turned):
+                        steps.append(setting(bar, field, (turned, values)))  # pyright: ignore[reportArgumentType]
+    if state.original:
+        following = _part_step(state, turned_text)
+        if following is not None:
+            steps.append(following)
+    return steps
+
+
+def changed_in(sheet: Worksheet, state: ChartState, change: Change) -> None:
+    """Every reference of one chart changed now, as a sheet copied with it does."""
+    carry_out(_chart_plan(sheet, state, change))
+
+
+def carry_out(steps: list[Step]) -> None:
+    for step in steps:
+        step()

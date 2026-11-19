@@ -1,0 +1,3174 @@
+"""Reading a workbook into the model, and writing the model back out.
+
+Loading reads the sheets, their cells, the defined names and the Power
+Query queries.  Saving puts back only what changed: every part the model
+does not describe, and every cell nobody touched, is carried over
+verbatim, so a merge, a conditional format or a pivot table survives a
+macro that wrote one cell.
+
+That is the same rule the rest of pyOpenVBA follows.  Regenerating a
+sheet from the model would be far easier and would quietly throw away
+whatever the model has no field for.
+"""
+
+from __future__ import annotations
+
+import posixpath
+import re
+from collections.abc import Callable, Collection
+from functools import lru_cache
+from pathlib import Path
+from typing import TYPE_CHECKING, Final, NamedTuple
+
+from pyopenvba._a1 import Area, column_letter, column_number, parse_area, parse_reference, split_sheet
+from pyopenvba._relationships import in_office_order
+from pyopenvba._xml import attributes as _attributes
+from pyopenvba._xml import escape as _escape
+from pyopenvba._xml import escape_text as _escape_text
+from pyopenvba._xml import tag_attributes as _tag_attributes
+from pyopenvba._xml import unescape as _unescape
+from pyopenvba.apps.excel._dynamic_file import Collector, Metadata, RichError
+from pyopenvba.apps.excel._xstring import decode as _decode_string, escape as _encode_string
+from pyopenvba.integrity import xml_problem
+from pyopenvba.exceptions import PyOpenVBAError, VBARuntimeError, VBAUnsupportedError
+from pyopenvba.formula import _prefixes as prefixes
+from pyopenvba.formula._values import ExcelError
+from pyopenvba.formula._parse import without_dangling_references
+from pyopenvba.formula._prefixes import calculated_always, calls_only_ordinary_functions
+from pyopenvba.formula._structured import from_file, in_file
+from pyopenvba.interpreter._values import EMPTY, VBADate, to_text
+from pyopenvba.powerquery._opc import OpcFile
+from pyopenvba.powerquery._sheets import add_content_type, add_relationship, drop_content_type, sheet_entries
+
+if TYPE_CHECKING:
+    from pyopenvba.apps.excel._chart_sheets import ChartSheet
+    from pyopenvba.apps.excel._data_tables import DataTable
+    from pyopenvba.apps.excel._model import Application, Cell, Workbook, Worksheet
+    from pyopenvba.apps.excel._refresh import LoadTarget
+    from pyopenvba.apps.excel._rich_text import Run
+    from pyopenvba.apps.excel._styles import Stylesheet
+    from pyopenvba.shapes._values import Shape as ShapeState
+
+_ROW = re.compile(r"<row\b[^>]*?(?:/>|>.*?</row>)", re.DOTALL)
+_CELL = re.compile(r"<c\b[^>]*?(?:/>|>.*?</c>)", re.DOTALL)
+_SHEET_DATA = re.compile(r"(<sheetData\b[^>]*?)(/>|>(.*?)</sheetData>)", re.DOTALL)
+#: A cell's value; Excel writes a formula's empty text as <v/>.
+_VALUE = re.compile(r"<v\b[^>]*?(?:/>|>(.*?)</v>)", re.DOTALL)
+_FORMULA = re.compile(r"<f\b([^>]*)(?:/>|>(.*?)</f>)", re.DOTALL)
+_INLINE = re.compile(r"<is>(.*?)</is>", re.DOTALL)
+_TEXT = re.compile(r"<t[^>]*>(.*?)</t>", re.DOTALL)
+_SHARED_ITEM = re.compile(r"<si>(.*?)</si>", re.DOTALL)
+_DEFINED_NAME = re.compile(r"<definedName\b((?:[^\"'<>]|\"[^\"]*\"|'[^']*')*)>(.*?)</definedName>", re.DOTALL)
+class FormulaStorageSpans(NamedTuple):
+    """Exact byte ownership along the current worksheet cell-reader path."""
+
+    data: tuple[int, int] | None
+    rows: list[tuple[int, int]]
+    cells: list[tuple[int, int]]
+    formulas: list[tuple[int, int]]
+
+
+def formula_spans(data: bytes) -> FormulaStorageSpans:
+    """Legacy ownership, called after validated opening-position admission."""
+    sheet = re.search(_SHEET_DATA.pattern.encode('ascii'), data, re.DOTALL)
+    if sheet is None:
+        return FormulaStorageSpans(None, [], [], [])
+    result = FormulaStorageSpans(sheet.span(), [], [], [])
+
+    def append(target: list[tuple[int, int]], span: tuple[int, int]) -> None:
+        if len(result.rows) + len(result.cells) + len(result.formulas) >= 350_000:
+            raise ValueError("Cell metadata exceeds its lexical record budget")
+        target.append(span)
+
+    if sheet.group(3) is not None:
+        for row in re.finditer(_ROW.pattern.encode('ascii'), sheet.group(3), re.DOTALL):
+            row_at = sheet.start(3) + row.start()
+            append(result.rows, (row_at, row_at + len(row.group())))
+            for cell in re.finditer(_CELL.pattern.encode('ascii'), row.group(), re.DOTALL):
+                cell_at = row_at + cell.start()
+                append(result.cells, (cell_at, cell_at + len(cell.group())))
+                formula = re.search(_FORMULA.pattern.encode('ascii'), cell.group(), re.DOTALL)
+                if formula is not None:
+                    start = cell_at + formula.start()
+                    append(result.formulas, (start, start + len(formula.group())))
+    return result
+
+
+def defined_name_spans(data: bytes) -> list[tuple[int, int]]:
+    """Byte ownership of names recognized by the existing lexical reader."""
+    return [match.span() for match in re.finditer(_DEFINED_NAME.pattern.encode('ascii'), data, re.DOTALL)]
+
+
+_FILTER_DATABASE = "_xlnm._FilterDatabase"
+_AUTO_FILTER = re.compile(r"<autoFilter\b[^>]*/>|<autoFilter\b.*?</autoFilter>", re.DOTALL)
+#: The worksheet children an autoFilter comes before, in the schema's order.
+_AFTER_AUTO_FILTER = re.compile(
+    r"<(?:sortState|dataConsolidate|customSheetViews|mergeCells|phoneticPr|conditionalFormatting|dataValidations|"
+    r"hyperlinks|printOptions|pageMargins|pageSetup|headerFooter|rowBreaks|colBreaks|customProperties|cellWatches|"
+    r"ignoredErrors|smartTags|drawing|legacyDrawing|legacyDrawingHF|picture|oleObjects|controls|webPublishItems|"
+    r"tableParts|extLst)\b|</worksheet>")
+
+
+class WorkbookFileError(PyOpenVBAError):
+    """Raised when a workbook's parts cannot be read or written."""
+
+
+class MalformedPartError(WorkbookFileError):
+    """A part of the package is not well-formed XML, which Workbooks.Open answers as Excel does."""
+
+    def __init__(self, part: str, reason: str) -> None:
+        super().__init__(f"{part} is not well-formed XML: {reason}")
+        self.part = part
+
+
+# --- reading ------------------------------------------------------------------------
+
+
+def _refuse_malformed(package: OpcFile) -> None:
+    """Excel opens no workbook with a part that is not well-formed XML, but for its theme, which it goes without
+    (tests/fixtures/bad_xml/bad_xml.json)."""
+    for part in package.names():
+        if not part.endswith((".xml", ".rels")) or re.fullmatch(r"xl/theme/theme\d+\.xml", part):
+            continue
+        problem = xml_problem(package.read(part))
+        if problem is not None:
+            raise MalformedPartError(part, problem)
+
+
+#: A column of a table named on its own: Tab[a], not Tab[@a] or Tab[[#All],[a]].
+_WHOLE_COLUMN = re.compile(r"\[[^\[\]#@,:]+\]")
+
+
+def _read_columns_as_this_row(book: Workbook) -> None:
+    """A file can hold a table's column where one value is wanted, as =@Tab[a] saves: loaded, it reads as this row's cell,
+    =Tab[@a] (tests/fixtures/formula_reads.json). A sheet nobody writes to keeps its bytes all the same."""
+    from pyopenvba.apps.excel._model import written_formula
+
+    if not any(sheet.tables for sheet in book.sheets_):
+        return
+    for sheet in book.sheets_:
+        for (row, column), cell in sheet.cells_.items():
+            formula = cell.formula
+            if not formula or cell.dynamic or "[" not in formula or not _WHOLE_COLUMN.search(formula):
+                continue
+            try:
+                read = written_formula(sheet, formula, row, column)
+            except (VBARuntimeError, VBAUnsupportedError):
+                continue
+            if read != formula and read.replace("[@", "[") == formula:
+                cell.formula = read
+
+
+def load_workbook(application: Application, path: Path, *, _passed: object = None) -> Workbook:
+    """A workbook read from an xlsx, xlsm, xlsb or xlam package. ``_passed`` is the token _hooks.link_gate gives for a linked
+    workbook's file it checked; anything else goes through the sandbox's gate on opening a workbook."""
+    from pyopenvba.apps.excel._hooks import passed
+    from pyopenvba.apps.excel._model import Workbook
+
+    if not passed(_passed):
+        application.outside("Opening a workbook")
+    if not path.exists():
+        raise WorkbookFileError(f"there is no file at {path}")
+    if path.suffix.lower() in (".xls", ".xla", ".xlt"):
+        raise VBAUnsupportedError("opening an Excel 97-2003 workbook is not implemented")
+    if path.suffix.lower() == ".xlsb":
+        raise WorkbookFileError(
+            "an xlsb workbook keeps its cells in a binary part that pyOpenVBA does not read; "
+            "its VBA project is readable through ExcelFile"
+        )
+    package = OpcFile.parse(path.read_bytes())
+    _refuse_malformed(package)
+    from pyopenvba.apps.excel._prefixed_parts import respell
+
+    # A part spelling SpreadsheetML's namespace under a prefix is read, and saved, as Excel spells it.
+    respell(package)
+    book = Workbook(application, path.name, str(path.parent))
+    book.package = package
+    book.session_properties["IsAddin"] = workbook_format(book) == 55
+    book.links_folder = str(path.resolve().parent)
+    workbook_part = package.read("xl/workbook.xml")
+    workbook_xml = workbook_part.decode("utf-8", errors="replace")
+    from pyopenvba.apps.excel._charts_file import xml_tree
+    from pyopenvba.apps.excel._date_system import read as read_date_system
+    from pyopenvba.apps.excel._external_links import read as read_links
+
+    from pyopenvba.apps.excel._workbook_options import read as read_options
+
+    read_date_system(book, workbook_part)
+    parsed = xml_tree(workbook_part)
+    read_options(book, parsed)
+    read_links(book, package, parsed)
+    linked = _relationships(package)
+    relationships = {key: part for key, (part, _kind) in linked.items()}
+    strings = _shared_strings(package)
+    stylesheet = book.stylesheet
+    from pyopenvba.apps.excel import _dynamic_file
+
+    metadata = _dynamic_file.read(package)
+    found = re.search(r'<workbookPr\b[^>]*\bcodeName="([^"]*)"', workbook_xml)
+    if found is not None:
+        book.code_name = _unescape(found.group(1))
+    # Each sheet keeps the number the file gives it, by its relationship, and the next one made takes one past
+    # the highest.
+    numbers: dict[str, int] = {}
+    states: dict[str, str] = {}
+    for tag in re.findall(r"<sheet\b[^>]*>", workbook_xml):
+        attributes = _tag_attributes(tag)
+        identifier = next((value for key, value in attributes.items() if key.endswith(":id")), "")
+        if attributes.get("sheetId", "").isdecimal():
+            numbers[identifier] = int(attributes["sheetId"])
+        states[identifier] = attributes.get("state", "")
+    for name, relationship_id in sheet_entries(workbook_xml):
+        part = relationships.get(relationship_id, "")
+        other = _OTHER_SHEETS.get(linked.get(relationship_id, ("", ""))[1])
+        if other == "a chart sheet":
+            from pyopenvba.apps.excel._chart_sheets import ChartSheet
+
+            chart_sheet = ChartSheet(book, name, part, package, numbers.get(relationship_id, 0),
+                                     _SHEET_VISIBILITY.get(states.get(relationship_id, ""), -1))
+            book.chart_sheets.append(chart_sheet)
+            book.file_tabs.append(chart_sheet)
+            continue
+        if other is not None:
+            raise VBAUnsupportedError(f"opening a workbook with {other} is not implemented")
+        sheet = book.add_sheet(name)
+        book.file_tabs.append(sheet)
+        sheet.sheet_id = numbers.get(relationship_id, sheet.sheet_id)
+        sheet.visible = _SHEET_VISIBILITY.get(states.get(relationship_id, ""), -1)
+        sheet.part_name = part
+        # Missing code names stay empty until project access materializes them.
+        if part and package.has(part):
+            sheet_xml = package.read(part).decode("utf-8", errors="replace")
+            found = re.search(r'<sheetPr\b[^>]*\bcodeName="([^"]*)"', sheet_xml)
+            if found is not None:
+                sheet.code_name = _unescape(found.group(1))
+            _read_sheet(sheet, sheet_xml, strings, stylesheet, metadata)
+            _read_shapes(sheet, package, sheet_xml)
+            _read_notes(sheet, package)
+            sheet.held_kinds = {kind for kind, _ in _sheet_relationships(package, part).values()} | {
+                marker for marker in ("oleObjects", "webPublishItems") if f"<{marker}" in sheet_xml}
+            from pyopenvba.apps.excel._hyperlinks_file import read as read_links
+
+            sheet.hyperlinks = read_links(sheet, sheet_xml, _sheet_relationships(package, part))
+            _read_tables(sheet, package, sheet_xml)
+            from pyopenvba.apps.excel._validation import read_rules
+            from pyopenvba.apps.excel._windows import read_view
+
+            sheet.validations = read_rules(sheet_xml)
+            from pyopenvba.apps.excel._conditional import read_sheet_rules
+
+            plain_load = workbook_format(book) == 51 or not package.has('xl/vbaProject.bin')
+            sheet.conditional_formats, understood = read_sheet_rules(
+                sheet_xml, imported=workbook_format(book) == 51, plain_load=plain_load,
+                sheet_index=book.sheets_.index(sheet))
+            sheet.conditional_foreign = not understood
+            if plain_load and understood:
+                from pyopenvba.apps.excel._conditional_joins import join
+
+                # Excel joins rules alike as it reads a workbook without a VBA project, and saves them joined.
+                sheet.conditional_changed = join(sheet)
+            from pyopenvba.apps.excel._conditional_border_context import initialize
+
+            initialize(sheet)
+            read_view(sheet, sheet_xml)
+            from pyopenvba.apps.excel._sheet_tabs import read as read_tab
+
+            read_tab(sheet, sheet_xml)
+    book.next_sheet_id = max((sheet.sheet_id for sheet in book.tabs()), default=0) + 1
+    for sheet in book.sheets_:
+        if sheet.part_name:
+            sheet.xml_cells_part = next((_resolved(target) for kind, target in _sheet_relationships(package, sheet.part_name).values()
+                                         if kind == "tableSingleCells"), "")
+    from pyopenvba.apps.excel._xml_maps import read_parts as read_xml_maps
+
+    read_xml_maps(book, package, {})
+    _read_threads(book, package)
+    book.held_kinds = {kind.rsplit("/", 1)[-1] for _, kind in _relationships(package).values()} | {
+        marker for marker in ("customWorkbookViews", "webPublishObjects") if f"<{marker}" in workbook_xml}
+    from pyopenvba.apps.excel._windows import read_book_view
+
+    read_book_view(book, workbook_xml)
+    from pyopenvba.apps.excel._pivots import read as read_pivots
+
+    read_pivots(book)
+    _read_names(book, workbook_xml)
+    from pyopenvba.apps.excel._advanced_filter import read_state as read_advanced_filter
+
+    for sheet in book.sheets_:
+        if sheet.part_name and package.has(sheet.part_name):
+            read_advanced_filter(sheet, package.read(sheet.part_name))
+    from pyopenvba.apps.excel._protection import read_book_protection
+
+    read_book_protection(book, workbook_xml)
+    _read_queries(book, path)
+    from pyopenvba.apps.excel._query_tables import read as read_query_tables
+
+    read_query_tables(book, package, _sheet_relationships, _resolved)
+    from pyopenvba.apps.excel._calculation_settings import read as read_calculation
+
+    book.saved = True
+    # Last, as a workbook worked out in full as it opens may be left unsaved (see _calculation_state).
+    read_calculation(book, workbook_xml)
+    # Excel's numbering of new sheets starts again in an opened file (tests/fixtures/new_sheet_names.json).
+    book.sheet_name_counter = 0
+    book.opened_with_links = any(sheet.hyperlinks for sheet in book.sheets_)
+    _read_columns_as_this_row(book)
+    from pyopenvba.apps.excel._hidden_names import read_from_file
+
+    read_from_file(book)
+    return book
+
+
+def _relationship_map(package: OpcFile) -> dict[str, str]:
+    """Each workbook relationship id against the part it names."""
+    return {key: part for key, (part, _kind) in _relationships(package).items()}
+
+
+def _relationships(package: OpcFile) -> dict[str, tuple[str, str]]:
+    """Each workbook relationship id against the part it names and the relationship's type."""
+    if not package.has("xl/_rels/workbook.xml.rels"):
+        return {}
+    from pyopenvba.apps.excel._charts_file import xml_tree
+
+    namespace = '{http://schemas.openxmlformats.org/package/2006/relationships}'
+    root = xml_tree(package.read("xl/_rels/workbook.xml.rels"))
+    if root.tag != namespace + 'Relationships':
+        raise WorkbookFileError('The workbook relationships use an unsupported root or namespace')
+    out: dict[str, tuple[str, str]] = {}
+    for element in root.findall(namespace + 'Relationship'):
+        attributes = element.attrib
+        target = attributes.get("Target", "")
+        if not target:
+            continue
+        part = target[1:] if target.startswith("/") else f"xl/{target.lstrip('/')}"
+        out[attributes.get("Id", "")] = part, attributes.get("Type", "")
+    return out
+
+
+#: The sheets other than worksheets a workbook's relationships name, as the model reports them.
+_OTHER_SHEETS: Final = {
+    "http://schemas.openxmlformats.org/officeDocument/2006/relationships/chartsheet": "a chart sheet",
+    "http://schemas.openxmlformats.org/officeDocument/2006/relationships/dialogsheet": "a dialog sheet",
+    "http://schemas.microsoft.com/office/2006/relationships/xlMacrosheet": "an Excel 4 macro sheet",
+    "http://schemas.microsoft.com/office/2006/relationships/xlIntlMacrosheet": "an Excel 4 macro sheet",
+}
+
+
+class _Strings(list[str]):
+    """A workbook's shared strings, and the runs of fonts each rich one is in, by its number (see _rich_text)."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.runs: dict[int, tuple[Run, ...]] = {}
+
+
+def _shared_strings(package: OpcFile) -> _Strings:
+    strings = _Strings()
+    if not package.has("xl/sharedStrings.xml"):
+        return strings
+    text = package.read("xl/sharedStrings.xml").decode("utf-8", errors="replace")
+    for index, item in enumerate(_SHARED_ITEM.findall(text)):
+        strings.append("".join(_cell_text(piece) for piece in _TEXT.findall(item)))
+        if "<r>" in item:
+            from pyopenvba.apps.excel._rich_text import read_runs
+
+            runs = read_runs(item, _cell_text)
+            if runs is not None:
+                strings.runs[index] = runs
+    return strings
+
+
+def _runs(cell_xml: str, kind: str, strings: list[str]) -> tuple[Run, ...] | None:
+    """The runs of fonts a string cell's text is in, from the shared string it names or the one it holds."""
+    if kind == "s" and isinstance(strings, _Strings) and strings.runs:
+        raw = _VALUE.search(cell_xml)
+        index = (raw.group(1) or "").strip() if raw is not None else ""
+        return strings.runs.get(int(index)) if index.isdigit() else None
+    if kind == "inlineStr" and "<r>" in cell_xml:
+        from pyopenvba.apps.excel._rich_text import read_runs
+
+        inline = _INLINE.search(cell_xml)
+        return read_runs(inline.group(1), _cell_text) if inline is not None else None
+    return None
+
+
+@lru_cache(maxsize=1)
+def _template_style_parts() -> tuple[str, str]:
+    from pyopenvba._templates import EMPTY_XLSM_BYTES
+
+    template = OpcFile.parse(EMPTY_XLSM_BYTES)
+    return (template.read("xl/styles.xml").decode("utf-8"), template.read("xl/theme/theme1.xml").decode("utf-8"))
+
+
+#: What a file with no theme part reads as: Excel's 2007 theme, not the one a new workbook has now (tests/fixtures/tool_books/spellings.json).
+_NO_THEME = ('<a:theme xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><a:themeElements><a:clrScheme name="Office">'
+             '<a:dk1><a:sysClr val="windowText" lastClr="000000"/></a:dk1><a:lt1><a:sysClr val="window" lastClr="FFFFFF"/></a:lt1>'
+             '<a:dk2><a:srgbClr val="1F497D"/></a:dk2><a:lt2><a:srgbClr val="EEECE1"/></a:lt2><a:accent1><a:srgbClr val="4F81BD"/></a:accent1>'
+             '<a:accent2><a:srgbClr val="C0504D"/></a:accent2><a:accent3><a:srgbClr val="9BBB59"/></a:accent3><a:accent4><a:srgbClr val="8064A2"/></a:accent4>'
+             '<a:accent5><a:srgbClr val="4BACC6"/></a:accent5><a:accent6><a:srgbClr val="F79646"/></a:accent6><a:hlink><a:srgbClr val="0000FF"/></a:hlink>'
+             '<a:folHlink><a:srgbClr val="800080"/></a:folHlink></a:clrScheme><a:fontScheme name="Office"><a:majorFont><a:latin typeface="Cambria"/></a:majorFont>'
+             '<a:minorFont><a:latin typeface="Calibri"/></a:minorFont></a:fontScheme></a:themeElements></a:theme>')
+
+
+def read_stylesheet(package: OpcFile | None) -> Stylesheet:
+    """A workbook's stylesheet and theme; a workbook made here has the template's."""
+    from pyopenvba.apps.excel._styles import Stylesheet
+
+    if package is None:
+        return Stylesheet(*_template_style_parts())
+    styles = package.read("xl/styles.xml").decode("utf-8", errors="replace") if package.has("xl/styles.xml") else ""
+    theme = ""
+    for part in package.names():
+        if re.fullmatch(r"xl/theme/theme\d+\.xml", part):
+            theme = package.read(part).decode("utf-8", errors="replace")
+            break
+    return Stylesheet(styles or _template_style_parts()[0], theme or _NO_THEME)
+
+
+def _read_sheet(sheet: Worksheet, xml: str, strings: list[str], stylesheet: Stylesheet,
+                metadata: Metadata | None = None) -> None:
+    for tag in re.findall(r"<mergeCell\b[^>]*/>", xml):
+        reference = _tag_attributes(tag).get("ref", "")
+        if reference:
+            sheet.merged_areas.extend(parse_reference(reference, sheet=sheet.name))
+    element = _AUTO_FILTER.search(xml)
+    if element is not None:
+        from pyopenvba.apps.excel._autofilter import read_filter
+
+        sheet.auto_filter = read_filter(sheet, element.group())
+    from pyopenvba.apps.excel._protection import read_protection
+
+    read_protection(sheet, xml)
+    sheet.dims.load(xml)
+    match = _SHEET_DATA.search(xml)
+    if match and match.group(2) != "/>":
+        _read_cells(sheet, match.group(3) or "", strings, stylesheet, metadata)
+    stated = re.search(r"<dimension\b[^>]*/>", xml)
+    if sheet.dims.tidied or (stated is not None and _with_dimension(stated.group(0), sheet) != stated.group(0)):
+        # What Excel let go of on opening the file is gone from it when Excel saves, and the
+        # used block it states is the one Excel works out.
+        sheet.dirty = True
+
+
+def _read_cells(sheet: Worksheet, rows: str, strings: list[str], stylesheet: Stylesheet,
+                metadata: Metadata | None = None) -> None:
+    from pyopenvba.apps.excel._model import Cell
+    from pyopenvba.formula._parse import shift_text
+
+    # A shared formula's text is in its first cell only; the others are filled in from it once all are read.
+    firsts: dict[int, tuple[int, int, str]] = {}
+    followers: list[tuple[int, int, Cell]] = []
+    #: Each dynamic-array formula's block, and the error only a dynamic array has that one shows.
+    dynamic: dict[tuple[int, int], Area] = {}
+    rich: dict[tuple[int, int], RichError] = {}
+    #: Each data table's <f>, kept on its first cell (see _data_tables).
+    tables: dict[tuple[int, int], dict[str, str]] = {}
+    for row_xml in _ROW.findall(rows):
+        for cell_xml in _CELL.findall(row_xml):
+            attributes = _tag_attributes(cell_xml)
+            reference = attributes.get("r", "")
+            if not reference:
+                continue
+            column, row = _split_reference(reference)
+            kind = attributes.get("t", "")
+            written = attributes.get("s", "")
+            xf = int(written) if written.isdigit() else 0
+            style = stylesheet.style(xf) if xf else None
+            formula = ""
+            calculate = False
+            shared: int | None = None
+            cell_meta, value_meta = attributes.get("cm", ""), attributes.get("vm", "")
+            is_dynamic = metadata is not None and cell_meta.isdigit() and int(cell_meta) in metadata.dynamic
+            formula_match = _FORMULA.search(cell_xml)
+            if formula_match is not None:
+                body = (formula_match.group(2) or "").strip()
+                formula = _formula_read(body) if body else ""
+                element = _attributes(f"<f {formula_match.group(1)}>")
+                calculate = element.get('ca', '0').lower() in ('1', 'true')
+                if element.get("t") == "shared" and element.get("si", "").isdigit():
+                    shared = int(element["si"])
+                    if formula and element.get("ref"):
+                        sheet.shared_groups[shared] = parse_area(element["ref"], sheet="")
+                        firsts[shared] = (row, column, formula)
+                elif element.get("t") == "array" and formula and is_dynamic:
+                    # A dynamic-array formula: its first cell holds it, the rest of its block what it spilled.
+                    dynamic[(row, column)] = parse_area(element.get("ref") or reference, sheet="")
+                elif element.get("t") == "array" and formula:
+                    # An array formula: its first cell holds it, the rest of its block the values it gave.
+                    sheet.array_formulas[(row, column)] = parse_area(element.get("ref") or reference, sheet="")
+                elif element.get("t") == "dataTable":
+                    # A data table: its first cell holds the table, every cell of it the value it gave.
+                    tables[(row, column)] = {**element, "ref": element.get("ref") or reference}
+            value = _cell_value(cell_xml, kind, strings)
+            error = metadata.errors.get(int(value_meta)) if metadata is not None and value_meta.isdigit() else None
+            if error is not None:
+                # #VALUE! in the cell, and the rich value behind it saying which error only a dynamic array has.
+                value = ExcelError(error.error)
+                rich[(row, column)] = error
+            if value is EMPTY and formula_match is None \
+                    and (style or stylesheet.default) == sheet.inherited_style(row, column):
+                # An empty cell in the format its row or column gives it says nothing, and Excel drops it.
+                sheet.dims.tidied = True
+                continue
+            if style is None and stylesheet.default.number_format != "General":
+                # A cell on the default format still has to read that format.
+                style = stylesheet.default
+            cell = Cell(value=value, formula=formula, stale=formula_match is not None and (value is EMPTY or calculate), style=style,
+                        xf=xf if style is not None else -1, shared=shared,
+                        dynamic=bool(formula) and (row, column) in dynamic,
+                        runs=_runs(cell_xml, kind, strings) if formula_match is None else None)
+            sheet.cells_[(row, column)] = cell
+            if shared is not None and not formula:
+                followers.append((row, column, cell))
+    for row, column, cell in followers:
+        first = firsts.get(cell.shared) if cell.shared is not None else None
+        if first is None:
+            cell.shared = None
+            continue
+        top, left, text = first
+        cell.formula = shift_text(text, row - top, column - left)
+        cell.stale |= cell.value is EMPTY
+    _read_data_tables(sheet, tables)
+    _read_spills(sheet, dynamic, rich)
+    sheet.dims.settle_growth()
+
+
+def _read_data_tables(sheet: Worksheet, tables: dict[tuple[int, int], dict[str, str]]) -> None:
+    """The data tables a file keeps, each cell of one saying its =TABLE() and holding the value it gave; one the file
+    marks ca is worked out again (see _data_tables)."""
+    from pyopenvba.apps.excel._data_tables import read
+
+    for anchor, element in tables.items():
+        table = read(element, element["ref"])
+        if table is None or (table.area.top, table.area.left) != anchor:
+            continue
+        sheet.data_tables[anchor] = table
+        text = table.formula()
+        area = table.area
+        for row in range(area.top, area.bottom + 1):
+            for column in range(area.left, area.right + 1):
+                cell = sheet.cell(row, column, create=True)
+                assert cell is not None
+                cell.formula, cell.shared = text, None
+                cell.stale = table.always or cell.value is EMPTY
+
+
+def _read_spills(sheet: Worksheet, dynamic: dict[tuple[int, int], Area], rich: dict[tuple[int, int], RichError]) \
+        -> None:
+    """What each dynamic-array formula a file keeps spilled: its block's other cells show its answer, and a #SPILL!
+    wants the block its rich value says (see _spills, _dynamic_file)."""
+    from pyopenvba.apps.excel._spills import BEYOND_THE_EDGE, Spill
+
+    for (row, column), area in dynamic.items():
+        error = rich.get((row, column))
+        if error is not None and error.error == "#SPILL!":
+            wanted = Area(row, column, row + error.rows, column + error.columns)
+            sheet.spills[(row, column)] = Spill(wanted, blocked=True, why=error.why or BEYOND_THE_EDGE)
+        elif area.rows * area.columns > 1:
+            sheet.spills[(row, column)] = Spill(Area(area.top, area.left, area.bottom, area.right))
+            for each_row in range(area.top, area.bottom + 1):
+                for each_column in range(area.left, area.right + 1):
+                    member = sheet.cells_.get((each_row, each_column))
+                    if member is not None and (each_row, each_column) != (row, column):
+                        member.spilled_from = (row, column)
+        else:
+            sheet.spills[(row, column)] = Spill(Area(row, column, row, column), blocked=True)
+
+
+def _cell_text(raw: str) -> str:
+    return _decode_string(_unescape(raw.replace('\r\n', '\n').replace('\r', '\n')))
+
+
+def _cell_value(cell_xml: str, kind: str, strings: list[str]) -> object:
+    if kind == "inlineStr":
+        inline = _INLINE.search(cell_xml)
+        return "".join(_cell_text(piece) for piece in _TEXT.findall(inline.group(1))) if inline else ""
+    raw = _VALUE.search(cell_xml)
+    if raw is None or (raw.group(1) is None and kind != "str"):
+        return EMPTY
+    text = _unescape(raw.group(1) or "")
+    if kind == "s":
+        try:
+            return strings[int(text)]
+        except (ValueError, IndexError):
+            return ""
+    if kind == "str":
+        return _cell_text(raw.group(1) or "")
+    if kind == "b":
+        return text.strip() not in ("0", "")
+    if kind == "e":
+        from pyopenvba.formula._values import ERRORS, ExcelError
+
+        return ERRORS.get(text, ExcelError(text or "#VALUE!"))
+    if kind == "d":
+        from pyopenvba.interpreter._values import parse_date_text
+
+        parsed = parse_date_text(text.replace("T", " "))
+        return parsed.serial if parsed is not None else text
+    try:
+        # Worksheet numbers remain Doubles even when XML omits a decimal point;
+        # the cell's format decides what Range.Value makes of one.
+        return float(text)
+    except ValueError:
+        return text
+
+
+def _read_names(book: Workbook, workbook_xml: str) -> None:
+    from pyopenvba.apps.excel._advanced_filter import attribute_values
+    from pyopenvba.apps.excel._model import NameEntry
+
+    for attributes_text, body in _DEFINED_NAME.findall(workbook_xml):
+        attributes = attribute_values(attributes_text)
+        name = attributes.get("name", "")
+        if name in ("_xlnm.Print_Area", "_xlnm.Print_Titles"):
+            scope = attributes.get("localSheetId", "")
+            if not re.fullmatch(r"[0-9]{1,10}", scope) or int(scope) >= len(book.tabs()):
+                # Unowned/global reserved print metadata must survive unchanged.
+                continue
+        if name in (_FILTER_DATABASE, "_xlnm.Criteria", "_xlnm.Extract", "_xlnm.Print_Area", "_xlnm.Print_Titles"):
+            # The model keeps a filter's hidden name, as Excel shows it: _FilterDatabase on its sheet.
+            name = name.removeprefix("_xlnm.")
+        elif not name or name.startswith("_xlnm"):
+            continue
+        local_id = attributes.get("localSheetId", "")
+        if local_id.isdigit() and int(local_id) < len(book.tabs()):
+            from pyopenvba._a1 import quote_sheet
+
+            owner = book.tabs()[int(local_id)]
+            if name in ("Print_Area", "Print_Titles") and attributes.get("name") == "_xlnm." + name:
+                owner.page_print_names_owned.add(name)
+            name = quote_sheet(owner.name) + "!" + name
+        from pyopenvba.apps.excel._workbook_links import read_name
+
+        refers = read_name(_formula_read(body.strip()))
+        entry = NameEntry(name, refers, book, attributes=attributes_text.strip(),
+                          visible=attributes.get("hidden", "0") not in ("1", "true"),
+                          comment=attributes.get("comment", ""))
+        from pyopenvba.apps.excel._name_macro import loaded
+
+        loaded(entry, attributes)
+        book.names_.entries.append(entry)
+
+
+_TABLE_PART = re.compile(r"<table\b[^>]*/?>")
+
+
+def read_load_targets(package: OpcFile, book: Workbook) -> dict[str, LoadTarget]:
+    """Where each query's rows sit, read from the tables in the package.
+
+    Excel names the table it makes for a query after the query, so the
+    table's name is what ties the two together; its ``ref`` is the block
+    the rows fill, headers included.
+    """
+    from pyopenvba.apps.excel._refresh import LoadTarget as Target
+
+    out: dict[str, LoadTarget] = {}
+    wanted = {entry.name.lower(): entry.name for entry in book.queries_.entries}
+    for sheet in book.sheets_:
+        if not sheet.part_name:
+            continue
+        rels = f"{sheet.part_name.rsplit('/', 1)[0]}/_rels/{sheet.part_name.rsplit('/', 1)[1]}.rels"
+        if not package.has(rels):
+            continue
+        text = package.read(rels).decode("utf-8", errors="replace")
+        for element in re.findall(r"<Relationship\b[^>]*/>", text):
+            attributes = _attributes(element)
+            target = attributes.get("Target", "")
+            if "table" not in target.lower():
+                continue
+            part = target[1:] if target.startswith("/") else f"xl/{target.lstrip('./')}"
+            part = part.replace("xl/../", "xl/").replace("/worksheets/../", "/")
+            if not package.has(part):
+                continue
+            table_xml = package.read(part).decode("utf-8", errors="replace")
+            found = _TABLE_PART.search(table_xml)
+            if found is None:
+                continue
+            fields = _tag_attributes(found.group(0))
+            name = fields.get("displayName") or fields.get("name", "")
+            reference = fields.get("ref", "")
+            if not name or not reference:
+                continue
+            key = wanted.get(name.lower()) or wanted.get(name.replace("_", " ").lower())
+            if key is None:
+                continue
+            try:
+                area = Area(*_area_of(reference), sheet.name)
+            except ValueError:
+                continue
+            out[key] = Target(sheet.name, area, part, name)
+    return out
+
+
+def _area_of(reference: str) -> tuple[int, int, int, int]:
+    from pyopenvba._a1 import parse_area
+
+    area = parse_area(reference)
+    return area.top, area.left, area.bottom, area.right
+
+
+def _read_shape_links(shapes: list[ShapeState], relationships: dict[str, tuple[str, str]]) -> None:
+    """Each shape's hyperlink, its relationship made the address it names."""
+    for shape in shapes:
+        if shape.link is not None:
+            relationship, tip, place = shape.link
+            target = relationships.get(relationship, ("", ""))[1]
+            shape.link = (target, tip, place)
+        _read_shape_links(shape.children, relationships)
+
+
+def _read_shapes(sheet: Worksheet, package: OpcFile, sheet_xml: str) -> None:
+    """The sheet's drawing, read into the model.
+
+    A sheet points at its drawing through a relationship; the shapes
+    are in that part, and a form control's own settings are in the
+    ``ctrlProps`` part the sheet points at separately.
+    """
+    from pyopenvba.apps.excel._prefixed_parts import drawing_spelled
+    from pyopenvba.shapes._xlsx import control_text, read_control_settings, read_controls, read_drawing
+
+    part = _sheet_relationship(package, sheet.part_name, "drawing")
+    if not part or not package.has(part):
+        return
+    sheet.drawing_part = part
+    sheet.drawing_xml = drawing_spelled(package.read(part).decode("utf-8", errors="replace"))
+    # Anchors are read against the model's own rows and columns, the ones
+    # a save writes them against, so a shape nobody moved stays put.
+    sheet.shapes_ = read_drawing(sheet.drawing_xml, sheet.drawing_grid())
+    _read_shape_links(sheet.shapes_, _sheet_relationships(package, part))
+    from pyopenvba.apps.excel import _charts_file
+
+    _charts_file.read(sheet, package)
+    # The counter a new shape's name comes from carries on from what is
+    # already there rather than starting again at one.
+    sheet.shape_count = len(sheet.shapes_)
+    parts = _control_parts(package, sheet.part_name)
+    controls = read_controls(sheet_xml, parts)
+    vml_part = _sheet_relationship(package, sheet.part_name, "vmlDrawing")
+    vml = package.read(vml_part).decode("utf-8") if vml_part and package.has(vml_part) else ""
+    for shape in sheet.shapes_:
+        found = controls.get(shape.shape_id)
+        if found is not None:
+            shape.control = found
+            # Which part it came from, so a save changes that control
+            # rather than adding another one beside it.
+            found.part_name = _part_for(package, sheet.part_name, found.relationship)
+            # Excel reports a control's macro workbook-qualified, and
+            # writes it as [0]!Name; the model carries the plain name.
+            shape.macro = found.macro_text.rpartition("!")[2]
+            if vml:
+                read_control_settings(vml, shape, found)
+            if vml and "<xdr:txBody" not in shape.source:
+                shape.text = control_text(vml, shape.shape_id)
+    from pyopenvba.apps.excel._radios import initialize
+
+    initialize(sheet)
+    sheet.drawing_dirty = False
+
+
+def _read_notes(sheet: Worksheet, package: OpcFile) -> None:
+    """The sheet's notes, from its comments part and the boxes in its VML part (see _notes_file)."""
+    from pyopenvba.apps.excel._notes_file import read
+
+    vml_part = _sheet_relationship(package, sheet.part_name, "vmlDrawing")
+    comments_part = _sheet_relationship(package, sheet.part_name, "comments")
+    vml = package.read(vml_part).decode("utf-8", errors="replace") if vml_part and package.has(vml_part) else ""
+    comments = (package.read(comments_part).decode("utf-8", errors="replace")
+                if comments_part and package.has(comments_part) else "")
+    if vml or comments:
+        read(sheet, comments, vml)
+    sheet.notes_changed = False
+
+
+def _write_notes(book: Workbook, package: OpcFile) -> None:
+    """Every sheet whose notes changed, its comments part and the boxes in its VML part written again: made where
+    it had none, as Excel makes them, and taken away where it has no notes left (see _notes_file)."""
+    from pyopenvba.apps.excel._notes import in_order, vml_block
+    from pyopenvba.apps.excel._notes_file import comments_part, empty_vml, with_notes
+
+    for sheet in book.sheets_:
+        if not sheet.notes_changed or not sheet.part_name or not package.has(sheet.part_name):
+            continue
+        sheet.notes_changed = False
+        comments_at = _sheet_relationship(package, sheet.part_name, "comments")
+        vml_at = _sheet_relationship(package, sheet.part_name, "vmlDrawing")
+        if not sheet.notes and not comments_at:
+            continue
+        if not vml_at:
+            vml_at = _new_notes_vml(package, sheet, vml_block(sheet))
+        vml = package.read(vml_at).decode("utf-8", errors="replace") if package.has(vml_at) else ""
+        drawn = with_notes(sheet, vml or empty_vml(vml_block(sheet)))
+        if sheet.notes:
+            if not comments_at:
+                comments_at = _new_comments(package, sheet)
+            listed = [(f"{column_letter(column)}{row}", note) for (row, column), note in in_order(sheet)]
+            package.write(comments_at, comments_part(listed).encode("utf-8"))
+        else:
+            _drop_sheet_part(package, sheet, comments_at)
+        if re.search(r"<v:shape(?=[\s/>])", drawn):
+            package.write(vml_at, drawn.encode("utf-8"))
+        else:
+            _drop_sheet_part(package, sheet, vml_at)
+
+
+def _override_before_properties(package: OpcFile, part: str, content_type: str) -> None:
+    """A part named in the content types before the document's own properties, as Excel names a sheet's comments,
+    threaded comments and the persons (tests/fixtures/threaded_comments.json)."""
+    types = package.read("[Content_Types].xml").decode("utf-8")
+    if f'PartName="/{part}"' in types:
+        return
+    override = f'<Override PartName="/{part}" ContentType="{content_type}"/>'
+    at = types.find('<Override PartName="/docProps/')
+    at = at if at >= 0 else types.rfind("</Types>")
+    package.write("[Content_Types].xml", (types[:at] + override + types[at:]).encode("utf-8"))
+
+
+def _write_threads(book: Workbook, package: OpcFile, changed: set[str]) -> None:
+    """Each sheet whose notes changed, its threadedComments part written again, made where it had none and taken
+    away where it has no thread left; and the workbook's persons part, while any sheet has a thread (see _threads)."""
+    from pyopenvba.apps.excel._threads import (PERSONS_RELATIONSHIP, PERSONS_TYPE, THREADS_RELATIONSHIP, THREADS_TYPE,
+                                               persons_part, threads, threads_part)
+
+    for sheet in book.sheets_:
+        if sheet.part_name not in changed:
+            continue
+        at = _sheet_relationship(package, sheet.part_name, "threadedComment")
+        if not threads(sheet):
+            if at:
+                _drop_sheet_part(package, sheet, at)
+                drop_content_type(package, at)
+            continue
+        if not at:
+            taken = set(package.names())
+            number = 1
+            while f"xl/threadedComments/threadedComment{number}.xml" in taken:
+                number += 1
+            at = f"xl/threadedComments/threadedComment{number}.xml"
+            _override_before_properties(package, at, THREADS_TYPE)
+            _add_sheet_relationship(package, sheet.part_name, f"../threadedComments/threadedComment{number}.xml",
+                                    THREADS_RELATIONSHIP)
+        package.write(at, threads_part(sheet).encode("utf-8"))
+    if not changed:
+        return
+    rels = "xl/_rels/workbook.xml.rels"
+    listed = package.read(rels).decode("utf-8") if package.has(rels) else ""
+    held = re.search(r'<Relationship\b[^>]*Type="' + re.escape(PERSONS_RELATIONSHIP) + r'"[^>]*/>', listed)
+    part = "xl/" + _attributes(held.group(0)).get("Target", "persons/person.xml") if held else "xl/persons/person.xml"
+    if any(threads(sheet) for sheet in book.sheets_):
+        if held is None:
+            _override_before_properties(package, part, PERSONS_TYPE)
+            add_relationship(package, rels, PERSONS_RELATIONSHIP, "persons/person.xml")
+        package.write(part, persons_part(book).encode("utf-8"))
+    elif held is not None:
+        package.write(rels, listed.replace(held.group(0), "").encode("utf-8"))
+        drop_content_type(package, part)
+        _remove_unreferenced_part(package, part)
+
+
+def _read_threads(book: Workbook, package: OpcFile) -> None:
+    """The workbook's persons and each sheet's threads, put on the stand-in notes its comments part gave."""
+    from pyopenvba.apps.excel._threads import PERSONS_RELATIONSHIP, read_persons, read_threads
+
+    rels = "xl/_rels/workbook.xml.rels"
+    listed = package.read(rels).decode("utf-8") if package.has(rels) else ""
+    held = re.search(r'<Relationship\b[^>]*Type="' + re.escape(PERSONS_RELATIONSHIP) + r'"[^>]*/>', listed)
+    if held is not None:
+        part = posixpath.normpath(posixpath.join("xl", _attributes(held.group(0)).get("Target", "")))
+        if package.has(part):
+            read_persons(book, package.read(part).decode("utf-8", errors="replace"))
+    for sheet in book.sheets_:
+        at = _sheet_relationship(package, sheet.part_name, "threadedComment")
+        if at and package.has(at):
+            read_threads(sheet, package.read(at).decode("utf-8", errors="replace"))
+
+
+def _write_links(book: Workbook, package: OpcFile, folder: str) -> None:
+    """Every sheet whose links changed -- or, saved in another folder than before, has a DOS path a link saves
+    relative to the folder -- its hyperlinks element and its relationships written again (see _hyperlinks_file),
+    after every other part the save relates to the sheet, which the links number ahead of."""
+    from pyopenvba.apps.excel._hyperlinks_file import follows_folder, write
+
+    moved = folder != book.links_folder
+    for sheet in book.sheets_:
+        wanted = sheet.links_changed or (moved and any(follows_folder(link.address) for link in sheet.hyperlinks))
+        if wanted and sheet.part_name and package.has(sheet.part_name):
+            write(sheet, package, folder)
+            sheet.links_changed = False
+    book.links_folder = folder
+
+
+_IMAGE_RELATIONSHIP = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/image"
+#: What follows a sheet's <picture> in the schema's order: the first of these there.
+_AFTER_PICTURE = re.compile(r"<(?:oleObjects|controls|webPublishItems|tableParts|extLst|mc:AlternateContent)\b"
+                            r"|</worksheet>")
+
+
+def _write_backgrounds(book: Workbook, package: OpcFile) -> None:
+    """Each sheet whose background picture changed: the old one's <picture>, relationship and image taken away, and
+    the new one written. The image goes in xl/media, sharing a part that holds the same bytes, as Excel shares one
+    between sheets; its relationship comes after a VML part the save makes and before a comments part
+    (tests/fixtures/background_picture.json)."""
+    for sheet in book.sheets_:
+        if not sheet.background_changed or not sheet.part_name or not package.has(sheet.part_name):
+            continue
+        sheet.background_changed = False
+        text = package.read(sheet.part_name).decode("utf-8", errors="replace")
+        for relationship, (kind, target) in _sheet_relationships(package, sheet.part_name).items():
+            if kind == "image":
+                _remove_sheet_relationship(package, sheet.part_name, relationship)
+                text = re.sub(r'<picture\b[^>]*\br:id="' + re.escape(relationship) + r'"[^>]*/>', "", text)
+                package.write(sheet.part_name, text.encode("utf-8"))
+                _remove_unreferenced_part(package, _resolved(target))
+        if sheet.background is None:
+            continue
+        held = sorted(name for name in package.names() if name.startswith("xl/media/"))
+        part = next((name for name in held if package.read(name) == sheet.background), None)
+        if part is None:
+            number = 1
+            while f"xl/media/image{number}.png" in held:
+                number += 1
+            part = f"xl/media/image{number}.png"
+            package.write(part, sheet.background)
+        _add_default_content_type(package, "png", "image/png")
+        relationship = _add_sheet_relationship(package, sheet.part_name, "../" + part[len("xl/"):],
+                                               _IMAGE_RELATIONSHIP)
+        text = package.read(sheet.part_name).decode("utf-8", errors="replace")
+        cells_end = max(text.find("</sheetData>"), text.find("<sheetData/>"), 0)
+        place = _AFTER_PICTURE.search(text, cells_end)
+        at = place.start() if place is not None else len(text)
+        package.write(sheet.part_name, (text[:at] + f'<picture r:id="{relationship}"/>' + text[at:]).encode("utf-8"))
+
+
+def _new_vml_parts(book: Workbook, package: OpcFile) -> None:
+    """The VML part each sheet about to draw its first note or form control needs, made sheet by sheet, so they
+    are numbered in the sheets' order, as Excel numbers them (tests/fixtures/notes.json)."""
+    from pyopenvba.apps.excel._notes import vml_block
+
+    for sheet in book.sheets_:
+        if not sheet.part_name or not package.has(sheet.part_name):
+            continue
+        fresh = any(one.kind == "formControl" and one.control is not None and not one.control.part_name
+                    for one in sheet.shapes_) if sheet.drawing_dirty else False
+        if not (sheet.notes_changed and sheet.notes) and not fresh:
+            continue
+        if not _sheet_relationship(package, sheet.part_name, "vmlDrawing"):
+            _new_notes_vml(package, sheet, vml_block(sheet))
+
+
+#: What follows a sheet's <legacyDrawing> in the schema's order, after its cells: the first of these there.
+_AFTER_LEGACY_DRAWING = re.compile(r"<(?:legacyDrawingHF|picture|oleObjects|controls|webPublishItems|tableParts|"
+                                   r"extLst|mc:AlternateContent)\b|</worksheet>")
+
+
+def _new_notes_vml(package: OpcFile, sheet: Worksheet, block: int) -> str:
+    """The VML part a sheet's first note needs, numbered from its block of ids, and <legacyDrawing> naming it."""
+    from pyopenvba.apps.excel._notes_file import empty_vml
+
+    taken = {name for name in package.names() if name.startswith("xl/drawings/vmlDrawing")}
+    number = 1
+    while f"xl/drawings/vmlDrawing{number}.vml" in taken:
+        number += 1
+    part = f"xl/drawings/vmlDrawing{number}.vml"
+    package.write(part, empty_vml(block).encode("utf-8"))
+    _add_default_content_type(package, "vml", "application/vnd.openxmlformats-officedocument.vmlDrawing")
+    relationship = _add_sheet_relationship(package, sheet.part_name, f"../drawings/vmlDrawing{number}.vml",
+                                           "http://schemas.openxmlformats.org/officeDocument/2006/relationships/"
+                                           "vmlDrawing")
+    text = package.read(sheet.part_name).decode("utf-8", errors="replace")
+    if "<legacyDrawing " not in text:
+        cells_end = max(text.find("</sheetData>"), text.find("<sheetData/>"), 0)
+        place = _AFTER_LEGACY_DRAWING.search(text, cells_end)
+        at = place.start() if place is not None else len(text)
+        text = text[:at] + f'<legacyDrawing r:id="{relationship}"/>' + text[at:]
+        package.write(sheet.part_name, text.encode("utf-8"))
+    return part
+
+
+def _new_comments(package: OpcFile, sheet: Worksheet) -> str:
+    """A comments part for a sheet's notes, named in the content types before the document's own properties, and
+    related to the sheet after its VML part (tests/fixtures/notes.json)."""
+    from pyopenvba.apps.excel._notes_file import COMMENTS_RELATIONSHIP, COMMENTS_TYPE
+
+    taken = set(package.names())
+    number = 1
+    while f"xl/comments{number}.xml" in taken:
+        number += 1
+    part = f"xl/comments{number}.xml"
+    package.write(part, b"")
+    types = package.read("[Content_Types].xml").decode("utf-8")
+    override = f'<Override PartName="/{part}" ContentType="{COMMENTS_TYPE}"/>'
+    at = types.find('<Override PartName="/docProps/')
+    at = at if at >= 0 else types.rfind("</Types>")
+    package.write("[Content_Types].xml", (types[:at] + override + types[at:]).encode("utf-8"))
+    _add_sheet_relationship(package, sheet.part_name, f"../comments{number}.xml", COMMENTS_RELATIONSHIP)
+    return part
+
+
+def _drop_sheet_part(package: OpcFile, sheet: Worksheet, part: str) -> None:
+    """A part the sheet no longer needs taken away, with its relationship, and for a VML part its <legacyDrawing>."""
+    for relationship, (kind, target) in _sheet_relationships(package, sheet.part_name).items():
+        if _resolved(target) != part:
+            continue
+        _remove_sheet_relationship(package, sheet.part_name, relationship)
+        if kind == "vmlDrawing":
+            text = package.read(sheet.part_name).decode("utf-8", errors="replace")
+            text = re.sub(r'<legacyDrawing\b[^>]*\br:id="' + re.escape(relationship) + r'"[^>]*/>', "", text)
+            package.write(sheet.part_name, text.encode("utf-8"))
+    _remove_unreferenced_part(package, part)
+
+
+def _sheet_relationship(package: OpcFile, sheet_part: str, kind: str) -> str:
+    """The part a sheet's relationship of this kind points at.
+
+    Matched on the relationship's type rather than its target, because
+    xl/drawings holds the VML for the form controls as well, and its
+    name starts with the same word.
+    """
+    for _, (relationship_kind, target) in _sheet_relationships(package, sheet_part).items():
+        if relationship_kind == kind:
+            return _resolved(target)
+    return ""
+
+
+def _sheet_relationships(package: OpcFile, sheet_part: str) -> dict[str, tuple[str, str]]:
+    """Each relationship on a sheet, as ``id -> (kind, target)``.
+
+    The kind is the last word of the type URI: drawing, vmlDrawing,
+    ctrlProp, table, and so on.
+    """
+    if not sheet_part:
+        return {}
+    folder, _, name = sheet_part.rpartition("/")
+    rels = f"{folder}/_rels/{name}.rels"
+    if not package.has(rels):
+        return {}
+    text = package.read(rels).decode("utf-8", errors="replace")
+    out: dict[str, tuple[str, str]] = {}
+    for element in re.findall(r"<Relationship\b[^>]*/>", text):
+        fields = _attributes(element)
+        if "Id" in fields and "Target" in fields:
+            out[fields["Id"]] = (fields.get("Type", "").rpartition("/")[2], fields["Target"])
+    return out
+
+
+def _resolved(target: str) -> str:
+    """A relationship target as a part name in the package."""
+    if target.startswith("/"):
+        return target[1:]
+    part = f"xl/worksheets/{target}"
+    while "/../" in part:
+        head, _, tail = part.rpartition("/../")
+        part = head.rpartition("/")[0] + "/" + tail
+    return part.replace("./", "")
+
+
+def _part_for(package: OpcFile, sheet_part: str, relationship: str) -> str:
+    """The part one of a sheet's relationships names."""
+    found = _sheet_relationships(package, sheet_part).get(relationship)
+    return _resolved(found[1]) if found else ""
+
+
+def _control_parts(package: OpcFile, sheet_part: str) -> dict[str, str]:
+    """Each control's own part, by the relationship the sheet names."""
+    out: dict[str, str] = {}
+    for relationship, (kind, target) in _sheet_relationships(package, sheet_part).items():
+        if kind != "ctrlProp":
+            continue
+        part = _resolved(target)
+        if package.has(part):
+            out[relationship] = package.read(part).decode("utf-8", errors="replace")
+    return out
+
+
+def _read_tables(sheet: Worksheet, package: OpcFile, sheet_xml: str) -> None:
+    """The tables the sheet's tableParts name, each from its own part."""
+    from pyopenvba.apps.excel._tables import read_table
+
+    for relationship in re.findall(r'<tablePart\b[^>]*\br:id="([^"]+)"', sheet_xml):
+        part = _part_for(package, sheet.part_name, relationship)
+        if part and package.has(part):
+            xml = package.read(part).decode("utf-8", errors="replace")
+            sheet.tables.append(read_table(sheet, part, relationship, xml))
+
+
+#: Where a sheet's tableParts go: before the first of these that is there.
+_AFTER_TABLE_PARTS = re.compile(r"<extLst\b|</worksheet>")
+
+
+def _drop_gone_tables(book: Workbook, package: OpcFile) -> None:
+    """Take from the file each table of a sheet that the macro deleted or unlisted, which left in its part and tableParts
+    comes back on opening, or over cleared cells has Excel refuse the file (tests/fixtures/deleted_data.json)."""
+    for sheet in book.sheets_:
+        if not sheet.part_name or not package.has(sheet.part_name):
+            continue
+        held = {table.part for table in sheet.tables}
+        gone = {relationship: _resolved(target) for relationship, (kind, target) in _sheet_relationships(package, sheet.part_name).items()
+                if kind == "table" and _resolved(target) not in held}
+        if not gone:
+            continue
+        xml = package.read(sheet.part_name).decode("utf-8", errors="replace")
+        for relationship in gone:
+            xml = re.sub(r'<tablePart\b[^>]*\br:id="' + re.escape(relationship) + r'"[^>]*/>', "", xml)
+        left = re.findall(r"<tablePart\b[^>]*/>", xml)
+        element = f'<tableParts count="{len(left)}">{"".join(left)}</tableParts>' if left else ""
+        xml = re.sub(r"<tableParts\b.*?</tableParts>|<tableParts\b[^>]*/>", lambda _: element, xml, count=1, flags=re.DOTALL)
+        package.write(sheet.part_name, xml.encode("utf-8"))
+        for part in gone.values():
+            # A table over a database takes its query table's part with it (tests/fixtures/list_query_add_saved.json).
+            owned = [_resolved(target) for kind, target in _sheet_relationships(package, part).values() if kind == "queryTable"]
+            _drop_sheet_part(package, sheet, part)
+            rels = posixpath.join(posixpath.dirname(part), "_rels", posixpath.basename(part) + ".rels")
+            if owned and package.has(rels):
+                package.remove(rels)
+            for one in owned:
+                _remove_unreferenced_part(package, one)
+            # With its last relationship gone the sheet has no relationships part, as Excel writes none.
+            sheet_rels = posixpath.join(posixpath.dirname(sheet.part_name), "_rels", posixpath.basename(sheet.part_name) + ".rels")
+            if owned and package.has(sheet_rels) and "<Relationship " not in package.read(sheet_rels).decode("utf-8"):
+                package.remove(sheet_rels)
+
+
+def _drop_gone_pivot_tables(book: Workbook, package: OpcFile) -> None:
+    """Take from the file each pivot table a macro deleted, and its cache if no table is left to use it."""
+    from pyopenvba.apps.excel._pivots import PivotTable
+
+    for sheet in book.sheets_:
+        if not sheet.part_name or not package.has(sheet.part_name):
+            continue
+        tables: list[PivotTable] = sheet.pivot_tables
+        held = {table.part for table in tables}
+        gone = [_resolved(target) for kind, target in _sheet_relationships(package, sheet.part_name).values()
+                if kind == "pivotTable" and _resolved(target) not in held and package.has(_resolved(target))]
+        for part in gone:
+            tree = _part_tree(package, part)
+            for relationship, (_kind, target) in _sheet_relationships(package, sheet.part_name).items():
+                if _resolved(target) == part:
+                    _remove_sheet_relationship(package, sheet.part_name, relationship)
+            _remove_unused_pivot_caches(book, package, tree)
+            _remove_parts_left_unreached(package, tree)
+
+
+def _write_tables(book: Workbook, package: OpcFile) -> None:
+    """Every table the model made or changed, in its own part; a sheet with a new one names it in tableParts."""
+    from pyopenvba.apps.excel._table_sort import changed as sort_changed
+    from pyopenvba.apps.excel._tables import patched_xml, table_xml
+
+    for sheet in book.sheets_:
+        added = False
+        for table in sheet.tables:
+            if table.part and not table.changed and not sort_changed(table):
+                continue
+            # A table ListObjects.Add made over a database is written whole: a refresh changes its columns and their ids.
+            made = table.query is not None and table.query.made
+            if table.part and table.xml and not made:
+                table.xml = patched_xml(table)
+                package.write(table.part, table.xml.encode("utf-8"))
+                table.changed = False
+                continue
+            if not table.part:
+                if not sheet.part_name:
+                    continue
+                taken = set(package.names())
+                number = 1
+                while f"xl/tables/table{number}.xml" in taken:
+                    number += 1
+                table.part = f"xl/tables/table{number}.xml"
+                add_content_type(package, table.part,
+                                 "application/vnd.openxmlformats-officedocument.spreadsheetml.table+xml")
+                table.relationship = _add_sheet_relationship(
+                    package, sheet.part_name, f"../tables/table{number}.xml",
+                    "http://schemas.openxmlformats.org/officeDocument/2006/relationships/table")
+                added = True
+            table.xml = table_xml(table)
+            package.write(table.part, table.xml.encode("utf-8"))
+            table.changed = False
+        if added and package.has(sheet.part_name):
+            xml = package.read(sheet.part_name).decode("utf-8", errors="replace")
+            parts = "".join(f'<tablePart r:id="{table.relationship}"/>' for table in sheet.tables)
+            element = f'<tableParts count="{len(sheet.tables)}">{parts}</tableParts>'
+            existing = re.search(r"<tableParts\b.*?</tableParts>|<tableParts\b[^>]*/>", xml, re.DOTALL)
+            if existing is not None:
+                xml = xml[: existing.start()] + element + xml[existing.end():]
+            else:
+                place = _AFTER_TABLE_PARTS.search(xml)
+                if place is not None:
+                    xml = xml[: place.start()] + element + xml[place.start():]
+            package.write(sheet.part_name, xml.encode("utf-8"))
+
+
+def _write_shapes(book: Workbook, package: OpcFile) -> None:
+    """Write back the drawing of every sheet whose shapes changed."""
+    from pyopenvba.shapes._xlsx import EMPTY_DRAWING, read_drawing, written
+    from pyopenvba.apps.excel import _charts_file
+
+    for chart_sheet in book.chart_sheets:
+        chart_sheet.write_changes(package)
+        _charts_file.refresh(chart_sheet.sheet, package)
+        if package.read(chart_sheet.part_name).decode("utf-8", errors="replace") != chart_sheet.saved_xml():
+            package.write(chart_sheet.part_name, chart_sheet.saved_xml().encode("utf-8"))
+    from pyopenvba.apps.excel._old_drawings import follow_text_links
+
+    for sheet in book.sheets_:
+        # Rows grown by their fonts move the shapes over them before they are written, and linked text shows its cell.
+        sheet.dims.settle_shapes()
+        follow_text_links(sheet)
+        _charts_file.refresh(sheet, package)
+        if not sheet.drawing_dirty:
+            continue
+        if not sheet.drawing_part and not sheet.shapes_:
+            # Its only chart moved away before it was ever written (tests/fixtures/chart_location.json).
+            sheet.drawing_dirty = False
+            continue
+        part = sheet.drawing_part or _new_drawing(book, package, sheet)
+        if not part:
+            continue
+        original = sheet.drawing_xml or EMPTY_DRAWING
+        before = read_drawing(original, sheet.drawing_grid())
+        _charts_file.write(sheet, package, part)
+        _write_pictures(package, sheet, part)
+        package.write(part, written(sheet.shapes_, original, sheet.drawing_grid()).encode("utf-8"))
+        sheet.drawing_part = part
+        sheet.drawing_xml = package.read(part).decode("utf-8", errors="replace")
+        for relationship, (kind, target) in _sheet_relationships(package, part).items():
+            # A deleted picture's image goes with it, unless another picture holds the same one.
+            if kind == "image" and f'"{relationship}"' not in sheet.drawing_xml:
+                _remove_sheet_relationship(package, part, relationship)
+                _remove_unreferenced_part(package, _resolved(target))
+        _sync_controls(package, sheet, before)
+        _write_new_controls(package, sheet)
+        _write_control_macros(package, sheet)
+        sheet.drawing_dirty = False
+
+
+def _write_shape_default(book: Workbook, package: OpcFile) -> None:
+    """SetShapesDefaultProperties' spDef in the theme part (tests/fixtures/shape_columns.json)."""
+    if not book.shape_default_markup:
+        return
+    for part in package.names():
+        if re.fullmatch(r"xl/theme/theme\d+\.xml", part):
+            text = re.sub(r"<a:spDef>.*?</a:spDef>", "", package.read(part).decode("utf-8"), flags=re.DOTALL)
+            markup = book.shape_default_markup
+            package.write(part, re.sub(r"<a:objectDefaults>", lambda _: f"<a:objectDefaults>{markup}", text, count=1).encode("utf-8"))
+            return
+
+
+def _write_pictures(package: OpcFile, sheet: Worksheet, drawing: str) -> None:
+    """Each new picture's image in xl/media, sharing a part and a relationship with any that holds the same bytes
+    (tests/fixtures/shape_add_picture.json)."""
+    from pyopenvba._relationships import in_office_order
+    from pyopenvba.apps.excel._charts_file import rels_part
+
+    related: dict[bytes, str] = {shape.image: shape.image_relationship for shape in sheet.shapes_
+                                 if shape.image is not None and shape.image_relationship}
+    linked = {shape.image_link: shape.image_relationship for shape in sheet.shapes_ if shape.image_link and shape.image_relationship}
+    rels = rels_part(drawing)
+    for shape in sheet.shapes_:
+        if shape.image_link and not shape.image_relationship:
+            # A linked picture's relationship names its file, whose bytes stay out of the workbook.
+            if shape.image_link not in linked:
+                linked[shape.image_link] = add_relationship(package, rels, _IMAGE_RELATIONSHIP, "file:///" + shape.image_link, external=True)
+                package.write(rels, in_office_order(package.read(rels).decode("utf-8")).encode("utf-8"))
+            shape.image_relationship = linked[shape.image_link]
+        if shape.image is None or shape.image_relationship:
+            continue
+        if shape.image not in related:
+            held = sorted(name for name in package.names() if name.startswith("xl/media/"))
+            part = next((name for name in held if package.read(name) == shape.image), None)
+            extension = shape.image_extension
+            if part is None:
+                number = 1
+                while any(name.startswith(f"xl/media/image{number}.") for name in held):
+                    number += 1
+                part = f"xl/media/image{number}.{extension}"
+                package.write(part, shape.image)
+            # The extension names the content type, unless the file holds a PNG (tests/fixtures/shape_picture_formats.json).
+            holds_png = shape.image[:4] == b"\x89PNG"
+            _add_default_content_type(package, extension, "image/png" if holds_png else {
+                "jpg": "image/jpeg", "jpeg": "image/jpeg", "gif": "image/gif"}.get(extension, "image/png"))
+            related[shape.image] = add_relationship(package, rels, _IMAGE_RELATIONSHIP, "../" + part[len("xl/"):])
+            package.write(rels, in_office_order(package.read(rels).decode("utf-8")).encode("utf-8"))
+        shape.image_relationship = related[shape.image]
+
+
+def _sync_control_flags(package: OpcFile, sheet: Worksheet, xml: str, vml: str, item: ShapeState, info: object) -> tuple[str, str]:
+    """A loaded control's Enabled, PrintObject, LockedText, DropDownLines and Display3DShading where they now differ from what its file holds, written where Excel
+    writes each (tests/fixtures/loaded_control_edits.json); a control nobody changed is left as its file has it."""
+    from dataclasses import replace
+
+    from pyopenvba.shapes._xlsx import read_control_settings, with_control_flags, with_control_settings, with_vml_flags, with_vml_text_frame
+
+    control = item.control
+    if control is None:
+        return xml, vml
+    held = replace(control)
+    read_control_settings(vml, replace(item, control=held), held)
+    file_lock = getattr(info, "lock_text", control.lock_text)
+    file_three_d = getattr(info, "three_d", control.three_d)
+    in_part = file_lock != control.lock_text or file_three_d != control.three_d
+    if (held.disabled, held.print_object, held.drop_lines) != (control.disabled, control.print_object, control.drop_lines) or in_part or control.button_flags:
+        xml = with_control_flags(xml, item)
+        vml = with_vml_flags(vml, item)
+    vml = with_vml_text_frame(vml, item)
+    part = _part_for(package, sheet.part_name, getattr(info, "relationship", ""))
+    if part and package.has(part):
+        properties = package.read(part).decode("utf-8")
+        changed = with_control_settings(properties, control)
+        if changed != properties and (in_part or held.drop_lines != control.drop_lines):
+            package.write(part, changed.encode("utf-8"))
+    return xml, vml
+
+
+def _sync_controls(package: OpcFile, sheet: Worksheet, before: list[ShapeState]) -> None:
+    """Follow control edits and deletions into the sheet, VML and part relationships."""
+    from pyopenvba.shapes._xlsx import (
+        control_text, read_controls, with_control_shape, with_control_state, with_vml_control,
+        without_control, without_vml_control, with_control_bindings, with_vml_bindings,
+    )
+
+    if not sheet.part_name or not package.has(sheet.part_name):
+        return
+    xml = package.read(sheet.part_name).decode("utf-8")
+    controls = read_controls(xml, _control_parts(package, sheet.part_name))
+    vml_part = _sheet_relationship(package, sheet.part_name, "vmlDrawing")
+    vml = package.read(vml_part).decode("utf-8") if vml_part and package.has(vml_part) else ""
+    current = {item.shape_id: item for item in sheet.shapes_}
+    for old in before:
+        info = controls.get(old.shape_id)
+        if old.kind != "formControl" or info is None:
+            continue
+        item = current.get(old.shape_id)
+        if item is None or item.control is None or item.control.relationship != info.relationship:
+            part = _part_for(package, sheet.part_name, info.relationship)
+            xml = without_control(xml, old.shape_id)
+            vml = without_vml_control(vml, old.shape_id)
+            _remove_sheet_relationship(package, sheet.part_name, info.relationship)
+            if part:
+                _remove_unreferenced_part(package, part)
+            continue
+        if "<xdr:txBody" not in old.source:
+            old.text = control_text(vml, old.shape_id)
+        if (item.name, item.left, item.top, item.width, item.height) != (
+            old.name, old.left, old.top, old.width, old.height,
+        ):
+            xml = with_control_shape(xml, item, sheet.drawing_grid())
+        xml = with_control_state(xml, item)
+        vml = with_vml_control(vml, item, old, sheet.drawing_grid())
+        xml, vml = _sync_control_flags(package, sheet, xml, vml, item, info)
+        if any(getattr(item.control, key) != getattr(info, key) for key in (
+            "linked_cell", "list_range", "value", "selection_mode", "items", "selected_indices",
+            "minimum", "maximum", "increment", "page_change", "drop_width", "first_button",
+        )):
+            part = _part_for(package, sheet.part_name, info.relationship)
+            if part and package.has(part):
+                properties = package.read(part).decode("utf-8")
+                package.write(part, with_control_bindings(properties, item.control).encode("utf-8"))
+            vml = with_vml_bindings(vml, item.shape_id, item.control)
+    if vml_part:
+        if re.search(r"<v:shape(?=[\s/>])", vml) or sheet.notes:
+            # A part the sheet's notes are about to draw in stays, empty or not (see _write_notes).
+            package.write(vml_part, vml.encode("utf-8"))
+        else:
+            for rid, (kind, _) in _sheet_relationships(package, sheet.part_name).items():
+                if kind == "vmlDrawing":
+                    _remove_sheet_relationship(package, sheet.part_name, rid)
+                    xml = re.sub(
+                        r"<legacyDrawing\b[^>]*/>",
+                        lambda m: "" if _attributes(m.group(0)).get("r:id") == rid else m.group(0), xml,
+                    )
+            _remove_unreferenced_part(package, vml_part)
+    package.write(sheet.part_name, xml.encode("utf-8"))
+
+
+def _remove_sheet_relationship(package: OpcFile, sheet_part: str, relationship: str) -> None:
+    folder, _, name = sheet_part.rpartition("/")
+    part = f"{folder}/_rels/{name}.rels"
+    if package.has(part):
+        text = package.read(part).decode("utf-8")
+        text = re.sub(r"<Relationship\b[^>]*/>",
+                      lambda m: "" if _attributes(m.group(0)).get("Id") == relationship else m.group(0), text)
+        package.write(part, in_office_order(text).encode("utf-8"))
+
+
+def _remove_unreferenced_part(package: OpcFile, part: str) -> None:
+    """A control part may be shared; remove it only after its final relationship."""
+    for name in package.names():
+        if not name.endswith(".rels"):
+            continue
+        folder = name.split("/_rels/", 1)[0] if "/_rels/" in name else ""
+        for element in re.findall(r"<Relationship\b[^>]*/>", package.read(name).decode("utf-8")):
+            attrs = _attributes(element)
+            if attrs.get("TargetMode") == "External":
+                continue
+            target = attrs.get("Target", "")
+            resolved = target.lstrip("/") if target.startswith("/") else posixpath.normpath(posixpath.join(folder, target))
+            if resolved == part:
+                return
+    package.remove(part)
+    types = package.read("[Content_Types].xml").decode("utf-8")
+    types = re.sub(r"<Override\b[^>]*/>",
+                   lambda m: "" if _attributes(m.group(0)).get("PartName") == f"/{part}" else m.group(0), types)
+    package.write("[Content_Types].xml", types.encode("utf-8"))
+
+
+def _write_new_controls(package: OpcFile, sheet: Worksheet) -> None:
+    """Make real controls of the form controls a macro added.
+
+    A form control is four things at once: the hidden shape in the
+    drawing, the sheet's own ``<control>`` record, a part of its own
+    saying what kind it is, and the VML Excel actually draws.  Miss any
+    of them and Excel either loses the control or asks to repair the
+    file.
+    """
+    from pyopenvba.shapes._xlsx import CONTROL_SHAPE_TYPE, EMPTY_VML, control_entry, control_vml, with_vml_shape
+
+    fresh = [
+        one
+        for one in sheet.shapes_
+        if one.kind == "formControl" and one.control is not None and not one.control.part_name
+    ]
+    if not fresh or not sheet.part_name or not package.has(sheet.part_name):
+        return
+    sheet_xml = package.read(sheet.part_name).decode("utf-8", errors="replace")
+    vml_part = _sheet_relationship(package, sheet.part_name, "vmlDrawing")
+    if not vml_part:
+        vml_part = _new_vml(package, sheet)
+        sheet_xml = package.read(sheet.part_name).decode("utf-8", errors="replace")
+    vml = package.read(vml_part).decode("utf-8", errors="replace") if package.has(vml_part) else EMPTY_VML
+    grid = sheet.drawing_grid()
+    entries: list[str] = []
+    for shape in fresh:
+        part = _new_control_part(package, shape)
+        relationship = _add_sheet_relationship(
+            package,
+            sheet.part_name,
+            f"../ctrlProps/{part.rsplit('/', 1)[1]}",
+            # The type Excel writes, read out of a file it saved.  A
+            # control whose r:id resolves to nothing makes a workbook
+            # Excel will not open at all.
+            "http://schemas.openxmlformats.org/officeDocument/2006/relationships/ctrlProp",
+        )
+        if shape.control is not None:
+            shape.control.part_name = part
+            shape.control.relationship = relationship
+        entries.append(control_entry(shape, relationship, grid))
+        if 'id="_x0000_t201"' not in vml:
+            # A part a sheet's notes made has no shape type for a control yet.
+            vml = with_vml_shape(vml, CONTROL_SHAPE_TYPE)
+        vml = with_vml_shape(vml, control_vml(shape, grid))
+    package.write(vml_part, vml.encode("utf-8"))
+    package.write(sheet.part_name, _with_controls(sheet_xml, entries).encode("utf-8"))
+
+
+def _new_control_part(package: OpcFile, shape: ShapeState) -> str:
+    """A control's own part, written where Excel keeps them."""
+    from pyopenvba.shapes._xlsx import control_properties
+
+    taken = {name for name in package.names() if name.startswith("xl/ctrlProps/ctrlProp")}
+    number = 1
+    while f"xl/ctrlProps/ctrlProp{number}.xml" in taken:
+        number += 1
+    part = f"xl/ctrlProps/ctrlProp{number}.xml"
+    package.write(part, control_properties(shape).encode("utf-8"))
+    add_content_type(package, part, "application/vnd.ms-excel.controlproperties+xml")
+    return part
+
+
+def _new_vml(package: OpcFile, sheet: Worksheet) -> str:
+    """The VML part a sheet needs before it can hold a control, numbered from the sheet's block of ids."""
+    from pyopenvba.apps.excel._notes import vml_block
+    from pyopenvba.shapes._xlsx import EMPTY_VML
+
+    taken = {name for name in package.names() if name.startswith("xl/drawings/vmlDrawing")}
+    number = 1
+    while f"xl/drawings/vmlDrawing{number}.vml" in taken:
+        number += 1
+    part = f"xl/drawings/vmlDrawing{number}.vml"
+    package.write(part, EMPTY_VML.replace('data="1"', f'data="{vml_block(sheet)}"').encode("utf-8"))
+    _add_default_content_type(package, "vml", "application/vnd.openxmlformats-officedocument.vmlDrawing")
+    relationship = _add_sheet_relationship(
+        package,
+        sheet.part_name,
+        f"../drawings/vmlDrawing{number}.vml",
+        "http://schemas.openxmlformats.org/officeDocument/2006/relationships/vmlDrawing",
+    )
+    text = package.read(sheet.part_name).decode("utf-8", errors="replace")
+    if "<legacyDrawing " not in text:
+        element = f'<legacyDrawing r:id="{relationship}"/>'
+        # After the drawing, which is where Excel puts it.
+        if "<drawing " in text:
+            at = text.find("/>", text.find("<drawing ")) + 2
+            text = text[:at] + element + text[at:]
+        else:
+            text = text.replace("</worksheet>", element + "</worksheet>")
+        package.write(sheet.part_name, text.encode("utf-8"))
+    return part
+
+
+def _add_default_content_type(package: OpcFile, extension: str, content_type: str) -> None:
+    """One more Default in [Content_Types], if it is not there already.
+
+    It goes with the other Defaults, before the first Override: the
+    package schema wants them in that order, and Excel refuses to open
+    a workbook whose content types are out of it.
+    """
+    raw = package.read("[Content_Types].xml").decode("utf-8")
+    if f'Extension="{extension}"' in raw:
+        return
+    element = f'<Default Extension="{extension}" ContentType="{content_type}"/>'
+    # Excel keeps its Defaults in alphabetical order: png, rels, vml, xml (tests/fixtures/background_picture.json).
+    later = next((found for found in re.finditer(r'<Default\b[^>]*\bExtension="([^"]*)"[^>]*/>', raw)
+                  if found.group(1).lower() > extension.lower()), None)
+    if later is not None:
+        package.write("[Content_Types].xml", (raw[:later.start()] + element + raw[later.start():]).encode("utf-8"))
+        return
+    at = raw.rfind("/>", 0, raw.find("<Override"))
+    if at < 0:
+        at = raw.find(">", raw.find("<Types"))
+    package.write("[Content_Types].xml", (raw[: at + 2] + element + raw[at + 2 :]).encode("utf-8"))
+
+
+#: What a control's markup needs declared on the worksheet element: the
+#: drawing prefix its anchor uses, and the 2009 prefix the
+#: AlternateContent requires.  A sheet Excel wrote with controls has
+#: both; one written from the template has neither, and leaving them
+#: out makes a file Excel will not open.
+_CONTROL_NAMESPACES = {
+    "xdr": "http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing",
+    "x14": "http://schemas.microsoft.com/office/spreadsheetml/2009/9/main",
+}
+
+
+def _with_namespaces(sheet_xml: str, wanted: dict[str, str]) -> str:
+    """The sheet with these prefixes declared, if they are not already."""
+    found = re.search(r"<worksheet\b[^>]*>", sheet_xml)
+    if found is None:
+        return sheet_xml
+    element = found.group(0)
+    additions = "".join(
+        f' xmlns:{prefix}="{uri}"'
+        for prefix, uri in wanted.items()
+        if f"xmlns:{prefix}=" not in element
+    )
+    if not additions:
+        return sheet_xml
+    changed = element[:-1].rstrip() + additions + ">"
+    return sheet_xml[: found.start()] + changed + sheet_xml[found.end() :]
+
+
+def _with_controls(sheet_xml: str, entries: list[str]) -> str:
+    """The sheet carrying these control records, where Excel keeps them."""
+    if not entries:
+        return sheet_xml
+    sheet_xml = _with_namespaces(sheet_xml, _CONTROL_NAMESPACES)
+    body = "".join(entries)
+    marker = "<controls>"
+    at = sheet_xml.find(marker)
+    if at >= 0:
+        head = at + len(marker)
+        return sheet_xml[:head] + body + sheet_xml[head:]
+    block = (
+        '<mc:AlternateContent xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006">'
+        '<mc:Choice Requires="x14">'
+        f"<controls>{body}</controls>"
+        "</mc:Choice>"
+        "</mc:AlternateContent>"
+    )
+    return sheet_xml.replace("</worksheet>", block + "</worksheet>")
+
+
+def _write_control_macros(package: OpcFile, sheet: Worksheet) -> None:
+    """Follow a form control's macro into the two parts that hold it.
+
+    A control's macro is not in the drawing at all: the sheet's own
+    ``controlPr`` carries it, and so does the ``x:FmlaMacro`` of the
+    VML shape Excel reads.  Written as Excel writes it, ``[0]!Name``
+    for a procedure in this workbook.
+    """
+    from pyopenvba.shapes._xlsx import control_macro, with_control_macro, with_vml_macro
+
+    controls = [one for one in sheet.shapes_ if one.kind == "formControl"]
+    if not controls or not sheet.part_name or not package.has(sheet.part_name):
+        return
+    sheet_xml = package.read(sheet.part_name).decode("utf-8", errors="replace")
+    vml_part = _sheet_relationship(package, sheet.part_name, "vmlDrawing")
+    vml = package.read(vml_part).decode("utf-8", errors="replace") if vml_part else ""
+    changed_sheet = False
+    changed_vml = False
+    for shape in controls:
+        wanted = f"[0]!{shape.macro}" if shape.macro else ""
+        if control_macro(sheet_xml, shape.shape_id) == wanted:
+            continue
+        sheet_xml = with_control_macro(sheet_xml, shape.shape_id, wanted)
+        changed_sheet = True
+        if vml:
+            vml = with_vml_macro(vml, shape.shape_id, wanted)
+            changed_vml = True
+    if changed_sheet:
+        package.write(sheet.part_name, sheet_xml.encode("utf-8"))
+    if changed_vml:
+        package.write(vml_part, vml.encode("utf-8"))
+
+
+def _new_drawing(book: Workbook, package: OpcFile, sheet: Worksheet) -> str:
+    """A drawing part for a sheet that had none, wired to the sheet.
+
+    Three things make a drawing part real to Excel: the part itself,
+    the content type that says what it is, and the sheet's own
+    ``<drawing>`` element naming the relationship to it.
+    """
+    from pyopenvba.shapes._xlsx import EMPTY_DRAWING
+
+    if not sheet.part_name:
+        return ""
+    taken = {
+        name for name in package.names() if name.startswith("xl/drawings/drawing")
+    }
+    number = 1
+    while f"xl/drawings/drawing{number}.xml" in taken:
+        number += 1
+    part = f"xl/drawings/drawing{number}.xml"
+    package.write(part, EMPTY_DRAWING.encode("utf-8"))
+    add_content_type(
+        package,
+        part,
+        "application/vnd.openxmlformats-officedocument.drawing+xml",
+    )
+    relationship = _add_sheet_relationship(
+        package,
+        sheet.part_name,
+        f"../drawings/drawing{number}.xml",
+        "http://schemas.openxmlformats.org/officeDocument/2006/relationships/drawing",
+    )
+    _name_the_drawing(package, sheet, relationship)
+    return part
+
+
+def _add_sheet_relationship(package: OpcFile, sheet_part: str, target: str, kind: str) -> str:
+    """One more relationship on a sheet, and the id it was given."""
+    folder, _, name = sheet_part.rpartition("/")
+    rels = f"{folder}/_rels/{name}.rels"
+    if package.has(rels):
+        text = package.read(rels).decode("utf-8", errors="replace")
+    else:
+        text = (
+            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\r\n'
+            '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+            "</Relationships>"
+        )
+    used = {
+        fields.get("Id", "")
+        for fields in map(_attributes, re.findall(r"<Relationship\b[^>]*/>", text))
+    }
+    number = 1
+    while f"rId{number}" in used:
+        number += 1
+    identifier = f"rId{number}"
+    element = f'<Relationship Id="{identifier}" Type="{kind}" Target="{target}"/>'
+    # Office writes a part's relationships in its own order, which puts a comments part ahead of its sheet's VML
+    # part (see pyopenvba._relationships).
+    package.write(rels, in_office_order(text.replace("</Relationships>", element + "</Relationships>"))
+                  .encode("utf-8"))
+    return identifier
+
+
+def _name_the_drawing(package: OpcFile, sheet: Worksheet, relationship: str) -> None:
+    """Put the ``<drawing>`` element in the sheet, where Excel keeps it.
+
+    It goes at the end of the sheet, after everything else Excel writes;
+    a sheet that already names a drawing is left alone.
+    """
+    text = package.read(sheet.part_name).decode("utf-8", errors="replace")
+    if "<drawing " in text:
+        return
+    element = f'<drawing r:id="{relationship}"/>'
+    if "</worksheet>" not in text:
+        return
+    # Ahead of a <legacyDrawing> a sheet's notes put there, which the schema has after it.
+    cells_end = max(text.find("</sheetData>"), text.find("<sheetData/>"), 0)
+    place = _AFTER_DRAWING.search(text, cells_end)
+    at = place.start() if place is not None else text.rfind("</worksheet>")
+    package.write(sheet.part_name, (text[:at] + element + text[at:]).encode("utf-8"))
+
+
+#: What follows a sheet's <drawing> in the schema's order, after its cells: the first of these there.
+_AFTER_DRAWING = re.compile(r"<(?:legacyDrawing|legacyDrawingHF|picture|oleObjects|controls|webPublishItems|"
+                            r"tableParts|extLst|mc:AlternateContent)\b|</worksheet>")
+
+
+def _read_queries(book: Workbook, path: Path) -> None:
+    from pyopenvba.apps.excel._model import QueryEntry
+
+    try:
+        from pyopenvba.powerquery import PowerQueryWorkbook
+    except ImportError:  # pragma: no cover - the package always ships
+        return
+    try:
+        with PowerQueryWorkbook(path) as queries:
+            for name in queries.query_names():
+                query = queries.query(name)
+                book.queries_.entries.append(
+                    QueryEntry(name, query.formula, getattr(query, "description", "") or "")
+                )
+    except Exception:  # noqa: BLE001 - a workbook with no Power Query is ordinary
+        return
+
+
+def _split_reference(reference: str) -> tuple[int, int]:
+    letters = "".join(char for char in reference if char.isalpha())
+    digits = "".join(char for char in reference if char.isdigit())
+    return column_number(letters), int(digits)
+
+
+# --- writing --------------------------------------------------------------------------
+
+
+def save_workbook(book: Workbook, target: Path, *, fresh_suffix: str | None = None) -> None:
+    """Write the workbook out, patching only the cells the model changed. A workbook made here takes the package
+    of ``fresh_suffix``'s format, or else of the target's extension."""
+    from pyopenvba.apps.excel._controls import refresh
+    from pyopenvba.apps.excel._pivot_options import settle_manual
+
+    settle_manual(book)
+    calculate_for_save(book)
+    # Worked out once for the save, when a sheet first asks, from the formulas as they now stand.
+    book.calculator.volatile_readers = None
+    from pyopenvba.apps.excel._sort import preflight_save
+
+    preflight_save(book)
+    for sheet in book.sheets_:
+        for shape in sheet.shapes_:
+            refresh(sheet, shape)
+    package = book.package
+    removed_sheets = False
+    if package is None:
+        package = _fresh_package(fresh_suffix if fresh_suffix is not None else target.suffix.lower())
+        book.package = package
+        _match_sheets_to_package(book, package)
+        if book.chart_sheets:
+            _sync_sheets(book, package)
+    else:
+        _sync_sheets(book, package)
+        removed_sheets = _remove_deleted_sheets(book, package)
+        if book.deleted_chart_sheets:
+            from pyopenvba.apps.excel._chart_sheets import remove_deleted
+
+            remove_deleted(book, package)
+    from pyopenvba.apps.excel._cell_styles import prepare_save
+    from pyopenvba.apps.excel._windows import saved, tabs_moved, with_book_view, with_view
+
+    tabs = tabs_moved(book)
+    before = {sheet.part_name: package.read(sheet.part_name) for sheet in book.sheets_ if sheet.part_name and package.has(sheet.part_name)}
+    # A style a cell uses is written before the cells' formats, whose parts follow its own.
+    prepare_save(book)
+    collector = Collector()
+    for sheet in book.sheets_:
+        if any(cell.dynamic for cell in sheet.cells_.values()):
+            # A dynamic-array formula's cm and vm number the metadata the save writes afresh, so its sheet is
+            # written afresh too.
+            sheet.dirty = True
+        if any(not cell.formula and isinstance(cell.value, ExcelError) and cell.value.name in ('#SPILL!', '#CALC!')
+               for cell in sheet.cells_.values()):
+            sheet.dirty = True
+        if sheet.notes_changed:
+            # A note's row and cell are written in the sheet (see _notes_file).
+            sheet.dirty = True
+    # The save leaves out the file's xfs nothing uses any more, which moves the ones after them.
+    moves = book.stylesheet.moved_from_file()
+    from pyopenvba.apps.excel._page_setup import pending as page_pending
+    from pyopenvba.apps.excel._sort import changed as sort_changed
+    from pyopenvba.apps.excel._sort import with_sort_state
+
+    for sheet in book.sheets_:
+        # A sheet nobody wrote to keeps the bytes it arrived with, its view too unless the window changed it.
+        outline_changes = sheet.outline_state is not None and bool(sheet.outline_state.changes
+                                                                        or sheet.outline_state.changed_rows
+                                                                        or sheet.outline_state.changed_columns)
+        page_changes = page_pending(sheet)
+        sort_changes = sort_changed(sheet)
+        # Excel writes the rules of a workbook it read without a VBA project in its own order, joined where it
+        # joined them (_conditional_joins), so a sheet keeps its bytes only where they are those.
+        conditional_changes = not sheet.dirty and _plain_conditional(sheet)
+        breaks_changes = sheet.page_breaks is not None and sheet.page_breaks.changed
+        from pyopenvba.apps.excel._sparklines import rewritten as sparklines_rewritten
+
+        sparkline_changes = sparklines_rewritten(sheet)
+        if not sheet.part_name or not (sheet.dirty or sheet.view.changed or tabs or moves or page_changes
+                                       or outline_changes or sort_changes or conditional_changes
+                                       or sheet.tab_changed or breaks_changes or sheet.transitions_changed
+                                       or sparkline_changes):
+            continue
+        original = (
+            package.read(sheet.part_name).decode("utf-8", errors="replace")
+            if package.has(sheet.part_name)
+            else _EMPTY_SHEET
+        )
+        patched = with_view(sheet, _patched_sheet(sheet, original, package, collector) if sheet.dirty
+                            else _restyled_sheet(original, moves), tabs=tabs)
+        if outline_changes:
+            from pyopenvba.apps.excel._outline import with_outline
+
+            patched = with_outline(sheet, patched)
+        if page_changes:
+            from pyopenvba.apps.excel._page_setup import with_setup
+
+            patched = with_setup(sheet, patched)
+        if sort_changes:
+            patched = with_sort_state(sheet, patched)
+        if sheet.tab_changed:
+            from pyopenvba.apps.excel._sheet_tabs import with_tab
+
+            patched = with_tab(sheet, patched)
+        if sheet.transitions_changed:
+            from pyopenvba.apps.excel._worksheet_settings import with_transitions
+
+            patched = with_transitions(sheet, patched)
+        if breaks_changes:
+            from pyopenvba.apps.excel._page_breaks import with_breaks
+
+            patched = with_breaks(sheet, patched)
+        if conditional_changes:
+            from pyopenvba.apps.excel._conditional import with_rules as with_conditional_rules
+
+            patched = with_conditional_rules(patched, sheet.conditional_formats,
+                                             extension=not sheet.conditional_foreign)
+            sheet.conditional_changed = False
+        if sparkline_changes:
+            from pyopenvba.apps.excel._sparklines import written as with_sparklines
+
+            patched = with_sparklines(sheet, patched)
+        from pyopenvba.apps.excel._error_checks import written as with_ignored_errors
+
+        patched = with_ignored_errors(sheet, patched)
+        from pyopenvba.apps.excel._scenarios import written as with_scenarios
+
+        patched = with_scenarios(sheet, patched)
+        from pyopenvba.apps.excel._allow_edit_ranges import written as with_allow_edit_ranges
+
+        patched = with_allow_edit_ranges(sheet, patched)
+        if sheet.dirty or patched != original:
+            package.write(sheet.part_name, patched.encode("utf-8"))
+            if outline_changes and sheet.outline_state is not None:
+                sheet.outline_state.axes_checked = False
+    _write_cached_values(book, package)
+    if removed_sheets or any(sheet.part_name and package.has(sheet.part_name) and package.read(sheet.part_name) != before.get(sheet.part_name)
+                             for sheet in book.sheets_):
+        _blank_unused_strings(book, package)
+    collector.write(package)
+    from pyopenvba.apps.excel._pivot_rich import write as write_rich_pivots
+
+    write_rich_pivots(book, package)
+    if book.names_.changed:
+        _write_names(book, package)
+    from pyopenvba.apps.excel._custom_properties import write as write_custom_properties
+
+    write_custom_properties(book, package)
+    if book.protection_changed and package.has("xl/workbook.xml"):
+        from pyopenvba.apps.excel._protection import with_book_protection
+
+        text = package.read("xl/workbook.xml").decode("utf-8", errors="replace")
+        package.write("xl/workbook.xml", with_book_protection(book, text).encode("utf-8"))
+    if (tabs or book.view.changed) and package.has("xl/workbook.xml"):
+        text = package.read("xl/workbook.xml").decode("utf-8", errors="replace")
+        viewed = with_book_view(book, text)
+        if viewed != text:
+            package.write("xl/workbook.xml", viewed.encode("utf-8"))
+    _resize_loaded_tables(book, package)
+    _drop_gone_tables(book, package)
+    _write_tables(book, package)
+    from pyopenvba.apps.excel._xml_maps import write_parts as write_xml_maps
+
+    write_xml_maps(book, package, _add_sheet_relationship)
+    _drop_gone_pivot_tables(book, package)
+    from pyopenvba.apps.excel._pivot_create import write as write_pivots
+    from pyopenvba.apps.excel._pivots import number_parts
+
+    number_parts(book, package)
+    write_pivots(book, package)
+    _new_vml_parts(book, package)
+    _write_shapes(book, package)
+    _write_backgrounds(book, package)
+    _write_shape_default(book, package)
+    noted = {sheet.part_name for sheet in book.sheets_ if sheet.notes_changed and sheet.part_name}
+    _write_notes(book, package)
+    _write_threads(book, package, noted)
+    _write_links(book, package, str(target.resolve().parent))
+    from pyopenvba.apps.excel._workbook_links import write as write_workbook_links
+
+    write_workbook_links(book, package)
+    from pyopenvba.apps.excel._new_links import write_made
+
+    write_made(book, package, str(target.resolve().parent))
+    from pyopenvba.apps.excel._connections import refuse_changed
+
+    refuse_changed(book)
+    from pyopenvba.apps.excel._workbook_more import write_parts, write_theme
+
+    write_theme(book, package)
+    write_parts(book, package)
+    from pyopenvba.apps.excel._workbook_options import write as write_options
+
+    write_options(book, package)
+    from pyopenvba.apps.excel._dxf_table import number_dxfs
+
+    number_dxfs(book, package)
+    _write_styles(book, package)
+    from pyopenvba.apps.excel._calculation_settings import write as write_calculation
+    from pyopenvba.apps.excel._date_system import write as write_date_system
+
+    raw = package.read("xl/workbook.xml")
+    patched = write_date_system(book, raw)
+    text = patched.decode("utf-8", errors="replace")
+    calculated_xml = write_calculation(book, text)
+    if patched is not raw or calculated_xml != text:
+        package.write("xl/workbook.xml", calculated_xml.encode("utf-8"))
+    from pyopenvba.apps.excel._vba_save import persist_project
+
+    had_project = package.has('xl/vbaProject.bin')
+    package = persist_project(book, package)
+    if not had_project and package.has('xl/vbaProject.bin'):
+        from pyopenvba.apps.excel._conditional import canonical_load
+        from pyopenvba.apps.excel._conditional import with_rules as conditional_xml
+
+        for sheet in book.sheets_:
+            if sheet.part_name and any(canonical_load(rule) for rule in sheet.conditional_formats):
+                original = package.read(sheet.part_name).decode('utf-8')
+                rewritten = conditional_xml(original, sheet.conditional_formats, extension=not sheet.conditional_foreign)
+                if rewritten != original:
+                    package.write(sheet.part_name, rewritten.encode('utf-8'))
+    from pyopenvba.apps.excel._document_properties import write as write_properties
+
+    write_properties(book, package)
+    for sheet in book.sheets_:
+        for shape in sheet.shapes_:
+            if shape.macro_book:
+                raise VBAUnsupportedError(f"Saving a form control whose macro is in {shape.macro_book}, an external link in the file, is not implemented")
+            control = shape.control
+            if shape.kind == "formControl" and not shape.source and control is not None and (
+                    control.text_frame not in (None, ("HorizontalAlignment", -4108), ("VerticalAlignment", -4108), ("Orientation", -4128))
+                    or control.button_flags - {"JustLastX"}):
+                # Excel gives a new button a DrawingML text body, which it reads these from in place of the VML, and the model writes
+                # none yet: Excel would read the model's file otherwise (tests/fixtures/new_control_edits.json).
+                raise VBAUnsupportedError("Saving a new button's alignment, Orientation or DefaultButton, CancelButton, DismissButton or "
+                                          "HelpButton is not implemented")
+    from pyopenvba.apps.excel._query_tables import write as write_query_tables
+
+    write_query_tables(book, package, _add_sheet_relationship, _override_before_properties, _sheet_relationships, _resolved, _drop_sheet_part)
+    from pyopenvba.apps.excel._calc_chain import settle as settle_calc_chain
+
+    settle_calc_chain(book, package, _relationships(package), _remove_unreferenced_part)
+    book.application.outside("Saving a workbook")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(package.serialize())
+    book.package = package
+    book.deleted_document_names.clear()
+    book.date_system_changed = False
+    saved(book)
+
+
+#: A sheet added to a workbook, as Excel writes one on a 96-DPI display
+#: without the random xr:uid it gives each sheet.
+_EMPTY_SHEET = (
+    '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\r\n'
+    '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"'
+    ' xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"'
+    ' xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006" mc:Ignorable="x14ac xr xr2 xr3"'
+    ' xmlns:x14ac="http://schemas.microsoft.com/office/spreadsheetml/2009/9/ac"'
+    ' xmlns:xr="http://schemas.microsoft.com/office/spreadsheetml/2014/revision"'
+    ' xmlns:xr2="http://schemas.microsoft.com/office/spreadsheetml/2015/revision2"'
+    ' xmlns:xr3="http://schemas.microsoft.com/office/spreadsheetml/2016/revision3">'
+    '<dimension ref="A1"/><sheetViews><sheetView workbookViewId="0"/></sheetViews>'
+    '<sheetFormatPr defaultRowHeight="15" x14ac:dyDescent="0.25"/><sheetData/>'
+    '<pageMargins left="0.7" right="0.7" top="0.75" bottom="0.75" header="0.3" footer="0.3"/></worksheet>'
+)
+
+
+def _fresh_package(suffix: str) -> OpcFile:
+    """A package for a workbook that was made here rather than opened.
+
+    Built from the template captured from a freshly Excel-authored file,
+    so what comes out opens without a repair prompt.
+    """
+    from pyopenvba._templates import EMPTY_XLSM_BYTES
+
+    package = OpcFile.parse(EMPTY_XLSM_BYTES)
+    # A macro-enabled book Excel saves with no code holds no VBA project, nor code names (tests/fixtures/workbook_reads/settings.xlsm,
+    # tests/fixtures/workbook_reads_heldout/round1_excel.json): the project is put in at the save only when there is code for it.
+    _make_macro_free(package)
+    if suffix in (".xlsm", ".xltx", ".xltm"):
+        _write_main_type(package, {".xlsm": 52, ".xltx": 54, ".xltm": 53}[suffix])
+    return package
+
+
+_CONTENT_OVERRIDE = re.compile(r"<(?:[\w.-]+:)?Override\b[^>]*>")
+_CONTENT_ATTRIBUTE = re.compile(r'''\b([\w:.-]+)\s*=\s*(["'])(.*?)\2''')
+
+
+def _content_attributes(tag: str) -> dict[str, str]:
+    return {match.group(1): _unescape(match.group(3)) for match in _CONTENT_ATTRIBUTE.finditer(tag)}
+
+
+def workbook_format(book: Workbook) -> int:
+    if book.format_code is not None:
+        return book.format_code
+    if book.package is None:
+        return 51
+    content = book.package.read("[Content_Types].xml").decode("utf-8")
+    for element in _CONTENT_OVERRIDE.findall(content):
+        attributes = _content_attributes(element)
+        if attributes.get("PartName") == "/xl/workbook.xml":
+            return {
+                "application/vnd.ms-excel.sheet.macroEnabled.main+xml": 52,
+                "application/vnd.ms-excel.addin.macroEnabled.main+xml": 55,
+                "application/vnd.ms-excel.template.macroEnabled.main+xml": 53,
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.template.main+xml": 54,
+            }.get(attributes.get("ContentType", ""), 51)
+    return 51
+
+
+def prepare_format(book: Workbook, file_format: int) -> None:
+    """Convert existing XML workbook packaging for the supported SaveAs formats."""
+    from pyopenvba.apps.excel._sort import preflight_save
+
+    preflight_save(book)
+    package = book.package
+    previous = workbook_format(book)
+    book.format_code = file_format
+    if file_format not in (52, 53, 55) and any(entry.macro_type for entry in book.names_.entries):
+        book.names_.changed = True
+    if package is None or previous == file_format:
+        return
+    if previous == 51 and file_format == 52:
+        for sheet in book.sheets_:
+            if any(rule.imported for rule in sheet.conditional_formats):
+                # Native writes FileFormat51's loaded area/group order into
+                # the converted macro-enabled package without changing the
+                # current in-memory rule geometry or API projection.
+                sheet.conditional_changed = True
+                sheet.touched()
+    if file_format in (51, 54):
+        from pyopenvba._package_signature import relationships_part, without_signature
+
+        for part, data in without_signature(list(package.names()), package.read, "xl/vbaProject.bin").items():
+            if data is None:
+                package.remove(part)
+            else:
+                package.write(part, data)
+        rels = relationships_part("xl/vbaProject.bin")
+        if package.has(rels):
+            package.remove(rels)
+        _make_macro_free(package)
+    _write_main_type(package, file_format)
+
+
+def _write_main_type(package: OpcFile, file_format: int) -> None:
+    """The content type that says what the package is."""
+    content = package.read("[Content_Types].xml").decode("utf-8")
+    main = {52: "application/vnd.ms-excel.sheet.macroEnabled.main+xml",
+            53: "application/vnd.ms-excel.template.macroEnabled.main+xml",
+            54: "application/vnd.openxmlformats-officedocument.spreadsheetml.template.main+xml"}.get(
+                file_format, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml")
+
+    def changed(match: re.Match[str]) -> str:
+        tag = match.group(0)
+        if _content_attributes(tag).get("PartName") != "/xl/workbook.xml":
+            return tag
+        return re.sub(r'''(\bContentType\s*=\s*(["']))(.*?)\2''',
+                      lambda attribute: attribute.group(1) + main + attribute.group(2), tag)
+
+    content = _CONTENT_OVERRIDE.sub(changed, content)
+    package.write("[Content_Types].xml", content.encode("utf-8"))
+
+
+def _make_macro_free(package: OpcFile) -> None:
+    """Turn the macro-enabled template into a plain xlsx."""
+    if package.has("xl/vbaProject.bin"):
+        package.remove("xl/vbaProject.bin")
+    if package.has("xl/_rels/workbook.xml.rels"):
+        text = package.read("xl/_rels/workbook.xml.rels").decode("utf-8")
+        text = re.sub(r"<Relationship\b[^>]*vbaProject\.bin[^>]*/>", "", text)
+        package.write("xl/_rels/workbook.xml.rels", text.encode("utf-8"))
+    if package.has("[Content_Types].xml"):
+        text = package.read("[Content_Types].xml").decode("utf-8")
+        text = re.sub(r"<Override\b[^>]*vbaProject\.bin[^>]*/>", "", text)
+        # Excel's xlsx declares no bin parts; a project put in later declares them again (see _new_project).
+        text = text.replace('<Default Extension="bin" ContentType="application/vnd.ms-office.vbaProject"/>', "")
+        text = text.replace(
+            "application/vnd.ms-excel.sheet.macroEnabled.main+xml",
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml",
+        )
+        package.write("[Content_Types].xml", text.encode("utf-8"))
+    if package.has("xl/workbook.xml"):
+        text = package.read("xl/workbook.xml").decode("utf-8")
+        text = text.replace(' codeName="ThisWorkbook"', "")
+        package.write("xl/workbook.xml", text.encode("utf-8"))
+    for part in package.names():
+        if re.fullmatch(r"xl/worksheets/sheet\d+\.xml", part):
+            # A new workbook's sheets have no code names in an xlsx, nor a sheetPr for one (tests/fixtures/
+            # sheet_tabs/ none).
+            text = package.read(part).decode("utf-8")
+            plain = re.sub(r'<sheetPr codeName="[^"]*"/>', "", text)
+            plain = re.sub(r'(<sheetPr\b[^>]*?) codeName="[^"]*"', r"\1", plain)
+            if plain != text:
+                package.write(part, plain.encode("utf-8"))
+
+
+def _match_sheets_to_package(book: Workbook, package: OpcFile) -> None:
+    """Give every sheet a part, adding parts for the ones the template lacks."""
+    workbook_xml = package.read("xl/workbook.xml").decode("utf-8", errors="replace")
+    relationships = _relationship_map(package)
+    existing = [(name, relationships.get(rid, "")) for name, rid in sheet_entries(workbook_xml)]
+    additions: list[str] = []
+    for index, sheet in enumerate(book.sheets_):
+        if index < len(existing):
+            sheet.part_name = existing[index][1]
+        else:
+            sheet.part_name = f"xl/worksheets/sheet{index + 1}.xml"
+            package.write(sheet.part_name, _EMPTY_SHEET.encode("utf-8"))
+            add_content_type(
+                package,
+                sheet.part_name,
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml",
+            )
+            relationship = add_relationship(
+                package, "xl/_rels/workbook.xml.rels",
+                "http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet",
+                f"worksheets/sheet{index + 1}.xml",
+            )
+            additions.append(f'<sheet name="{_escape(sheet.name)}" sheetId="{sheet.sheet_id}"{_sheet_state(sheet)} '
+                             f'r:id="{relationship}"/>')
+    _rename_sheets_in_workbook(book, package, existing)
+    if additions:
+        text = package.read("xl/workbook.xml").decode("utf-8")
+        package.write("xl/workbook.xml", text.replace("</sheets>", "".join(additions) + "</sheets>", 1).encode("utf-8"))
+
+
+def has_reserved_sheet_names(sheet: Worksheet) -> bool:
+    """Check persisted scope by part identity, including after unsaved reorders."""
+    from xml.etree import ElementTree as ET
+
+    package = sheet.book.package
+    if package is None:
+        return False
+    root = ET.fromstring(package.read("xl/workbook.xml"))
+    relationships = _relationship_map(package)
+    tabs = [node for node in root.iter() if node.tag.endswith("}sheet")]
+    index = next((str(i) for i, node in enumerate(tabs)
+                  if relationships.get(node.attrib.get("{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id", "")) == sheet.part_name), "")
+    return any(node.attrib.get("name", "").startswith("_xlnm") and node.attrib.get("localSheetId") == index
+               for node in root.iter())
+
+
+def _part_tree(package: OpcFile, part: str) -> set[str]:
+    """A part and every part its relationships reach, however far."""
+    found: set[str] = set()
+    waiting = [part]
+    while waiting:
+        one = waiting.pop()
+        if one in found or not package.has(one):
+            continue
+        found.add(one)
+        folder, _, name = one.rpartition("/")
+        rels = f"{folder}/_rels/{name}.rels" if folder else f"_rels/{name}.rels"
+        if not package.has(rels):
+            continue
+        for element in re.findall(r"<Relationship\b[^>]*/>", package.read(rels).decode("utf-8")):
+            attributes = _attributes(element)
+            if attributes.get("TargetMode") == "External":
+                continue
+            target = attributes.get("Target", "")
+            waiting.append(target.lstrip("/") if target.startswith("/") else posixpath.normpath(posixpath.join(folder, target)))
+    return found
+
+
+def _remove_deleted_sheets(book: Workbook, package: OpcFile) -> bool:
+    """Take a deleted sheet out of the file, as Excel does, with all it alone reaches and any pivot cache no table is left
+    to use: only its entry in the workbook's list goes when the sheet is deleted, which leaves its cells, notes, shapes,
+    charts, tables and pivot tables for anyone who opens the package (tests/fixtures/deleted_sheet_parts.json). Whether
+    any did."""
+    kept = {sheet.part_name for sheet in book.sheets_}
+    gone = {key: part for key, (part, kind) in _relationships(package).items()
+            if kind.endswith("/worksheet") and part not in kept}
+    if not gone:
+        return False
+    text = package.read("xl/_rels/workbook.xml.rels").decode("utf-8")
+    text = re.sub(r"<Relationship\b[^>]*/>",
+                  lambda found: "" if _attributes(found.group(0)).get("Id") in gone else found.group(0), text)
+    package.write("xl/_rels/workbook.xml.rels", in_office_order(text).encode("utf-8"))
+    tree: set[str] = set()
+    for part in gone.values():
+        tree |= _part_tree(package, part)
+    _remove_unused_pivot_caches(book, package, tree)
+    _remove_parts_left_unreached(package, tree)
+    return True
+
+
+def _remove_parts_left_unreached(package: OpcFile, tree: set[str]) -> None:
+    """Take out each part of ``tree`` that nothing in the workbook reaches now, with its relationships and Override."""
+    still = _part_tree(package, "xl/workbook.xml")
+    for part in sorted(tree - still):
+        folder, _, name = part.rpartition("/")
+        rels = f"{folder}/_rels/{name}.rels"
+        if package.has(rels):
+            package.remove(rels)
+        package.remove(part)
+        types = package.read("[Content_Types].xml").decode("utf-8")
+        types = re.sub(r"<Override\b[^>]*/>",
+                       lambda found: "" if _attributes(found.group(0)).get("PartName") == f"/{part}" else found.group(0), types)
+        package.write("[Content_Types].xml", types.encode("utf-8"))
+
+
+def _remove_unused_pivot_caches(book: Workbook, package: OpcFile, tree: set[str]) -> None:
+    """Take from the workbook each pivot cache in ``tree`` that no remaining sheet's table uses."""
+    used: set[str] = set()
+    for sheet in book.sheets_:
+        if sheet.part_name:
+            used |= _part_tree(package, sheet.part_name)
+    linked = _relationships(package)
+    unused = {key for key, (part, _kind) in linked.items() if part in tree and part not in used and "pivotCacheDefinition" in part}
+    if not unused:
+        return
+    parts = {linked[key][0] for key in unused}
+    book.pivot_caches[:] = [cache for cache in book.pivot_caches if cache.part not in parts]
+    text = package.read("xl/_rels/workbook.xml.rels").decode("utf-8")
+    text = re.sub(r"<Relationship\b[^>]*/>",
+                  lambda found: "" if _attributes(found.group(0)).get("Id") in unused else found.group(0), text)
+    package.write("xl/_rels/workbook.xml.rels", in_office_order(text).encode("utf-8"))
+    workbook = package.read("xl/workbook.xml").decode("utf-8")
+    workbook = re.sub(r"<pivotCache\b[^>]*/>",
+                      lambda found: "" if _attributes(found.group(0)).get("r:id") in unused else found.group(0), workbook)
+    workbook = re.sub(r"<pivotCaches>\s*</pivotCaches>", "", workbook)
+    package.write("xl/workbook.xml", workbook.encode("utf-8"))
+
+
+def _blank_unused_strings(book: Workbook, package: OpcFile) -> None:
+    """Empty each shared string no sheet uses any more, so text a macro cleared, overwrote or deleted with its sheet does
+    not stay in the file (tests/fixtures/deleted_data.json). Excel leaves such a string out and numbers the rest again;
+    this keeps every number, as the sheets kept whole hold them, and so does not match Excel's bytes. The byte fidelity rule
+    is broken knowingly here, until the save writes the table as Excel does."""
+    if not package.has("xl/sharedStrings.xml"):
+        return
+    used: set[int] = set()
+    for sheet in book.sheets_:
+        if sheet.part_name and package.has(sheet.part_name):
+            used.update(map(int, _SHARED_REFERENCE.findall(package.read(sheet.part_name))))
+    data = package.read("xl/sharedStrings.xml")
+    pieces: list[bytes] = []
+    done = 0
+    for index, found in enumerate(_SHARED_ITEM_BYTES.finditer(data)):
+        if index not in used:
+            pieces += [data[done:found.start()], b"<si><t/></si>"]
+            done = found.end()
+    if pieces:
+        package.write("xl/sharedStrings.xml", b"".join([*pieces, data[done:]]))
+
+
+#: The number in a cell holding a shared string, and one string of the table.
+_SHARED_REFERENCE = re.compile(rb'\st="s"[^>]*>(?:<f\b[^>]*?(?:/>|>[^<]*</f>))?<v>([0-9]+)</v>')
+_SHARED_ITEM_BYTES = re.compile(rb"<si\b[^>]*?(?:/>|>.*?</si>)", re.DOTALL)
+
+
+def _sync_sheets(book: Workbook, package: OpcFile) -> None:
+    """Register new tabs in existing packages, preserving existing part identities."""
+    text = package.read("xl/workbook.xml").decode("utf-8")
+    relationships = _relationship_map(package)
+    block = re.search(r"<sheets\b[^>]*>.*?</sheets>", text, re.DOTALL)
+    if block is None:
+        raise WorkbookFileError("Workbook has no sheets list")
+    existing: dict[str, dict[str, str]] = {}
+    for tag in re.findall(r"<sheet\b[^>]*/>", block.group()):
+        attrs = _tag_attributes(tag)
+        existing[relationships.get(attrs.get("r:id", ""), "")] = attrs
+    from pyopenvba.apps.excel._advanced_filter import attribute_values, patch_attribute
+
+    old_parts = list(existing)
+    new_positions = {sheet.part_name: index for index, sheet in enumerate(book.tabs()) if sheet.part_name}
+    reserved: dict[str, str] = {}
+    for match in _DEFINED_NAME.finditer(text):
+        fragment, body = match.group(1), match.group(2)
+        attrs = attribute_values(fragment)
+        if not attrs.get("name", "").startswith("_xlnm") or "localSheetId" not in attrs:
+            continue
+        scope = attrs["localSheetId"]
+        if not re.fullmatch(r"[0-9]{1,10}", scope) or int(scope) >= len(old_parts):
+            raise VBAUnsupportedError("Saving reserved names with invalid sheet scope is not implemented")
+        position = new_positions.get(old_parts[int(scope)])
+        reserved[match.group()] = ("" if position is None else
+                                  "<definedName" + patch_attribute(fragment, "localSheetId", str(position))
+                                  + ">" + body + "</definedName>")
+    from pyopenvba.apps.excel._chart_sheets import ChartSheet
+
+    tags: list[str] = []
+    for sheet in book.tabs():
+        attrs = dict(existing.get(sheet.part_name, {}))
+        if not attrs and isinstance(sheet, ChartSheet):
+            attrs = {"name": sheet.name, "sheetId": str(sheet.sheet_id), "r:id": sheet.write_parts(package)}
+        elif not attrs:
+            number = 1
+            while package.has(f"xl/worksheets/sheet{number}.xml"):
+                number += 1
+            sheet.part_name = f"xl/worksheets/sheet{number}.xml"
+            package.write(sheet.part_name, _EMPTY_SHEET.encode())
+            add_content_type(package, sheet.part_name, "application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml")
+            rid = add_relationship(package, "xl/_rels/workbook.xml.rels",
+                                   "http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet",
+                                   f"worksheets/sheet{number}.xml")
+            # The name first, as Excel writes a sheet, and the number it was made with.
+            attrs = {"name": sheet.name, "sheetId": str(sheet.sheet_id), "r:id": rid}
+        attrs["name"] = sheet.name
+        # The state the model has now, between sheetId and the relationship as Excel writes it: a macro may have hidden
+        # or shown the sheet since the file was read.
+        attrs.pop("state", None)
+        state = _sheet_state(sheet)
+        tags.append("<sheet " + " ".join(f'{key}="{_escape(value)}"' + (state if key == "sheetId" else "")
+                                         for key, value in attrs.items()) + "/>")
+    rebuilt = "<sheets>" + "".join(tags) + "</sheets>"
+    if rebuilt != block.group():
+        def remap_reserved(match: re.Match[str]) -> str:
+            return reserved.get(match.group(), match.group())
+
+        updated = text[:block.start()] + rebuilt + text[block.end():]
+        updated = _DEFINED_NAME.sub(remap_reserved, updated)
+        package.write("xl/workbook.xml", updated.encode())
+        book.names_.changed = True
+
+
+def _resize_loaded_tables(book: Workbook, package: OpcFile) -> None:
+    """Follow a refreshed query's rows with its table and its name.
+
+    A refresh that brings back more rows than last time leaves the
+    table saying it ends where it used to, and Excel then shows a table
+    that stops short of its own data.
+    """
+    targets = getattr(book, "_load_targets", None)
+    if not targets:
+        return
+    for name, target in targets.items():
+        if not target.table_part or not package.has(target.table_part):
+            continue
+        reference = target.area.address(absolute=False)
+        text = package.read(target.table_part).decode("utf-8", errors="replace")
+        patched = re.sub(r'(<table\b[^>]*?\bref=")[^"]*(")', rf"\1{reference}\2", text, count=1)
+        patched = re.sub(
+            r'(<autoFilter\b[^>]*?\bref=")[^"]*(")', rf"\1{reference}\2", patched, count=1
+        )
+        patched = _follow_columns(package, target, patched)
+        if patched != text:
+            package.write(target.table_part, patched.encode("utf-8"))
+        _follow_defined_name(book, package, name, target)
+
+
+def _follow_columns(package: OpcFile, target: LoadTarget, text: str) -> str:
+    """The table's own column list, brought in line with the headers.
+
+    A refresh that brings back different columns leaves the table
+    listing the old ones, and Excel then shows headers that do not
+    match the cells under them.
+    """
+    headers = target.headers
+    if not headers:
+        return text
+    columns = "".join(
+        f'<tableColumn id="{index + 1}" uniqueName="{index + 1}" name="{_escape(name)}"'
+        f' queryTableFieldId="{index + 1}"/>'
+        for index, name in enumerate(headers)
+    )
+    patched = re.sub(
+        r"<tableColumns\b[^>]*>.*?</tableColumns>",
+        f'<tableColumns count="{len(headers)}">{columns}</tableColumns>',
+        text,
+        count=1,
+        flags=re.DOTALL,
+    )
+    _follow_query_table(package, target, headers)
+    return patched
+
+
+def _follow_query_table(package: OpcFile, target: LoadTarget, headers: list[str]) -> None:
+    """The query table beside it lists the same fields."""
+    part = target.table_part
+    rels = f"{part.rsplit('/', 1)[0]}/_rels/{part.rsplit('/', 1)[1]}.rels"
+    if not part or not package.has(rels):
+        return
+    text = package.read(rels).decode("utf-8", errors="replace")
+    for element in re.findall(r"<Relationship\b[^>]*/>", text):
+        found = _attributes(element).get("Target", "")
+        if "querytable" not in found.lower():
+            continue
+        query_part = found[1:] if found.startswith("/") else f"xl/{found.lstrip('./')}"
+        query_part = query_part.replace("xl/../", "xl/").replace("/tables/../", "/")
+        if not package.has(query_part):
+            continue
+        body = package.read(query_part).decode("utf-8", errors="replace")
+        fields = "".join(
+            f'<queryTableField id="{index + 1}" name="{_escape(name)}" tableColumnId="{index + 1}"/>'
+            for index, name in enumerate(headers)
+        )
+        package.write(
+            query_part,
+            re.sub(
+                r"<queryTableFields\b[^>]*>.*?</queryTableFields>",
+                f'<queryTableFields count="{len(headers)}">{fields}</queryTableFields>',
+                body,
+                count=1,
+                flags=re.DOTALL,
+            ).encode("utf-8"),
+        )
+
+
+def _follow_defined_name(book: Workbook, package: OpcFile, name: str, target: LoadTarget) -> None:
+    """The hidden ExternalData name moves with the table it stands for."""
+    from pyopenvba._a1 import quote_sheet, split_sheet
+
+    area = target.area
+    wanted = f"{quote_sheet(area.sheet)}!{area.address()}"
+    changed = False
+    for entry in book.names_.entries:
+        if not split_sheet(entry.name)[1].startswith("ExternalData_"):
+            continue
+        if entry.refers_to.lstrip("=").split("!")[0].strip("'") != area.sheet:
+            continue
+        if entry.refers_to.lstrip("=") != wanted:
+            entry.refers_to = f"={wanted}"
+            changed = True
+    if changed:
+        book.names_.changed = True
+        _write_names(book, package)
+
+
+#: Worksheet.Visible by the state the workbook part gives a sheet: none is xlSheetVisible.
+_SHEET_VISIBILITY = {"hidden": 0, "veryHidden": 2}
+
+
+def _sheet_state(sheet: Worksheet | ChartSheet) -> str:
+    """A sheet's state attribute, as Excel writes it between sheetId and its relationship; none for one that shows."""
+    state = next((name for name, value in _SHEET_VISIBILITY.items() if value == sheet.visible), "")
+    return f' state="{state}"' if state else ""
+
+
+def _rename_sheets_in_workbook(book: Workbook, package: OpcFile, existing: list[tuple[str, str]]) -> None:
+    """Put the model's sheet names, and the numbers the sheets were made with, into the package's workbook part.
+
+    Only those of the sheets the template already has: adding a
+    sheet to the workbook part means a relationship and a content type
+    as well, which is why a new workbook starts from a template rather
+    than from nothing.
+    """
+    text = package.read("xl/workbook.xml").decode("utf-8", errors="replace")
+    for index, (old, _) in enumerate(existing):
+        if index >= len(book.sheets_):
+            break
+        sheet = book.sheets_[index]
+        if sheet.name != old:
+            text = text.replace(f'name="{_escape(old)}"', f'name="{_escape(sheet.name)}"', 1)
+        found = re.search(rf'<sheet\b[^>]*\bname="{re.escape(_escape(sheet.name))}"[^>]*>', text)
+        if found is not None:
+            tag = re.sub(r'\sstate="[^"]*"', "", found.group())
+            tag = re.sub(r'\bsheetId="\d+"', lambda _: f'sheetId="{sheet.sheet_id}"{_sheet_state(sheet)}', tag, count=1)
+            text = text[:found.start()] + tag + text[found.end():]
+    package.write("xl/workbook.xml", text.encode("utf-8"))
+
+
+def _plain_conditional(sheet: Worksheet) -> bool:
+    """Whether a sheet holds conditional formats read from a workbook without a VBA project, which Excel writes
+    again in its own order (tests/fixtures/conditional_joins/conditional_joins_resaved.xlsx)."""
+    from pyopenvba.apps.excel._conditional import canonical_load
+
+    return sheet.conditional_changed or any(rule.loaded and canonical_load(rule) for rule in sheet.conditional_formats)
+
+
+def _reading_volatile(sheet: Worksheet) -> set[tuple[int, int]]:
+    """The cells of a sheet a file marks ca="1" for what they read (see Calculator.reading_volatile)."""
+    book = sheet.book
+    keys = book.calculator.volatile_readers
+    if keys is None:
+        knows = _knows(book)
+
+        def marked_for_itself(formula: str) -> bool:
+            return not calls_only_ordinary_functions(formula) and calculated_always(formula, knows)
+
+        keys = book.calculator.reading_volatile(marked_for_itself)
+        book.calculator.volatile_readers = keys
+    name = sheet.name.lower()
+    return {(row, column) for owner, row, column in keys if owner == name}
+
+
+def _patched_sheet(sheet: Worksheet, original: str, package: OpcFile, collector: Collector | None = None) -> str:
+    """The sheet's XML with the model's cells written into it; ``collector`` gathers the metadata its dynamic-array
+    formulas need, which the save writes after every sheet."""
+    match = _SHEET_DATA.search(original)
+    if not match:
+        raise WorkbookFileError(f"{sheet.part_name} has no sheetData")
+    body = "" if match.group(2) == "/>" else (match.group(3) or "")
+    rows: dict[int, str] = {}
+    for row_xml in _ROW.findall(body):
+        rows[_row_number(row_xml)] = row_xml
+    # Each row's cells are the model's, written in one pass: those that say something, in column order.
+    by_row: dict[int, list[tuple[int, Cell]]] = {}
+    for (row, column), cell in sorted(sheet.cells_.items()):
+        if sheet.holds(row, column, cell):
+            by_row.setdefault(row, []).append((column, cell))
+    stylesheet = sheet.book.stylesheet
+    from pyopenvba.apps.excel._arrays import elements
+    from pyopenvba.apps.excel._shared import formula_elements
+
+    tables = [table.name for one in sheet.book.sheets_ for table in one.tables]
+
+    def spell(text: str) -> str:
+        return _formula_xml(text, tables)
+
+    knows = _knows(sheet.book)
+
+    def always(formula: str) -> bool:
+        return calculated_always(formula, knows)
+
+    marked = _reading_volatile(sheet)
+    formulas = formula_elements(sheet, spell, always, marked) | elements(sheet, spell, always, marked)
+    automatic = sheet.book.calculator.automatic
+    #: Whether a formula keeps its last value in the file though it is to be worked out again, as in manual
+    #: calculation and on a sheet whose EnableCalculation is False (tests/fixtures/worksheet_settings.json).
+    keeping = not automatic or not sheet.enable_calculation
+    #: The cells whose last value a save keeps though they are to be worked out again: every formula's in manual
+    #: calculation, and a data table's in semi-automatic, which only a calculation asked for works out.
+    kept: set[tuple[int, int]] = set()
+    if sheet.data_tables:
+        from pyopenvba.apps.excel._data_tables import elements as table_elements
+
+        def unsettled(table: DataTable) -> bool:
+            area = table.area
+            return not automatic and any(
+                cell is not None and (cell.stale if cell.save_dirty is None else cell.save_dirty)
+                for row in range(area.top, area.bottom + 1) for column in range(area.left, area.right + 1)
+                for cell in [sheet.cells_.get((row, column))])
+
+        tabled = table_elements(sheet, unsettled)
+        formulas |= tabled
+        if sheet.book.application.calculation == 2:  # xlCalculationSemiautomatic
+            kept.update(tabled)
+    dynamic: dict[tuple[int, int], tuple[str, str | None]] = {}
+    from pyopenvba.apps.excel._pivot_create import rich_errors
+
+    pivot_errors = rich_errors(sheet)
+    for position, cell in sheet.cells_.items():
+        if cell.formula or cell.spilled_from is not None or not isinstance(cell.value, ExcelError) \
+                or cell.value.name not in ('#SPILL!', '#CALC!'):
+            continue
+        rich_error = pivot_errors.get(position, RichError(cell.value.name, 0))
+        index = (collector or Collector()).value(rich_error)
+        dynamic[position] = (f' vm="{index}"', '<v>#VALUE!</v>')
+    for position, cell in sheet.cells_.items():
+        if cell.dynamic and cell.formula:
+            formulas[position], dynamic[position] = _dynamic_element(sheet, position, cell, spell, always,
+                                                                      collector or Collector())
+    for position, cell in sheet.cells_.items():
+        if cell.formula and position not in formulas:
+            volatile = ' ca="1"' if always(cell.formula) or position in marked else ""
+            formulas[position] = f"<f{volatile}>{spell(cell.formula[1:])}</f>"
+        dirty = cell.stale if cell.save_dirty is None else cell.save_dirty
+        if cell.formula and dirty and not sheet.book.calculator.automatic \
+                and not re.search(r'\bca="', formulas[position]):
+            # Excel marks cached dirty formulas themselves, including dependents;
+            # calcCompleted alone does not make native manual calculation revisit them.
+            formulas[position] = formulas[position].replace('<f', '<f ca="1"', 1)
+    for row in set(rows) | set(by_row):
+        rows[row] = _row_with_cells(rows.get(row, f'<row r="{row}"></row>'), row, by_row.get(row, []), stylesheet,
+                                    formulas, dynamic, keep_stale=keeping, kept=kept)
+    for row in set(sheet.dims.rows) | sheet.dims.shaped_rows() | {row for row, _ in sheet.notes}:
+        rows.setdefault(row, f'<row r="{row}"/>')
+    rebuilt = _rows_as_excel_writes_them(sheet, original, rows)
+    patched = original[: match.start()] + f"<sheetData>{rebuilt}</sheetData>" + original[match.end() :]
+    patched = _with_dimension_parts(sheet, patched)
+    sheet.dims.saved()
+    if sheet.filter_changed:
+        patched = _with_auto_filter(sheet, patched)
+    if sheet.advanced_filter_changed or sheet.filter_changed:
+        from pyopenvba.apps.excel._advanced_filter import with_filter_mode
+
+        # filterMode says the sheet's own filter has criteria; a table's never sets it
+        # (tests/fixtures/autofilter_file/, tests/fixtures/table_autofilter/).
+        filtered = sheet.advanced_filter is not None or (sheet.auto_filter is not None and bool(sheet.auto_filter.fields))
+        patched = with_filter_mode(patched, filtered)
+        sheet.advanced_filter_changed = False
+    if sheet.protection_changed:
+        from pyopenvba.apps.excel._protection import with_protection
+
+        patched = with_protection(sheet, patched)
+    if sheet.validations_changed:
+        from pyopenvba.apps.excel._validation import with_rules
+
+        patched = with_rules(sheet, patched)
+        sheet.validations_changed = False
+    if sheet.conditional_changed:
+        from pyopenvba.apps.excel._conditional import with_rules as with_conditional_rules
+
+        patched = with_conditional_rules(patched, sheet.conditional_formats,
+                                         extension=not sheet.conditional_foreign)
+        sheet.conditional_changed = False
+    if sheet.merges_dirty:
+        markup = ""
+        if sheet.merged_areas:
+            records = ''.join(f'<mergeCell ref="{area.address(absolute=False)}"/>' for area in sheet.merged_areas)
+            markup = f'<mergeCells count="{len(sheet.merged_areas)}">{records}</mergeCells>'
+        existing = re.search(r"<mergeCells\b[^>]*(?:/>|>.*?</mergeCells>)", patched, re.DOTALL)
+        if existing:
+            patched = patched[:existing.start()] + markup + patched[existing.end():]
+        elif markup:
+            # mergeCells follows customSheetViews and precedes these optional
+            # worksheet children in schema order.
+            following = re.search(r"<(?:phoneticPr|conditionalFormatting|dataValidations|hyperlinks|printOptions|"
+                                  r"pageMargins|pageSetup|headerFooter|rowBreaks|colBreaks|customProperties|cellWatches|"
+                                  r"ignoredErrors|smartTags|drawing|legacyDrawing|legacyDrawingHF|picture|oleObjects|"
+                                  r"controls|webPublishItems|tableParts|extLst)\b|</worksheet>", patched)
+            if following:
+                patched = patched[:following.start()] + markup + patched[following.start():]
+    return _with_dimension(patched, sheet)
+
+
+def _with_auto_filter(sheet: Worksheet, xml: str) -> str:
+    """The sheet's autoFilter element as the model has it: replaced, put in its place, or taken out."""
+    markup = sheet.auto_filter.xml() if sheet.auto_filter is not None else ""
+    existing = _AUTO_FILTER.search(xml)
+    if existing is not None:
+        return xml[:existing.start()] + markup + xml[existing.end():]
+    following = _AFTER_AUTO_FILTER.search(xml)
+    if not markup or following is None:
+        return xml
+    return xml[:following.start()] + markup + xml[following.start():]
+
+
+def _row_number(row_xml: str) -> int:
+    try:
+        return int(_tag_attributes(row_xml).get("r", "0"))
+    except ValueError:
+        return 0
+
+
+def _declares_descent(xml: str) -> bool:
+    """Whether a sheet declares the namespace Excel 2010 writes a row's descent in."""
+    root = re.search(r"<worksheet\b[^>]*>", xml)
+    return root is not None and "xmlns:x14ac=" in root.group(0)
+
+
+def _rows_as_excel_writes_them(sheet: Worksheet, original: str, rows: dict[int, str]) -> str:
+    """Every row element with its start tag worked out from the model.
+
+    The spans Excel writes cover the 16-row block's cells; a row keeps the
+    descent its file gave it, and a new one gets the Normal font's. A row
+    left with no cells and nothing of its own to say is dropped, as Excel
+    drops it, unless a note is on it (tests/fixtures/notes.json).
+    """
+    from pyopenvba.apps.excel._dimensions import block_spans, row_start_tag
+
+    dims = sheet.dims
+    descent = dims.default_descent() if _declares_descent(original) else None
+    spans = block_spans(sheet)
+    noted = {row for row, _ in sheet.notes}
+    out: list[str] = []
+    for number in sorted(rows):
+        row_xml = rows[number]
+        head_end = row_xml.index(">")
+        closed = row_xml[head_end - 1] == "/"
+        inner = "" if closed else row_xml[head_end + 1: row_xml.rindex("</row>")]
+        has_cells = bool(_CELL.search(inner))
+        tag = row_start_tag(sheet, number, _tag_attributes(row_xml), spans.get((number - 1) // 16), descent,
+                            has_cells or number in noted)
+        if tag is None:
+            continue
+        out.append(f"{tag}{inner}</row>" if has_cells else f"{tag[:-1]}/>")
+    return "".join(out)
+
+
+#: Where a worksheet's sheetFormatPr and cols go: before the first of these that is there.
+_AFTER_FORMAT = re.compile(r"<(?:cols|sheetData)\b")
+_AFTER_COLUMNS = re.compile(r"<sheetData\b")
+
+
+def _with_dimension_parts(sheet: Worksheet, xml: str) -> str:
+    """The sheet's sheetFormatPr and cols, as the model now has them."""
+    from pyopenvba.apps.excel._dimensions import columns_element, format_element
+
+    dims = sheet.dims
+    head = format_element(sheet, _declares_descent(xml))
+    if head is not None:
+        existing = re.search(r"<sheetFormatPr\b[^>]*?/>|<sheetFormatPr\b[^>]*>.*?</sheetFormatPr>", xml, re.DOTALL)
+        if existing is not None:
+            xml = xml[: existing.start()] + head + xml[existing.end():]
+        else:
+            place = _AFTER_FORMAT.search(xml)
+            if place is not None:
+                xml = xml[: place.start()] + head + xml[place.start():]
+    if dims.columns_written():
+        cols = columns_element(dims)
+        existing = re.search(r"<cols\b[^>]*>.*?</cols>|<cols\b[^>]*/>", xml, re.DOTALL)
+        if existing is not None:
+            xml = xml[: existing.start()] + cols + xml[existing.end():]
+        elif cols:
+            place = _AFTER_COLUMNS.search(xml)
+            if place is not None:
+                xml = xml[: place.start()] + cols + xml[place.start():]
+    return xml
+
+
+def _dynamic_element(sheet: Worksheet, position: tuple[int, int], cell: Cell, spell: Callable[[str], str],
+                     always: Callable[[str], bool], collector: Collector) -> tuple[str, tuple[str, str | None]]:
+    """A dynamic-array formula's <f>, an array formula over the block it spilled into, and its cell's cm and vm with
+    the <v> of an error only a dynamic array has: #SPILL!, aca="1" ca="1" over its own cell and a rich value saying
+    why and how far the answer reached, and #CALC! for an empty array (tests/fixtures/dynamic_arrays.json)."""
+    from pyopenvba.apps.excel._dynamic_file import EMPTY_ARRAY
+    from pyopenvba.apps.excel._spills import BEYOND_THE_EDGE, OBSTRUCTED
+    from pyopenvba.formula._prefixes import calls
+
+    row, column = position
+    here = f"{column_letter(column)}{row}"
+    text = spell(cell.formula[1:])
+    spill = sheet.spills.get(position)
+    marks = f' cm="{collector.cell()}"'
+    value = cell.value
+    cached = not cell.stale or not sheet.book.calculator.automatic
+    if cached and isinstance(value, ExcelError) and value.name == "#SPILL!":
+        wanted = spill.area if spill is not None else Area(row, column, row, column)
+        why = spill.why if spill is not None else OBSTRUCTED
+        reach = (0, 0) if why == BEYOND_THE_EDGE else (wanted.rows - 1, wanted.columns - 1)
+        index = collector.value(RichError("#SPILL!", why, *reach))
+        return f'<f t="array" aca="1" ref="{here}" ca="1">{text}</f>', (f'{marks} vm="{index}"', "<v>#VALUE!</v>")
+    if cached and isinstance(value, ExcelError) and value.name == "#CALC!":
+        index = collector.value(RichError("#CALC!", EMPTY_ARRAY))
+        return f'<f t="array" ref="{here}">{text}</f>', (f'{marks} vm="{index}"', "<v>#VALUE!</v>")
+    block = spill.area if spill is not None and not spill.blocked else Area(row, column, row, column)
+    volatile = always(cell.formula)
+    whole = volatile and (block.rows * block.columns == 1 or not calls(cell.formula, "RAND"))
+    flags = (' aca="1"' if whole else "", ' ca="1"' if volatile else "")
+    return f'<f t="array"{flags[0]} ref="{block.address(absolute=False)}"{flags[1]}>{text}</f>', (marks, None)
+
+
+def _row_with_cells(row_xml: str, row: int, cells: list[tuple[int, Cell]], stylesheet: Stylesheet,
+                    formulas: dict[tuple[int, int], str],
+                    dynamic: dict[tuple[int, int], tuple[str, str | None]] | None = None, *, keep_stale: bool = False,
+                    kept: Collection[tuple[int, int]] = ()) -> str:
+    """A row with the model's cells written into it in column order, in place of the ones it had.
+
+    ``formulas`` is the ``<f>`` of each formula cell, a shared formula's included, "" for a cell that carries none
+    though it holds one, as a data table's do but its first, and ``dynamic`` what each dynamic-array formula's cell
+    carries besides (see _cell_xml). A stale formula's value is kept with ``keep_stale``, and in the cells ``kept``.
+    """
+    head_end = row_xml.index(">")
+    closed = row_xml[head_end - 1] == "/"
+    opening = row_xml[: head_end - 1] + ">" if closed else row_xml[: head_end + 1]
+    rest = "" if closed else _CELL.sub("", row_xml[head_end + 1 : row_xml.rindex("</row>")])
+    extras = dynamic or {}
+    written = "".join(_cell_xml(f"{column_letter(column)}{row}", cell, _style_for(cell, stylesheet),
+                                formulas.get((row, column)), extras.get((row, column)),
+                                keep_stale=keep_stale or (row, column) in kept)
+                      for column, cell in cells)
+    return f"{opening}{written}{rest}</row>"
+
+
+def _cell_xml(reference: str, cell: Cell, style: str, formula: str | None = None,
+              dynamic: tuple[str, str | None] | None = None, *, keep_stale: bool = False) -> str:
+    """A cell's <c>; ``dynamic`` for a dynamic-array formula's: its cm and vm, and the <v> of an error only a dynamic
+    array has, #VALUE! with the rich value its vm names (see _dynamic_file)."""
+    attributes = f' s="{style}"' if style else ""
+    if cell.formula:
+        # A formula cell carries its last value in a <v>, never as an
+        # inline string: a formula whose answer is text is t="str".
+        kind, body = _formula_value(cell, keep_stale=keep_stale)
+        extra = ""
+        if dynamic is not None:
+            extra, rich = dynamic
+            if rich is not None:
+                kind, body = ' t="e"', rich
+        element = formula if formula is not None else f"<f>{_formula_xml(cell.formula[1:], ())}</f>"
+        return f'<c r="{reference}"{attributes}{kind}{extra}>{element}{body}</c>'
+    if cell.spilled_from is not None:
+        # A cell a formula spilled into keeps its value as a formula's is kept: text is t="str".
+        kind, body = _formula_value(cell, keep_stale=keep_stale)
+        return f'<c r="{reference}"{attributes}{kind}>{body}</c>' if body else f'<c r="{reference}"{attributes}/>'
+    kind, body = _value_body(cell.value)
+    if cell.runs is not None:
+        from pyopenvba.apps.excel._rich_text import runs_of, runs_xml
+
+        runs = runs_of(cell)
+        if runs is not None:
+            # Text in more than its cell's font, each run with its own (see _rich_text).
+            kind = ' t="inlineStr"'
+            body = f"<is>{runs_xml(runs, lambda text: _escape_text(_encode_string(text)))}</is>"
+    if dynamic is not None:
+        extra, rich = dynamic
+        attributes += extra
+        if rich is not None:
+            kind, body = ' t="e"', rich
+    if formula is not None:
+        # Another cell of an array formula worked out whenever anything changes: <f ca="1"/> beside its value.
+        return f'<c r="{reference}"{attributes}{kind}>{formula}{body}</c>'
+    if not body:
+        return f'<c r="{reference}"{attributes}/>'
+    return f'<c r="{reference}"{attributes}{kind}>{body}</c>'
+
+
+def _knows(book: Workbook) -> Callable[[str], bool]:
+    """Whether a workbook has a name a formula calls: a defined name, or a Function of a macro's module."""
+    names = {split_sheet(entry.name)[1].lower() for entry in book.names_.entries}
+    interpreter = book.application.interpreter
+
+    def knows(name: str) -> bool:
+        if name.lower() in names:
+            return True
+        if interpreter is None or "." in name:
+            return False
+        found, _ = interpreter.find_procedure(name)
+        return found is not None and found.kind == "function"
+
+    return knows
+
+
+def calculate_for_save(book: Workbook) -> None:
+    """Work out each formula nothing has read since it changed, so that it is saved with its value as Excel saves
+    it: under automatic calculation every cell is up to date. One the model cannot work out is saved without a
+    value, and under manual calculation a cell keeps the value it last had."""
+    from pyopenvba.exceptions import VBAUnsupportedError
+
+    calculator = book.calculator
+    if not calculator.automatic:
+        if book.application.calculate_before_save:
+            worked = calculator.calculate_all()
+            from pyopenvba.apps.excel._events import calculated_all
+
+            calculated_all(book, worked)
+        return
+    for sheet in book.sheets_:
+        for (row, column), cell in list(sheet.cells_.items()):
+            if cell.formula and cell.stale:
+                try:
+                    calculator.value_of(sheet.name, row, column)
+                except VBAUnsupportedError:
+                    continue
+
+
+_CELL_REFERENCE = re.compile(r'\sr="([A-Z]+)([0-9]+)"')
+_CELL_KIND = re.compile(r'\st="([^"]*)"')
+#: The mark on a formula a save left to Excel to work out; a c element has no other attribute of the name.
+_CA_MARK = re.compile(r'\sca="1"')
+
+
+def _write_cached_values(book: Workbook, package: OpcFile) -> None:
+    """Bring the values a sheet nobody wrote to holds up to what its formulas now come to, as Excel writes every sheet's
+    at a save. Reading another sheet, a name, a table or a hidden row makes a formula's value change with its own sheet
+    untouched, and Excel does not work a file out again as it opens (tests/fixtures/saved_values.json). Only each changed
+    cell's t, v and f's ca change, so the rest of the part keeps its bytes. A sheet where nothing has been worked out
+    since the last save, and nothing waits to be, is not read."""
+    strings: list[str] | None = None
+    worked = book.calculator.worked_out
+    for sheet in book.sheets_:
+        if sheet.dirty or not sheet.part_name or not package.has(sheet.part_name):
+            continue
+        if sheet not in worked and not book.date_system_changed and not sheet.marked_to_calculate \
+                and not any(cell.formula and (cell.stale or cell.save_dirty) for cell in sheet.cells_.values()):
+            continue
+        if strings is None:
+            strings = _shared_strings(package)
+        original = package.read(sheet.part_name).decode("utf-8", errors="replace")
+        written = _sheet_with_values(sheet, original, strings)
+        if written != original:
+            package.write(sheet.part_name, written.encode("utf-8"))
+    worked.clear()
+
+
+def _sheet_with_values(sheet: Worksheet, xml: str, strings: list[str]) -> str:
+    """A sheet's xml with each formula's cell holding the value the model has for it."""
+    match = _SHEET_DATA.search(xml)
+    if match is None or match.group(3) is None:
+        return xml
+    automatic = sheet.book.calculator.automatic
+    keeping = not automatic or not sheet.enable_calculation
+    reading = _reading_volatile(sheet)
+    # In semi-automatic calculation a data table keeps its last values until a calculation is asked for.
+    held = [table.area for table in sheet.data_tables.values()] if sheet.book.application.calculation == 2 else []
+
+    def refreshed(found: re.Match[str]) -> str:
+        element = found.group(0)
+        head = element[:element.index(">")]
+        reference = _CELL_REFERENCE.search(head)
+        if reference is None:
+            return element
+        row, column = int(reference.group(2)), column_number(reference.group(1))
+        cell = sheet.cells_.get((row, column))
+        if cell is None or not cell.formula:
+            return element
+        kept = keeping or any(area.top <= row <= area.bottom and area.left <= column <= area.right for area in held)
+        marked = (not automatic and (cell.stale if cell.save_dirty is None else cell.save_dirty)) or (row, column) in reading
+        kind = _CELL_KIND.search(head)
+        if not marked and (row, column) in sheet.marked_to_calculate:
+            # Worked out since a save marked it, so Excel has no more need to, and writes it without the mark.
+            sheet.marked_to_calculate.discard((row, column))
+            element = _CA_MARK.sub("", element, count=1)
+        written = _cell_with_value(element, cell, kind.group(1) if kind else "", strings, keep_stale=kept, marked=bool(marked))
+        if marked and _CA_MARK.search(written) and not _CA_MARK.search(element):
+            sheet.marked_to_calculate.add((row, column))
+        return written
+
+    return xml[:match.start(3)] + _CELL.sub(refreshed, match.group(3)) + xml[match.end(3):]
+
+
+def _cell_with_value(element: str, cell: Cell, kind: str, strings: list[str], *, keep_stale: bool, marked: bool) -> str:
+    """A formula's <c> with the value the model has for it, and with ca="1" on its <f> if ``marked``, as in manual
+    calculation until it is worked out. A cell with nothing to change comes back as it was."""
+    new_kind, body = _formula_value(cell, keep_stale=keep_stale)
+    head_end = element.index(">")
+    closed = element[head_end - 1] == "/"
+    head = element[:head_end - 1] if closed else element[:head_end]
+    inner = "" if closed else element[head_end + 1:element.rindex("</c>")]
+    held = _VALUE.search(inner)
+    changed = bool(body) != (held is not None) or (bool(body) and not _same_value(_cell_value(element, kind, strings), cell.value))
+    formula = _FORMULA.search(inner)
+    mark = marked and formula is not None and not re.search(r'\bca="', formula.group(1))
+    if not changed and not mark:
+        return element
+    if changed:
+        if held is not None:
+            inner = inner[:held.start()] + body + inner[held.end():]
+        else:
+            at = formula.end() if formula is not None else 0
+            inner = inner[:at] + body + inner[at:]
+        if new_kind != (f' t="{kind}"' if kind else ""):
+            head = _CELL_KIND.sub("", head)
+            place = re.search(r'\ss="[^"]*"', head) or _CELL_REFERENCE.search(head)
+            if place is not None:
+                head = head[:place.end()] + new_kind + head[place.end():]
+    if mark and formula is not None:
+        # Last among the f's attributes, after an array's t and ref, as Excel writes it.
+        end = formula.start() + len(formula.group(1)) + 2
+        inner = f'{inner[:end]} ca="1"{inner[end:]}'
+    return f"{head}>{inner}</c>" if inner else f"{head}/>"
+
+
+def _same_value(held: object, value: object) -> bool:
+    """Whether a value read from a file and a value the model has say the same."""
+    if isinstance(value, VBADate):
+        value = value.serial
+    if isinstance(held, ExcelError) or isinstance(value, ExcelError):
+        return isinstance(held, ExcelError) and isinstance(value, ExcelError) and held.name == value.name
+    if isinstance(held, bool) or isinstance(value, bool):
+        return isinstance(held, bool) and isinstance(value, bool) and held == value
+    if isinstance(held, str) or isinstance(value, str):
+        return isinstance(held, str) and isinstance(value, str) and held == value
+    if held is EMPTY or value is EMPTY:
+        return held is value
+    return isinstance(held, (int, float)) and isinstance(value, (int, float)) and float(held) == float(value)
+
+
+def _formula_xml(text: str, tables: Collection[str]) -> str:
+    """A formula, without its =, as a file spells it between <f> tags: structured references as a file has them
+    (pyopenvba.formula._structured.in_file), a newer function and a name a LET binds with their prefixes
+    (pyopenvba.formula._prefixes), a line break as Excel writes one there, CR LF, and a carriage return on its own
+    as _x000D_ (tests/fixtures/structured_references/)."""
+    spelled = without_dangling_references(prefixes.in_file(in_file("=" + text, tables)))
+    return _escape_text(_encode_string(spelled[1:])).replace("\n", "\r\n")
+
+
+def _formula_read(body: str) -> str:
+    """A formula a file spells between <f> tags, or in a defined name, as Range.Formula spells it."""
+    return prefixes.from_file(from_file("=" + _cell_text(body)))
+
+
+def _formula_value(cell: Cell, *, keep_stale: bool = False) -> tuple[str, str]:
+    """The type and the ``<v>`` a formula cell carries beside its formula."""
+    from pyopenvba.formula._values import ExcelError
+
+    if cell.stale and not keep_stale or cell.value is EMPTY:
+        return "", ""
+    value = cell.value
+    if isinstance(value, ExcelError):
+        return ' t="e"', f"<v>{_escape(value.name)}</v>"
+    if isinstance(value, bool):
+        return ' t="b"', f"<v>{1 if value else 0}</v>"
+    if isinstance(value, str):
+        return ' t="str"', f"<v>{_escape_text(_encode_string(value))}</v>"
+    if isinstance(value, VBADate):
+        return "", f"<v>{_number_text(value.serial)}</v>"
+    if isinstance(value, (int, float)):
+        return "", f"<v>{_number_text(value)}</v>"
+    return ' t="str"', f"<v>{_escape_text(_encode_string(to_text(value)))}</v>"
+
+
+def _value_body(value: object) -> tuple[str, str]:
+    from pyopenvba.formula._values import ExcelError
+    from pyopenvba.interpreter._values import VBAErrorValue
+
+    if isinstance(value, VBAErrorValue):
+        from pyopenvba.apps.excel._calc import ERROR_NUMBERS
+
+        value = ExcelError(next((name for name, number in ERROR_NUMBERS.items()
+                                if number == value.number), "#VALUE!"))
+
+    if value is EMPTY:
+        return "", ""
+    if isinstance(value, ExcelError):
+        return ' t="e"', f"<v>{_escape(value.name)}</v>"
+    if isinstance(value, bool):
+        return ' t="b"', f"<v>{1 if value else 0}</v>"
+    if isinstance(value, VBADate):
+        return "", f"<v>{_number_text(value.serial)}</v>"
+    if isinstance(value, (int, float)):
+        return "", f"<v>{_number_text(value)}</v>"
+    return ' t="inlineStr"', f"<is><t xml:space=\"preserve\">{_escape_text(_encode_string(to_text(value)))}</t></is>"
+
+
+def _number_text(value: float) -> str:
+    """A number as Excel saves it (tests/fixtures/saved_numbers.json): a whole number in digits below 1E+16; else 15 or 17
+    significant digits, with an E and no padding from 1E+16 up and below 0.1, unless plain digits are no longer. Excel
+    refuses a file with a huge number in plain digits."""
+    from pyopenvba.apps.excel._styles import excel_number
+
+    if (isinstance(value, int) or float(value).is_integer()) and abs(value) < 1e16:
+        return str(int(value))
+    number = float(value)
+    spelled = excel_number(number)
+    digits = len(spelled.partition("e")[0].lstrip("-0.").replace(".", ""))
+    mantissa, _, power = f"{number:.{digits - 1}e}".partition("e")
+    with_power = f"{mantissa}E{int(power):+d}"
+    size = abs(number)
+    if size >= 1e16:
+        return with_power
+    plain = spelled if "e" not in spelled else f"{number:.{max(0, digits - 1 - int(power))}f}"
+    if size < 0.1 and (digits > 15 or len(with_power) < len(plain)):
+        return with_power
+    return plain
+
+
+def _write_styles(book: Workbook, package: OpcFile) -> None:
+    """Write the stylesheet as Excel writes it at a save: what is in use, in the order its tables hold it."""
+    from pyopenvba.apps.excel._cell_styles import finish_save
+
+    stylesheet = book.stylesheet
+    if stylesheet.dirty:
+        if not package.has("xl/styles.xml"):
+            raise WorkbookFileError("the workbook has no styles part to write the cell formats to")
+        package.write("xl/styles.xml", stylesheet.written().encode("utf-8"))
+    finish_save(book, stylesheet.saved())
+
+
+#: A cell's, a row's and a column's format in a sheet's XML, which a save that moves the file's xfs renumbers.
+_STYLE_ATTRIBUTE = re.compile(r'(<(?:c|row)\b[^>]*?\bs="|<col\b[^>]*?\bstyle=")(\d+)(")')
+
+
+def _restyled_sheet(xml: str, moved: dict[int, int]) -> str:
+    """A sheet no macro changed, its formats pointing where the save put the file's xfs; a cell that comes to the
+    first, the default one, without the attribute, as Excel writes it
+    (tests/fixtures/number_format_resave/missing.xlsx)."""
+    def restyled(match: re.Match[str]) -> str:
+        index = moved.get(int(match.group(2)), int(match.group(2)))
+        if index == 0 and match.group(1).startswith("<c"):
+            return match.group(1)[:-len('s="')].rstrip()
+        return match.group(1) + str(index) + match.group(3)
+
+    return _STYLE_ATTRIBUTE.sub(restyled, xml)
+
+
+def _style_for(cell: Cell, stylesheet: Stylesheet) -> str:
+    """The xf a cell is written with: the one it was read with while its format is unchanged."""
+    if cell.style is None:
+        return ""
+    return str(stylesheet.index_as_read(cell.style, cell.xf))
+
+
+def _with_dimension(xml: str, sheet: Worksheet) -> str:
+    """The sheet's dimension, its used block written cell to cell even where it spans every column,
+    A1:XFD1048576 (tests/fixtures/notes.json)."""
+    bounds = sheet.used_bounds()
+    reference = "A1"
+    if bounds is not None:
+        top, left, bottom, right = bounds
+        first, last = f"{column_letter(left)}{top}", f"{column_letter(right)}{bottom}"
+        reference = first if first == last else f"{first}:{last}"
+    return re.sub(r'<dimension\b[^>]*/>', f'<dimension ref="{reference}"/>', xml, count=1)
+
+
+def _name_order(book: Workbook, name: str, local: str | None) -> tuple[object, ...]:
+    """Where Excel puts a defined name in the file: measured by scripts/measure_autofilter_file.py."""
+    sheet = ""
+    if local is not None and local.isdigit() and int(local) < len(book.tabs()):
+        sheet = book.tabs()[int(local)].name
+    return (_collation(name.removeprefix("_xlnm.")), 0 if local is not None else 1, _collation(sheet))
+
+
+def _collation(text: str) -> bytes:
+    """Text as Excel orders names: Windows' word sort ignoring case, and other text after it by its characters."""
+    from pyopenvba.apps.excel._names import collation
+
+    return collation(text)
+
+
+def _write_names(book: Workbook, package: OpcFile) -> None:
+    """The model's defined names, put back into the workbook part."""
+    if not package.has("xl/workbook.xml"):
+        return
+    text = package.read("xl/workbook.xml").decode("utf-8", errors="replace")
+    from pyopenvba.apps.excel._advanced_filter import attribute_values, patch_attribute
+    from pyopenvba.apps.excel._workbook_links import saved_name
+
+    written: list[tuple[tuple[object, ...], str]] = []
+    tables = [table.name for sheet in book.sheets_ for table in sheet.tables]
+    for attributes, body in _DEFINED_NAME.findall(text):
+        found = attribute_values(attributes)
+        name = found.get("name", "")
+        unowned_print = name in ("_xlnm.Print_Area", "_xlnm.Print_Titles")
+        scope = found.get("localSheetId", "")
+        if unowned_print and re.fullmatch(r"[0-9]{1,10}", scope) and int(scope) < len(book.tabs()):
+            unowned_print = name.removeprefix("_xlnm.") not in book.tabs()[int(scope)].page_print_names_owned
+        if name.startswith("_xlnm") and (name not in (_FILTER_DATABASE, "_xlnm.Criteria", "_xlnm.Extract", "_xlnm.Print_Area", "_xlnm.Print_Titles") or unowned_print):
+            written.append((_name_order(book, name, found.get("localSheetId")),
+                            f"<definedName {attributes}>{body}</definedName>"))
+    from pyopenvba.apps.excel._name_macro import saved as macro_saved
+
+    # Excel leaves Excel 4 macro names out of a workbook saved without macros (tests/fixtures/name_macro.json).
+    macros = workbook_format(book) in (52, 53, 55)
+    for entry in book.names_.entries:
+        if entry.macro_links_itself and macros:
+            raise VBAUnsupportedError("Saving a macro name whose RefersTo was set to a sheet's cells is not implemented")
+        if (entry.macro_type and not macros) or any(entry is lost for lost in book.query_names_lost):
+            continue
+        # A name that came from the file keeps the attributes it came
+        # with; localSheetId and hidden are not the model's to drop.
+        from pyopenvba._a1 import split_sheet
+
+        owned = attribute_values(entry.attributes)
+        scope, bare = split_sheet(entry.name)
+        owned["name"] = (_FILTER_DATABASE if bare == "_FilterDatabase" else
+                         "_xlnm." + bare if scope and bare in ("Criteria", "Extract", "Print_Area", "Print_Titles")
+                         and owned.get("name") == "_xlnm." + bare else bare)
+        owned.pop("localSheetId", None)
+        if scope:
+            index = next((i for i, sheet in enumerate(book.tabs()) if sheet.name.lower() == scope.lower()), None)
+            if index is not None:
+                owned["localSheetId"] = str(index)
+        owned.pop("hidden", None)
+        if not entry.visible:
+            owned["hidden"] = "1"
+        owned.pop("comment", None)
+        if entry.comment:
+            owned["comment"] = entry.comment
+        # Update only model-owned attributes; leave opaque attributes and their
+        # namespace declarations lexically intact, including single quotes.
+        attributes = entry.attributes
+        for key in ("name", "localSheetId", "hidden", "comment"):
+            attributes = patch_attribute(attributes, key, owned.get(key))
+        if entry.macro_changed:
+            for key, value in macro_saved(entry).items():
+                attributes = patch_attribute(attributes, key, value)
+        attributes = attributes.strip()
+        refers_to = saved_name(without_dangling_references(prefixes.in_file(in_file(entry.refers_to, tables))).lstrip("="))
+        written.append((_name_order(book, owned["name"], owned.get("localSheetId")),
+                        f"<definedName {attributes}>{_escape_text(refers_to)}</definedName>"))
+    # Excel writes its names in the Name Manager's order: by name as it shows there, ignoring case, and
+    # a name on a sheet before the workbook's of the same name, sheets in the order of their names.
+    written.sort(key=lambda pair: pair[0])
+    keep = [element for _, element in written]
+    block = f"<definedNames>{''.join(keep)}</definedNames>" if keep else ""
+    # The block goes in as it is: a name may hold a backslash, a\b, which a replacement template reads as an escape.
+    if "<definedNames>" in text:
+        text = re.sub(r"<definedNames>.*?</definedNames>", lambda _found: block, text, count=1, flags=re.DOTALL)
+    elif "<definedNames/>" in text:
+        text = text.replace("<definedNames/>", block, 1)
+    elif block:
+        text = re.sub(r"(<sheets>.*?</sheets>)", lambda found: found.group(1) + block, text, count=1,
+                      flags=re.DOTALL)
+    package.write("xl/workbook.xml", text.encode("utf-8"))

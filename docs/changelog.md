@@ -3,6 +3,6875 @@
 All notable changes to pyOpenVBA are documented here. This project follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- What macros see changes in several ways since 6.6.0, and a macro that relied on the old answers may behave differently:
+  - `Workbook.Calculate` is gone, as Excel does not have it. A macro now gets error 438.
+  - Assigning to a read-only member raises Excel's error instead of changing nothing or raising 450: a value goes by the member's own measured error, an object by what it answers (a Range takes the value, `Application` is 450, anything else 438), and `Set` on one is 438, 450 or 13.
+  - Settings and members given bad values raise Excel's error where they used to change nothing: Null is 94 and text that is no value 13 on `Application` and `Worksheet` settings, and values Excel refuses are 1004 or 5. Text past Excel's limits on hyperlinks, validation, table columns and windows raises too.
+  - `Range.Value`, `Value2` and `Formula` given `Null` clear the cell.
+  - A collection's `Item` raises Excel's error for each kind of index on each collection.
+  - `x.Add(1, 2)` or `P(a:=1)` as a bare statement no longer compiles, as in Excel. Use `Call` or drop the parentheses.
+  Each is listed with its detail below.
+- VBA runs in a sandbox by default. Running VBA can no longer save, open or
+  export a file, which raises `VBASandboxError`. Pass `sandbox=False` to
+  `ExcelApplication`, `WordApplication` or `PowerPointApplication`, or to their
+  `open`, to allow it as before. Python's own `app.save` and `open` are not
+  affected. This breaks a macro that saves or opens files under the defaults.
+
+### Added
+
+- `Selection` with a shape selected is the shape's drawing object, `Rectangle`, `Oval`, `Line` or `TextBox`, or
+  `DrawingObjects` for several, with `Name`, `Left`, `Top`, `ShapeRange` and `Count`. `ShapeRange.Select` selects them.
+- The old drawing and control collections (`Buttons`, `DropDowns`, `Rectangles`, `DrawingObjects` and the rest) answer
+  for their items as Excel does. Most reads over them are 1004, even where the items agree. A property set on one
+  reaches every item. `BringToFront` and `SendToBack` move the items together. `AddItem`, `RemoveItem` and
+  `RemoveAllItems` reach every list. Each button role (`DefaultButton`, `CancelButton`, `HelpButton`) is held by
+  one button on a sheet at a time. A form control loaded from a file takes its settings and saves them where Excel
+  writes each. So does a new one, for `Display3DShading`, `AddIndent` and the settings Excel takes and keeps
+  nowhere. A new button's roles, alignments and `Orientation` read as Excel's do in the session. Saving them says it
+  is not implemented: Excel reads them from a text body the model does not write for a new button yet. A rectangle,
+  oval, arc or text box loaded from a file takes its alignments, `Orientation`, `AddIndent`, `Placement`,
+  `Visible`, `Locked` and `PrintObject` as Excel does. Measured typed and late, through a save and a reopen.
+  A new or loaded drawing also takes `LockedText = False`, `ReadingOrder` and `Shadow = True`, alone and through
+  its collection, and saves each where Excel writes it. Its `Formula` links its text to a cell: the text shows the
+  cell's, in the cell's font, follows the cell, and stays when the link comes off. `AutoScaleFont` is taken and kept
+  nowhere, as in Excel. A line's old `ArrowHeadStyle`, `ArrowHeadLength` and `ArrowHeadWidth` set its ends as Excel
+  does, alone and through `Lines`. The hidden `_Default` of `CheckBoxes`, `OptionButtons`, `DropDowns`, `ListBoxes`
+  and `DrawingObjects` is their items' `Value`, as Excel answers it typed. `RoundedCorners = True` rounds a new or
+  loaded rectangle or text box, and renames a rectangle as Excel does. A picture takes `Shadow = True`, a loaded button
+  `AutoScaleFont`, and `DrawingObjects.Visible` reads the sheet's first form control's, as Excel does. `Left`, `Top`,
+  `Width` and `Height` over a whole old collection read 1004 and set as Excel does: a size goes to each item, an arc
+  taking half, and a place moves the items together so the last lands on the value. Measured at 144 DPI.
+  `DrawingObjects.Vertices` and `Reshape` answer 1004, and `DrawingObjects.Ungroup`, which answered 1004 where Excel
+  succeeds, now says it is not implemented.
+  `Duplicate` on a collection of shapes read from a file, form controls or lines says it is not implemented.
+- `Range.Insert` with something on the clipboard is Insert Copied Cells or Insert Cut Cells:
+  `Rows(3).Copy: Rows(6).Insert` duplicates the row and `Rows(3).Cut: Rows(6).Insert` moves it. Measured in live Excel
+  over about 240 shapes of copy, cut and target (`tests/fixtures/range_audit.json`). Filling whole columns with a copy
+  of cells, a million cells each, says it is not implemented.
+- Chart data from several areas with the same rows or columns, through `SetSourceData` and `AddChart2`'s selection, and
+  `AdvancedFilter` over a whole column.
+- `ListObject.Unlist`, which turns a table into cells: each of the 60 built-in styles becomes the cells' own formats
+  beneath what was set on them, and formulas naming the table name its cells. Compared with Excel for every style
+  under four sets of the table's options.
+- A colour on a series' line with a marker: setting `Format.Line.ForeColor.RGB` on a line series with markers or a
+  scatter series, and `MarkerStyle` on a line series with a line colour, reach the marker as they do in Excel.
+- `Shapes.AddChart2` and `Shapes.AddChart`, so a recorded macro that makes a chart runs. Each picks up the data round
+  its sheet's selection. It saves as Excel saves it, with its style and colours parts, wherever a chart type and
+  style were compared with Excel and match: every type the engine writes at the 14 styles some type takes by default,
+  and between 279 and 292 of the 297 styles for each of column, bar, stacked column, line, area, pie, doughnut and
+  scatter charts, data labels, axis titles, drop lines and high-low lines among what they bring. Any other style from
+  201 to 497 reports that it is not implemented. The old styles 1 to 48 work. Styled charts read their own fonts,
+  lines and gaps, and changing one keeps the style.
+- `Application.Undo` and `Repeat`, which raise 1004 as nothing is left to undo while a macro
+  runs. `OnUndo`, `OnRepeat`, `OnKey` and `CheckAbort`, checked and held nowhere, since the
+  model has no menu or keyboard. A key OnKey cannot read raises 1004.
+- Read-only `Application` members a macro may test: `WindowState`, `AutomationSecurity`,
+  `IgnoreRemoteRequests`, `MailSystem`, `MaxSupportedCompatibilityVersion`,
+  `TransitionMenuKey`, `TransitionMenuKeyAction`, `PreviousSelections`,
+  `ActiveProtectedViewWindow`, and the empty `ProtectedViewWindows`, `Watches`, `ODBCErrors`,
+  `OLEDBErrors`, `Excel4MacroSheets` and `Excel4IntlMacroSheets`.
+- `DataLabels.Format`: the fill's colour and the outline's weight. A colour on the outline
+  does nothing, as in Excel.
+- `Trendline.Forward2`, `Backward2` and setting `Backward`, which only a scatter chart runs
+  past half a category. `Trendline.DataLabel` reads and deletes; changing it is refused.
+  `Axis.MinorUnitScale` reads as on a category axis over numbers.
+- `SeriesCollection.Add` and `Extend`. A series can now read several areas, as in
+  `=SERIES(,,(Data!$B$2:$B$5,Data!$C$6),1)`.
+- `ChartObject.Duplicate`, `ChartObjects.Duplicate` and `Shape.Duplicate` of a chart, each
+  with a chart and part of its own. `ChartObject.Duplicate` answers a `Shape`, as in Excel.
+- `ChartObject.Copy`, `Cut` and `Shape.Copy`, `Cut` of a chart with `Worksheet.Paste`. The copy
+  holds the chart as it was, lasts until cells are copied, and pastes only on the active sheet.
+  Excel's own paste of a chart fails at random; the model's does not. A chart read from a file
+  is not copied. `Shape.DrawingObject` of a chart answers its `ChartObject`.
+- `Worksheet.Copy` with new charts on the sheet, each its own, reading the copies of the sheets
+  copied with it. Other drawings and charts read from a file stay refused.
+- `ChartArea.ClearFormats` and `ClearContents`, `PlotArea.ClearFormats`,
+  `Trendline.ClearFormats`, and `ChartObjects.Select` of a single chart.
+- `LegendEntry.Index`, `Font` and `LegendKey`. A key is its series under another name:
+  deleting it deletes the series.
+- `Range.NavigateArrow`, following the levels `ShowPrecedents` and `ShowDependents`
+  have traced. Several dependents on one sheet are refused, since their order was
+  not worked out.
+- `Range.Justify`. A line about as wide as its column is refused, because where Excel
+  breaks those depends on the display.
+- `Range.SortSpecial`, `Range.Show`, `Range.Run`, `Range.Phonetic`, `Range.Phonetics`,
+  `Range.SetPhonetic` and `Worksheet.PasteSpecial` for cells on the clipboard.
+- `Format.Line` on a trendline and on error bars: `ForeColor.RGB`, `Weight`, all
+  twelve `DashStyle` values, `Style`, and hiding with `Visible`. It shares its look
+  with their `Border`. `Format.Fill` raises the error Excel raises, since a line has
+  no fill. Theme colours, arrowheads, transparency on a line with a look, showing a
+  hidden line again, and a line's shadow, glow and soft edge are refused.
+- `Border` on a trendline and on error bars. Error bars refuse to hide their line, as
+  Excel's do, raising an error for `LineStyle` or `ColorIndex` set to `xlNone`.
+- `Border` on a chart's axes, gridlines, series, points, chart area, plot area,
+  legend, titles and axis titles: `Color`, `ColorIndex`, `Weight` and `LineStyle`,
+  over the same look as `Format.Line`. The markup matches Excel's.
+- `Series.ClearFormats`. It takes away the look set on a series and its points. On
+  a line or scatter series the marker comes back automatic and smoothing goes, and
+  a scatter series gains a line. Labels and trendlines stay. It is refused on a
+  line series with a look and on an area series with a point set apart.
+- `Chart.Refresh`, `ClearToMatchColorStyle`, `ChartObjects`, `Shapes`, `Hyperlinks`
+  and `Evaluate("Legend")`. An embedded chart holds no objects of its own, so the
+  collections count 0. `Chart.Location` to the chart's own sheet returns the
+  chart. `Chart.Delete`, `Move`, `Copy`, `OLEObjects`, `Calculate`, `Resize` and
+  `Evaluate` of anything else raise the errors Excel raises on an embedded chart.
+  `Walls`, `BackWall`, `SideWall` and `Floor` return their objects. Moving a
+  chart to another sheet, and a chart's own shapes, are refused.
+- `Shape.Shadow`, `Glow`, `SoftEdge` and `Reflection` on an AutoShape, a text box and a line, as
+  live Excel reads and saves them, the nine reflection presets and six soft edge types included.
+  Preset shadows, inner shadows and effects of a shape read from a file are refused.
+- `Chart.ApplyLayout` on column, bar, line, scatter, area, pie and doughnut charts. A layout gives
+  the chart all it says and puts the rest back as on a new chart. A `ChartType` argument and a
+  scatter chart's layouts 3 and 9, which add trendlines, are refused.
+- `Chart.ChartStyle` from 1 to 48, `ClearToMatchStyle` and `ChartWizard`. `ChartStyle` from 201
+  and setting `ChartColor` are refused.
+- `Chart.SetElement` on column, bar, line, scatter, area, pie and doughnut charts: titles,
+  legends, axes, axis titles, gridlines, data labels, data tables, error bars, drop and
+  high-low lines and up-down bars. A data label callout, taking away the plot area and an
+  area chart's error bars are refused.
+- `Chart.FullSeriesCollection`, and a series found by name in it or in `SeriesCollection`.
+- `Series.IsFiltered`, which moves a series out of `SeriesCollection` and into the file's extension
+  for filtered series. `NewSeries`, `SetSourceData` and setting `PlotOrder` are refused while a series
+  is filtered out.
+- `Select` on a chart's legend, legend entries, title, axes, axis titles, gridlines,
+  data labels, trendlines and error bars, which `Selection` then answers.
+- `Point.Select` and `Series.Select`, which `Selection` then answers. A chart that cannot
+  select the element fails as Excel does, with its chart area selected.
+  `ActiveWindow.Selection` answers the chart's frame while a chart is active.
+- A point's `Format.Fill` and `Format.Line` on line and scatter charts, where the fill and
+  line reach its marker as Excel writes them. Hiding the line, `Solid` on a marker and a
+  scatter point's line are refused. `Point.ClearFormats` on every kind of chart, and
+  `Point.Delete`, which as in Excel takes away the series.
+- One point's marker: `MarkerStyle`, `MarkerSize`, `MarkerBackgroundColor`,
+  `MarkerForegroundColor` and their `ColorIndex` forms, over its series' and given way to
+  when the series sets the same, on line, scatter and other charts. `Series.MarkerStyle`
+  and `MarkerSize` now read on a chart without lines, as Excel's do.
+- `ApplyDataLabels` on a chart, a series and a point: its type, each named part and the
+  separator, the way a type overrides what is already shown, and what stays of labels
+  already changed. `AutoText:=False` is refused.
+- One point's `DataLabel`: `Text`, `Caption`, `AutoText`, the `Show` members, `Position`,
+  `NumberFormat`, `Separator`, `Orientation`, `HorizontalAlignment`, `ReadingOrder`,
+  `Shadow`, `Font`, `Characters`, `Delete`, and a fill through `Format`. What is set of a
+  label stands apart from its series' labels and saves as Excel writes it. `AutoText =
+  False`, a formula, and a label's place and size are refused.
+- `ADODB.Stream`: bytes and text in memory through its charsets, as live Excel
+  answers them. `SaveToFile` and `LoadFromFile` need `sandbox=False`.
+- Text files and the file system from VBA with `sandbox=False`: `Open` for Input,
+  Output and Append, `Print #`, `Write #`, `Input #`, `Line Input #`, `Close`,
+  `Seek`, `Input()`, `EOF`, `LOF`, `Loc`, `FreeFile`, `Kill`, `MkDir`, `RmDir`,
+  `ChDir`, `CurDir`, `FileCopy`, `Name`, `Dir`, `FileLen`, `FileDateTime`, `GetAttr`,
+  `SetAttr` and `Environ`, as live Excel answers them.
+- `Scripting.FileSystemObject` with `sandbox=False`: its files, folders and text
+  streams, with the errors live Excel gives. Its path functions still work in the
+  sandbox.
+- Binary and Random files from VBA with `sandbox=False`: `Open` in those modes,
+  `Get`, `Put`, `Lock` and `Unlock`, with each type laid out byte for byte as
+  Excel lays it out.
+- HTTP from VBA with `sandbox=False`: `CreateObject` makes `MSXML2.XMLHTTP`,
+  `MSXML2.ServerXMLHTTP` and `WinHttp.WinHttpRequest.5.1` on Python's own
+  sockets, on any platform. Each sends and answers as its Windows stack does,
+  headers and errors included. `DoEvents` now runs, answering 0, and finishes
+  an asynchronous request.
+- Font on a chart's text: the chart title, axis titles, tick labels, legend,
+  data labels and chart area. It reads the theme's body font, at 18 point bold
+  on the chart title, 10 point bold on an axis title and 10 point elsewhere.
+  Name, Size, Bold, Italic, FontStyle, single Underline, Strikethrough, Color
+  and ColorIndex save as Excel writes them. Superscript is refused because
+  Excel reads it back and saves nothing. A chart area font beside another
+  element's font is refused because whether it reaches them was not measured.
+- Series.Points and Point, on the chart kinds the model makes. A point reads
+  what its series gives until something is set of it, and a save writes a
+  dPt for it in index order. Its Format, Explosion, InvertIfNegative and
+  HasDataLabel work on column, bar, area, pie and doughnut charts, and its
+  look on a line or scatter chart is refused for now. A pie or doughnut point
+  takes its own place's accent, and a change to the series' fill or line
+  takes that part from its points. Measured in
+  `tests/fixtures/series_points.json`.
+- Format on the chart area, plot area, legend, chart title, axis title, axes
+  and major gridlines, with its Fill and Line. The chart and plot areas fill
+  white, the others have no fill until one is set, and gridlines refuse a
+  fill. The chart area, axes and gridlines draw a grey line, and the others
+  have none until a colour is set. A save writes each look where Excel does.
+  Measured in `tests/fixtures/chart_element_format.json`.
+- Series.Format, with its Fill and Line, on the chart kinds the model
+  makes. A column, bar, pie, doughnut or area series reads its accent as
+  its fill and has no line until a colour is set. A line series draws in
+  its accent at 3 points and takes no fill. A series with markers gives a
+  fill colour to its markers. A save writes only what was set, as Excel
+  does. Measured in `tests/fixtures/series_format.json`.
+- ShapeRange.Fill and ShapeRange.Line. A range reads what its shapes share,
+  leaving a line's absent fill out, and reads the mixed value where they
+  differ. A change reaches each shape as it would alone, except hiding a
+  fill, which hides the first shape and leaves the others a bare noFill
+  that loses their colours, as Excel does. Measured in
+  `tests/fixtures/shape_range_fill_line.json`.
+- Shape.Fill and Shape.Line on a new AutoShape, text box or line, with the
+  FillFormat, LineFormat and ColorFormat objects. They read what the
+  shape's style gives in the default theme. A macro can set the fill's
+  colour, transparency and Visible, Solid, and the line's colour, weight,
+  two dash styles, transparency and Visible. A save writes only what was
+  set until a setting makes Excel write out the style, as hiding a line
+  does, and that stays once it is shown again. Measured in
+  `tests/fixtures/shape_fill_line.json`.
+- Workbook.TableStyles as a collection: the 170 built-in styles in Excel's
+  order, by number or by name in any case, error 9 for neither.
+  TableStyle.NameLocal reads English Excel's words, such as "Table Style
+  Medium 2". Each style answers which gallery it shows in, and refuses a
+  change with error 5. Deleting a built-in style raises 1004. Parent is
+  TableStyles. Measured in `tests/fixtures/table_styles.json`.
+- Series.DataLabels and the DataLabels object. It reads and sets which
+  parts the labels show, their position, number format and separator, and
+  writes each in the series' dLbls as Excel does. Each chart type's default
+  position and the positions it takes are measured. Labels showing nothing
+  read HasDataLabels False and write none. A DataLabels kept after its
+  labels go raises Excel's errors. Measured in
+  `tests/fixtures/data_labels_object.json`.
+- Chart.Elevation, Rotation, Perspective, RightAngleAxes, DepthPercent,
+  HeightPercent, GapDepth, AutoScaling, BarShape, ChartStyle, ChartColor,
+  CategoryLabelLevel and SeriesNameLevel, as every chart type the model
+  makes reads them. A pie or doughnut is seen from higher and unturned.
+  ChartGroup.DropLines, HiLoLines, UpBars, DownBars and SeriesLines, with
+  their names and Delete. Measured in
+  `tests/fixtures/chart_type_reads.json`.
+- Chart.ChartArea and PlotArea. The chart area is named Chart and reads
+  its chart object's Left and Top, its size less 5 points, and its shadow
+  and rounded corners. The plot area is named Plot, with an automatic
+  Position. Selecting either one activates the chart, and Selection then
+  reads that part. A new chart type for the active chart selects its chart
+  area, and a title does not, which ends the refusal of those Selection
+  reads. ChartObjects.Parent, Application, ShapeRange and
+  ProtectChartObject. Measured in `tests/fixtures/chart_areas.json`.
+- ActiveChart on Application, Workbook and Window, with ChartObject.Activate
+  and Select. An activated embedded chart stays active until a range is
+  selected or activated. It is kept per sheet and per workbook, and
+  Selection reads its ChartObject meanwhile. Chart.Activate and Select on
+  an embedded chart raise 1004, and a deleted ChartObject's Chart raises
+  1004. Measured in `tests/fixtures/active_chart.json`.
+- Shape.ScaleWidth and ScaleHeight on shapes and shape ranges. The factor
+  is a Single and the shape is kept at its top left, middle or bottom
+  right, in whole EMU, never below zero or past the sheet's edge. A locked
+  aspect ratio scales both ways. Shape.ConnectionSiteCount, ShapeStyle,
+  BackgroundStyle and GraphicStyle for each kind of shape the model makes.
+  ShapeRange's Chart, TextFrame, TextFrame2, BlackWhiteMode and the style
+  reads, with -2 where the shapes differ. Measured in
+  `tests/fixtures/shape_scale.json`.
+- Window.SheetViews and ActiveSheetView, and the WorksheetView each gives.
+  SheetViews holds every sheet in tab order, whichever are selected. A view
+  reads and sets its own sheet's gridlines, formulas, headings, zeros and
+  outline symbols, even while another sheet is active. Measured in
+  `tests/fixtures/sheet_views.json`.
+- Axis.MajorGridlines, MinorGridlines and TickLabels, with the Gridlines
+  and TickLabels objects. Gridlines answer their name and Delete.
+  TickLabels.NumberFormat follows the source cells until a format is set,
+  which unlinks it, and NumberFormatLinked and NumberFormatLocal behave as
+  in Excel, the saved numFmt included. A value axis now saves its first
+  value cell's format while linked, as Excel does. The fixed reads
+  (Orientation, Offset, Alignment, Depth, MultiLevel, ReadingOrder) answer
+  as a new chart does. Measured in `tests/fixtures/chart_axis_parts.json`.
+- 58 more members read as Excel answers them on a new workbook. The
+  Workbook password and encryption reads, Container, the document-server
+  members and ExternalCodeServiceTimeout. An embedded chart's sheet-only
+  members raise 1004, its protection and field-button reads are off and
+  PivotLayout is Nothing. Axis.CategorySortOrder and DisplayUnitLabel,
+  Series.BubbleSizes, ChartObject.ZOrder and ProtectChartObject.
+  Shape.Child, Connector, FormControlType, HasSmartArt, BlackWhiteMode and
+  Hyperlink. ShapeRange's single-shape reads, which several shapes answer
+  with error 70 or what they share. Application on Axis, AxisTitle,
+  LegendEntry and TextFrame2, and TextFrame2.Parent. Measured in
+  `tests/fixtures/missing_reads.json`.
+- Worksheet.QueryTables, OLEObjects and NamedSheetViews, Workbook.XmlMaps,
+  XmlNamespaces, CustomViews, PublishObjects, SlicerCaches, Charts and the
+  Excel 4 macro sheet collections, and Application.Charts. Each is empty as
+  on a new workbook, its items raising the errors Excel raises. A loaded
+  workbook holding any of these is refused rather than read as empty.
+  Measured in `tests/fixtures/empty_collections.json`.
+
+- 19 more Application properties read as Excel starts: DisplayRecentFiles,
+  ShowDevTools, CommandUnderlines, DataEntryMode, DefaultSaveFormat,
+  CanPlaySounds, Ready and the rest. The writable ones read only, since
+  measuring their setters would change the user's Excel profile. Measured
+  in `tests/fixtures/application_settings_more.json`.
+
+- Threaded comments: Range.AddCommentThreaded, Range.CommentThreaded,
+  Worksheet.CommentsThreaded and the CommentThreaded and Author objects.
+  A thread's text, replies, Resolved, Date, author, Parent, Next and
+  Previous read and change as Excel's do. A workbook saves the
+  threadedComments part, the stand-in note older versions of Excel read,
+  and the persons part, as Excel writes them, and reads them back. The
+  model has no account, so a person is Application.UserName with the
+  provider None. Excel opens such a file and reads its threads. Copying,
+  clearing and NoteText on a thread's cell are refused. Measured in
+  `tests/fixtures/threaded_comments.json`, with the measuring person's
+  identity masked.
+
+- FormatColor.Parent and Application on a colour scale's colours. Parent
+  reads its ColorScaleCriterion.
+- 88 core reads everyday macros make measured against live Excel, in
+  `tests/fixtures/core_reads.json`. They cover ActiveCell, Selection, Areas,
+  the Parent and Application of formats and collections, Name's local
+  forms, sort fields, table style flags and text frame margins.
+
+- 319 more WorksheetFunction members measured against live Excel through
+  both WorksheetFunction and Application, 355 calls in
+  `tests/fixtures/worksheet_functions_more.json`. 347 answer as Excel
+  does. Eight statistical answers land a unit away in the fifteenth
+  significant digit, and the test marks them.
+
+- ChartGroup.HasDropLines, HasHiLoLines, HasUpDownBars and
+  HasSeriesLines, read, set, saved and read back as Excel writes them.
+  Drop lines are written in line and area charts, high-low lines and
+  up-down bars in line charts, and series lines in stacked column and bar
+  charts. Other kinds keep the setting and write nothing. Measured in
+  `tests/fixtures/chart_group_lines.json`.
+
+- Workbook.FullNameURLEncoded, which reads FullName for any workbook on a
+  local disk, spaces, # and % unencoded. Measured in
+  `tests/fixtures/full_name_url_encoded.json`.
+
+- Rows that grow with a larger font move and size the shapes over them,
+  by their Placement, as Excel moves them. Measured in
+  `tests/fixtures/shape_structure_moves.json`.
+
+- Inserting and deleting rows, columns and cells on a sheet with merged
+  cells. The model refused this before. A merged area moves, grows and
+  shrinks as a reference to it would, and one left with a single cell is
+  unmerged. A merged area wholly inside a shifting band of cells moves
+  with it, and one the moving cells cut through is unmerged, its value
+  staying with its cell. Excel asks before that unless DisplayAlerts is
+  off, and the model reports that case as not implemented. Measured in
+  `tests/fixtures/merge_structure_edits.json`.
+
+- Inserting and deleting whole rows and columns on a sheet with shapes
+  or chart objects. The model refused this before. Shapes move with the
+  lines by their Placement. A shape that sizes with its cells grows when
+  lines go in through it, and is deleted with the last line it spans. A
+  shape that only moves goes to the start of the next line when its own
+  is deleted. Inserting or deleting cells moves only the shapes wholly
+  inside the shifted band. Measured in
+  `tests/fixtures/shape_structure_moves.json`.
+
+- Shapes and chart objects follow the cells under them as Excel moves
+  them when column widths, row heights, hidden columns and rows or the
+  standard width change. xlMoveAndSize keeps the cells under both corners
+  and how far into them the corners are. xlMove keeps the top left one
+  and its size. xlFreeFloating stays put. Shape.Placement can now be set,
+  and TopLeftCell answers the cell a shape is anchored to, hidden or not.
+  Measured in `tests/fixtures/shape_cell_moves.json`.
+
+- ChartObject.RoundedCorners and ChartObject.Shadow, read, set, saved
+  and read back as Excel writes them. ChartObject answers TopLeftCell,
+  BottomRightCell and Application. ChartGroup answers Application,
+  AxisGroup, Index and SeriesCollection, ChartTitle answers Application,
+  Parent and Name, and Legend answers Name. Measured in
+  `tests/fixtures/chart_object_reads.json`.
+
+- Chart trendlines: Series.Trendlines, Trendlines.Add and the Trendline
+  object, written and read back as Excel writes them. Add takes every
+  type with its order, period, forward, intercept, display flags and
+  name, and Backward is ignored as Excel ignores it. A trendline's
+  automatic name is its type and the series' name, such as
+  "2 per. Mov. Avg. (Sales)". Measured in
+  `tests/fixtures/chart_trendlines.json`.
+
+- Chart error bars: Series.ErrorBar, Series.HasErrorBars and the
+  ErrorBars object's Parent, Name, EndStyle and Delete, written and read
+  back as Excel writes them. ErrorBar takes every Include and Type,
+  custom values from ranges, arrays or numbers among them. HasErrorBars
+  makes a fixed bar of the value axis' major unit, 1 on scatter, pie and
+  doughnut charts. It is refused over an automatic major unit, which
+  needs Excel's layout. Measured in `tests/fixtures/chart_error_bars.json`.
+
+- Stacked and 100% stacked charts: ChartType takes xlColumnStacked,
+  xlColumnStacked100, xlBarStacked, xlBarStacked100, xlLineStacked,
+  xlLineStacked100, xlLineMarkersStacked, xlLineMarkersStacked100,
+  xlAreaStacked and xlAreaStacked100, and they are written, saved and
+  read back as Excel writes them. Stacking a column or bar chart sets its
+  Overlap to 100, and unstacking it sets 0. A 100% chart's value axis
+  shows percentages. A stacked line chart follows its first series'
+  marker as a plain line chart does. Measured in
+  `tests/fixtures/chart_stacked.json`.
+
+- Series answers Parent, Application, AxisGroup, ChartType, Type,
+  PlotColorIndex, IsFiltered, HasErrorBars, Has3DEffect, Shadow, BarShape,
+  PictureType, PictureUnit2, InvertColorIndex and InvertColor, as Excel
+  reads them on each kind of chart the model makes. Type uses the old
+  gallery constants, so any column chart reads xlColumn. Measured in
+  `tests/fixtures/chart_series_reads.json`.
+
+- The hidden `_Default` members answer as Excel's do in code that
+  declares its types: a collection's finds an item as Item does, on 25
+  collections from Shapes to PivotFilters, and Range's, Name's,
+  Application's and ControlFormat's stand for Item and Value, RefersTo,
+  Name and Value. Bound late, through an Object, Excel raises 438
+  instead, which the model does not tell apart. 37 live cases agree,
+  `tests/fixtures/hidden_defaults.json` and
+  `tests/fixtures/hidden_defaults_more.json`.
+
+- The hidden members `_Evaluate` and `_CodeName` answer as Excel's do:
+  Application's `_Evaluate` as Evaluate, a sheet's both as the error
+  value #NAME?, and an embedded chart's with Excel's errors. 14 live
+  cases agree, `tests/fixtures/hidden_members.json`.
+
+- `Window.ActivateNext` and `Window.ActivatePrevious` step through the
+  workbook windows as Excel does: next swaps the front two, previous
+  brings the back one forward. 8 live cases agree,
+  `tests/fixtures/window_activate_next.json`.
+
+- `PivotTable.ChangePivotCache` draws a table again from another
+  cache's source as Excel does, and `ConvertToFormulas` and
+  `ChangeConnection` raise Excel's errors on a table over a list. 8
+  live cases agree, `tests/fixtures/pivot_table_more.json`.
+
+- The pivot members that belong to OLAP tables raise the errors Excel's
+  do on a table over a list: PivotCache's `ResetTimer` and
+  `MakeConnection`, `DrillTo` on fields and items, PivotTable's
+  what-if changes and `RefreshDataSourceValues`, and PivotCell's
+  `AllocateChange` and `DiscardChange`. 11 live cases agree,
+  `tests/fixtures/pivot_olap_members.json`.
+
+- `PivotFilter.Order` reads -1 and refuses a new order with error 5, as
+  Excel's does on a table that is not OLAP, and `PivotItems.Add` adds an
+  item no record holds, saved as Excel saves it. 11 live cases agree,
+  `tests/fixtures/pivot_filter_order.json`.
+
+- `PivotTable.ListFormulas` writes Excel's listing of a table's
+  calculated fields and items on a new sheet, laid out, headed and noted
+  as Excel lays it out. 8 live cases agree,
+  `tests/fixtures/pivot_list_formulas.json`.
+
+- `PivotTable.SubtotalLocation` moves every field's subtotals to the top
+  or bottom of its group as Excel does, the table laid out again. 9 live
+  cases agree, `tests/fixtures/pivot_subtotal_location.json`.
+
+- `Shapes.AddPolyline` and `Shapes.AddCurve` draw freeforms as Excel
+  does, saved with Excel's custom geometry, box and style, a closed
+  polyline filled and an open one drawn as a line. 10 live cases
+  agree, `tests/fixtures/shape_polyline.json`.
+
+- `Chart.ChartGroups` and a group's `GapWidth`, `Overlap`,
+  `VaryByCategories`, `FirstSliceAngle` and `DoughnutHoleSize` answer
+  as Excel's do, saved in the chart's group and read back from a
+  loaded chart. 29 live cases agree, `tests/fixtures/chart_groups.json`.
+
+- `Legend.LegendEntries`, `LegendEntry.Delete` and `Legend.Clear`
+  answer as Excel's do. A legend lists one entry per series, or per
+  point in a pie, a deleted one is saved as a `legendEntry`, and
+  deleting the last takes the legend away. 13 live cases agree,
+  `tests/fixtures/chart_legend_entries.json`.
+
+- ControlFormat's `DropDownLines`, `Enabled`, `ListIndex`, `LockedText`
+  and `PrintObject` answer as Excel's do on new drop-downs, list boxes,
+  check boxes and buttons, and are saved where Excel saves them. A new
+  control now carries Excel's own defaults: a drop-down names its lines
+  only once set, lists lock no text, and only a button starts unprinted.
+  40 live cases agree, `tests/fixtures/control_format_more.json`.
+
+- A chart's category axis takes `CategoryType`, `BaseUnit`,
+  `BaseUnitIsAuto` and, with a major unit, `MajorUnitScale` as Excel's
+  does. A time scale, chosen or automatic over dates, is saved as a
+  date axis. 17 live cases agree, `tests/fixtures/chart_category_type.json`.
+
+- `Series.HasDataLabels` and `HasLeaderLines` answer as Excel's do on
+  every chart kind, and a loaded chart reads its labels from its file.
+  23 live cases agree, `tests/fixtures/chart_data_labels.json`.
+
+- A series' marker colours answer as Excel's do:
+  `MarkerForegroundColor`, `MarkerBackgroundColor` and their ColorIndex
+  forms, written in the marker's `spPr`. A colour given to a series
+  without markers turns its markers to automatic, as in Excel. 17 live
+  cases agree, `tests/fixtures/chart_marker_colours.json`.
+
+- `Series.InvertIfNegative`, `Series.Explosion`, `Chart.HasDataTable`
+  and `Chart.Name` answer as Excel's do, and a loaded chart reads the
+  first three from its file. 23 live cases agree,
+  `tests/fixtures/chart_series_more.json`.
+
+- TextFrame2's margins, `AutoSize`, `HorizontalAnchor`,
+  `VerticalAnchor`, `NoTextRotation`, `Orientation`, `WordWrap` and
+  `DeleteText` answer as Excel's do on new shapes, sharing the margins,
+  orientation and anchor TextFrame sets. 51 live cases agree,
+  `tests/fixtures/text_frame2.json`.
+
+- `Workbook.RunAutoMacros` runs `Auto_Open` and `Auto_Close` as Excel
+  does, down to Excel doing nothing on the call after one that ran a
+  macro. Auto_Activate and Auto_Deactivate run nothing. A 19-step live
+  sequence agrees, `tests/fixtures/run_auto_macros.json`.
+
+- ChartObject's `Visible`, `Locked`, `PrintObject`, `Placement`,
+  `BringToFront` and `SendToBack`, and ChartObjects' `Left`, `Top`,
+  `Width`, `Height` and `Visible`, answer as Excel's do. 22 live cases
+  agree, `tests/fixtures/chart_object_more.json`.
+
+- ShapeRange's `IncrementLeft`, `IncrementTop`, `IncrementRotation`,
+  `Flip`, `ZOrder`, `Decorative` and `AutoShapeType` answer as Excel's
+  do, and `Shape.AutoShapeType` can be set. ZOrder moves the range as
+  one block in its own order. 25 live cases agree,
+  `tests/fixtures/shape_range_more.json`.
+
+- TextFrame's margins, `HorizontalAlignment`, `VerticalAlignment`,
+  `Orientation`, `HorizontalOverflow`, `VerticalOverflow` and
+  `ReadingOrder` answer as Excel's do on new shapes, written into the
+  saved `bodyPr` and paragraphs, and `AutoMargins` raises 1004 as it
+  does in Excel. 103 live cases agree, `tests/fixtures/text_frame.json`.
+
+- `ShapeRange.Align` and `ShapeRange.Distribute` answer as Excel's do.
+  Align lines the shapes up on an edge or the middle of their box
+  together, whatever RelativeTo says. Distribute spaces them evenly
+  between the first and last in order of their edges. 29 live cases
+  agree, `tests/fixtures/shape_align.json`.
+
+- Groups move, size and come apart as Excel's do. Moving or sizing a
+  group carries its shapes, and moving a shape inside one regrows it in
+  the group's child space. `ParentGroup`, `Regroup`,
+  `ShapeRange.Ungroup` and `GroupShapes.Parent` and `Range` answer, and
+  `Shapes("name")` finds a shape inside a group. 22 live cases agree,
+  `tests/fixtures/shape_group_items.json`.
+
+- Shapes can be grouped: `ShapeRange.Group` makes a group in its topmost
+  member's place, named and numbered as Excel names and numbers one, and
+  `Shape.Ungroup` puts the shapes back. `GroupItems` finds a member by
+  name, and a group is saved as Excel writes it. 15 live cases agree,
+  `tests/fixtures/shape_group.json`.
+
+- `Shape.Duplicate`, `ShapeRange.Duplicate` and `Shape.ID` answer as
+  Excel's do. A copy lands 12 points right and down, on top, with the
+  next id, and a name of Excel's own making takes the sheet's next
+  number. Flip now mirrors a shape's rotation. 12 live cases agree,
+  `tests/fixtures/shape_duplicate.json`.
+
+- `Shape.Flip`, `HorizontalFlip`, `VerticalFlip` and `ZOrder` answer as
+  Excel's do. ZOrder reorders the drawing, which `Shapes` and
+  `ZOrderPosition` follow. 15 live cases agree,
+  `tests/fixtures/shape_flip_order.json`.
+
+- ShapeRange's Left, Top, Width, Height, Rotation, AlternativeText,
+  Title, LockAspectRatio, the flips and Name answer as Excel's do. A
+  read answers the value the shapes share, or Excel's mixed value where
+  their measurements differ, and a set reaches every shape. 16 live
+  cases agree, `tests/fixtures/shape_range_properties.json`.
+
+- Shapes can be hidden and shown: `Shape.Visible` and
+  `ShapeRange.Visible` read and set as Excel's do, written as the
+  shape's `hidden`. 10 live cases agree, `tests/fixtures/shape_visible.json`.
+
+- `Chart.Legend` and a `Legend` object answer as Excel's do: Position,
+  IncludeInLayout, Shadow and Delete. A chart without a legend raises
+  1004. 17 live cases agree, `tests/fixtures/chart_legend.json`.
+
+- `Axis.CategoryNames` and `Axis.Delete` answer as Excel's do.
+  CategoryNames reads the first series' categories, and setting it
+  gives every series the same categories. 17 live cases agree,
+  `tests/fixtures/chart_axis_names.json`.
+
+- `Range.ApplyOutlineStyles` gives summary rows and columns Excel's
+  RowLevel_n and ColLevel_n styles, which the model now defines as
+  Excel does. 9 live cases agree, `tests/fixtures/outline_styles.json`.
+
+- `Worksheet.SetBackgroundPicture` keeps a PNG's own bytes in the saved
+  file, shared between sheets that hold the same picture. 7 live cases
+  agree, `tests/fixtures/background_picture.json`.
+
+- `Worksheet.EnableFormatConditionsCalculation`, and
+  `Workbook.EnableConnections`, `ConvertComments`, `CanCheckIn` and
+  `ExclusiveAccess`, answer as Excel's do.
+  `tests/fixtures/format_conditions_calculation.json` and
+  `tests/fixtures/workbook_small_methods.json`.
+
+- Shape settings can be changed on shapes a workbook opened with, patched
+  into the markup they came with as Excel patches it. 17 live cases
+  agree, `tests/fixtures/loaded_shape/cases.json`.
+
+- `Chart.DisplayBlanksAs`, `PlotVisibleOnly`, `ShowDataLabelsOverMaximum`
+  and `DisplayValueNotAvailableAsBlank` answer as Excel's do, and a save
+  writes them as Excel does. 24 live cases agree,
+  `tests/fixtures/chart_display.json`.
+
+- `Axis.MajorTickMark`, `MinorTickMark`, `TickLabelPosition`,
+  `HasMajorGridlines`, `HasMinorGridlines`, `Crosses` and `CrossesAt`
+  answer as Excel's do. Crosses is written on the other axis, and
+  crossing at the maximum moves that axis to the far side. Line and
+  area charts now have axes. 36 live cases agree,
+  `tests/fixtures/chart_axis_lines.json`.
+
+- `Axis.MinorUnit`, `ScaleType`, `LogBase`, `DisplayUnit`,
+  `DisplayUnitCustom`, `HasDisplayUnitLabel`, `AxisBetweenCategories`,
+  `TickLabelSpacing` and `TickMarkSpacing` answer as Excel's do. 37
+  live cases agree, `tests/fixtures/chart_axis_scale.json`.
+
+- Series ids are numbered as Excel numbers them: past the series
+  `ChartObjects.Add` would have plotted from the selection, and
+  NewSeries takes the next one. 17 live cases agree,
+  `tests/fixtures/chart_series_ids.json`.
+
+- `Series.Smooth`, `MarkerStyle`, `MarkerSize`, `FormulaR1C1`,
+  `FormulaLocal` and `FormulaR1C1Local` answer as Excel's do. A line
+  chart's type follows its first series' marker. 50 live cases agree,
+  `tests/fixtures/chart_series_lines.json`.
+
+- Thirteen `ChartTitle` members and eleven `AxisTitle` members answer as
+  Excel's do: Caption, Delete, the Formula forms that link a title to
+  a cell, Orientation, the alignments, ReadingOrder, Position,
+  IncludeInLayout and Shadow. A setting is written only once set. 45
+  and 25 live cases agree, `tests/fixtures/chart_title.json` and
+  `tests/fixtures/chart_axis_title.json`.
+
+- `Shape.AlternativeText`, `Title`, `Decorative`, `Rotation`,
+  `IncrementRotation`, `IncrementLeft`, `IncrementTop`,
+  `LockAspectRatio` and `Locked` answer as Excel's do on shapes the
+  model makes. 18 live cases agree, `tests/fixtures/shape_properties.json`.
+
+- Seven more `Application` settings answer as Excel's do:
+  `MergeInstances`, `HighQualityModeForGraphics`, `GenerateTableRefs`,
+  `CursorMovement`, `DefaultSheetDirection`,
+  `LargeOperationCellThousandCount` and `ODBCTimeout`.
+  `tests/fixtures/application_settings.json`.
+
+- `Range.ShowPrecedents`, `ShowDependents` and `ShowErrors`, and
+  `Worksheet.CircleInvalid`, answer as Excel's do. ShowErrors answers
+  the cell an error starts in. 36 live cases agree,
+  `tests/fixtures/tracer_arrows.json`.
+
+- `Workbook.RemoveDocumentInformation` answers as Excel's does for
+  document properties, personal information and All. 10 live cases
+  agree, `tests/fixtures/remove_document_information.json`.
+
+- `Application.MacroOptions` answers as Excel's does. It writes a macro's
+  description, help id, shortcut key and category as attribute lines in
+  the procedure, which the VBE keeps out of `CodeModule`'s lines, and a
+  save writes the module as Excel does. 22 live cases agree,
+  `tests/fixtures/macro_options.json`. A category by name,
+  ArgumentDescriptions, StatusBar, HelpFile and the menu options report
+  themselves unsupported.
+
+- `Workbook.Connections` reads the data connections a file keeps, as
+  Excel does: each connection's name, description and type, and an OLE
+  DB connection's connection string, command and settings. 35 live
+  reads agree, `tests/fixtures/connections.json`. The model refreshes,
+  adds and changes no connection.
+
+- Twenty more `Application` and `Parent` members answer as Excel's do,
+  among them those of the pivot collections, `Queries` and
+  `SeriesCollection`. `DisplayFormat.MergeCells` and `Style`, a colour
+  scale FormatColor's `ColorIndex`, and `PivotTables.Add` join them.
+  15 live reads agree, `tests/fixtures/collection_members.json`.
+
+- A sparkline group's `DateRange` and `ModifyDateRange`, and its axis's
+  `RightToLeftPlotOrder`, answer as Excel's do. A date range reads as
+  given, makes the axis a date axis, and a save writes it before the
+  sparklines. 16 live cases agree, `tests/fixtures/sparkline_dates.json`.
+
+- `SparklineGroups.ClearGroups`, `Group` and `Ungroup` answer as Excel's
+  do. Group joins the range's sparklines under the settings of
+  Location's group, and Ungroup gives each its own group. 13 live cases
+  agree, `tests/fixtures/sparkline_grouping.json`.
+
+- `Range.SavedAsArray` answers as Excel's does: True for a cell of a CSE
+  array or of a spill. `HasRichDataType`, `LinkedDataTypeState`, `MDX`,
+  `Summary`, `QueryTable`, `ServerActions` and `CommentThreaded` answer
+  as they do on cells with no data types, queries or threaded comments.
+  64 live reads agree, `tests/fixtures/range_small_reads.json`.
+
+- A sparkline group's `Points`, `Axes`, `DisplayBlanksAs`,
+  `DisplayHidden` and `PlotBy` answer as Excel's do. Each point's
+  marking shows or hides and takes a colour. The vertical axis takes
+  group, single or custom scales with their values, and the horizontal
+  axis line shows or hides. `SeriesColor` and each point's colour are
+  FormatColors, reading and setting an RGB, a theme colour and its tint.
+  A save writes each setting into the group as Excel does. 43 live cases
+  agree, `tests/fixtures/sparkline_points.json`.
+
+- Sparklines come to the model with `Range.SparklineGroups`, as Excel
+  has them. `Add` makes line, column or win/loss sparklines for a row or
+  column of cells. A group reads and sets its type, source, cells, line
+  weight and series colour, and `Modify` and its kin move it. `Clear`,
+  `Delete` and `Range.Clear` take sparklines away. A save writes them in
+  the worksheet's extension as Excel does, and a reopened file gives them
+  back. 48 live cases and 12 saves agree, `tests/fixtures/sparklines.json`.
+  The model does not move a sparkline, so these report themselves
+  unsupported on a sheet a sparkline sits on or reads:
+  - inserting or deleting rows, columns or cells
+  - copying, cutting, pasting, sorting or filling
+  - copying, renaming or deleting the sheet
+
+- `PivotTable.GetData` answers as Excel's does for a name picking a data
+  field and items, quoted or not, in any order and case, with
+  `field[item]` and Grand Total. 33 live names agree,
+  `tests/fixtures/pivot_get_data.json`.
+
+- Small properties of pivot tables, caches, fields and items answer as
+  Excel's do on a pivot table over a worksheet range. 81 members, among
+  them SmallGrid, PrintDrillIndicators, ShowPageMultipleItemLabel,
+  PageFieldStyle, VacatedStyle, MissingItemsLimit, a field's DragTo*,
+  IncludeNewItemsInFilter, EnableItemSelection and ShowAllItems, and an
+  item's RecordCount. A save writes each flag to the pivot table's or
+  cache's part as Excel does, left out at its default. What only an OLAP
+  or external source has is error 1004. 185 live cases agree,
+  `tests/fixtures/pivot_properties.json`. These report themselves
+  unsupported:
+  - `DisplayMemberPropertyTooltips` set to True, which stopped Excel's
+    automation when it was measured
+  - `ShowAllItems` True on a row or column field
+  - a cache whose source is not a worksheet range
+
+- 35 small members answer as Excel's do. `Application` comes to pivot,
+  shape, pane and conditional-format objects, and `Parent` to Shape,
+  Shapes and Panes. PivotTable, PivotField and PivotItem read their name
+  as their default member, and `PTCondition` is False on a range's rules.
+  `Validation.IMEMode` reads xlIMEModeNoControl and ignores a set, as on a
+  machine with no East Asian input method. 31 live cases agree,
+  `tests/fixtures/object_members.json`.
+
+- `Range.LocationInTable` answers as Excel's does. Every cell of 595
+  pivot tables in 23 workbooks agrees, `tests/fixtures/location_in_table/`.
+
+- `Application.FindFormat` and `ReplaceFormat` work with `Range.Find` and
+  `Range.Replace`, as Excel's do. Find with SearchFormat finds a cell
+  whose own format holds every property set. Replace with ReplaceFormat
+  puts the format into each cell it changes, and with nothing sought it
+  restyles the cells it finds. The CellFormat keeps a font's Bold,
+  Italic, Name, Size, Underline and colour, an interior's colour and
+  pattern, and NumberFormat, Locked, FormulaHidden, HorizontalAlignment,
+  WrapText and IndentLevel. 54 live cases agree,
+  `tests/fixtures/find_format.json`. These report themselves unsupported:
+  - Borders
+  - setting the alignment and merge properties that read Null
+  - a format search over more than a million cells
+
+- `Worksheet.ClearArrows` and `ClearCircles` answer as Excel's do. There
+  is never anything to clear, since the model draws no arrows or circles,
+  and ClearArrows on a protected sheet is error 1004.
+  `tests/fixtures/clear_arrows.json`.
+
+- `Sheets.Add2` gives error 445 on a workbook's sheets, as Excel's does,
+  and adds no sheet. `tests/fixtures/sheets_add2.json`.
+
+- `AutoFilter.Sort` keeps the sheet filter's own sort settings apart
+  from `Worksheet.Sort`, as Excel does. Its range and header row are the
+  filter's, so `SetRange` is error 1004 and a `Header` of xlNo error 5.
+  `Apply` sorts the rows under the header. From then on a save writes
+  the fields as they are, those added since included, in the
+  `autoFilter` element. Removing the filter forgets them. 16 live cases
+  and 7 saves agree, `tests/fixtures/autofilter_sort.json`. These report
+  themselves unsupported:
+  - the Sort of a table's AutoFilter
+  - `Apply` on a filter with criteria
+  - reading the sort a file keeps with its AutoFilter
+
+- Twelve `Parent` and `Application` members answer as Excel's do.
+  `Areas.Parent` is the range of every area, `Filters.Parent` the
+  AutoFilter and `WorksheetFunction.Parent` the application, and Areas,
+  Filters, AutoFilter, WorksheetFunction, ListObjects, ListColumns,
+  ListRows and ListColumn gain `Application`. `ListColumn.Total` is the
+  column's cell in the totals row, and Nothing while the table shows
+  none. 16 live reads agree, `tests/fixtures/object_parents.json`.
+
+- `PageSetup.PrintNotes` works as Excel's does. It reads True when
+  comments print at the end or as shown. A set of True prints them at
+  the end, and False not at all. 14 live cases agree,
+  `tests/fixtures/print_notes.json`.
+
+- A sheet's sort fields answer as Excel's do. `SortField.Priority` reads
+  a field's place and moves it on a set. `Delete` takes a field out and
+  leaves it dead, and `ModifyKey` gives it a new key and keeps the rest.
+  `CustomOrder` reads back text given as its items joined by commas, and
+  a set takes text, a list's number or 0 for none. `SubField` keeps its
+  text, and on plain values that field then orders nothing. `Parent` is
+  the sheet's one `SortFields`, and `SortFields(0)` is error 1004. A save
+  writes the moved, deleted or changed fields to the `sortState` as Excel
+  does. 50 live cases agree, `tests/fixtures/sort_fields.json`. These
+  report themselves unsupported:
+  - saving a field with a `SubField`
+  - reading the `CustomOrder` of a field loaded from a file
+  - `Priority`, `Delete`, `ModifyKey`, `CustomOrder` and `SubField` sets
+    on a table's sort fields
+
+- `Workbook.Colors` and `Workbook.ResetColors` work as Excel's do. Colors
+  reads the 56-colour palette or one slot and sets either. Cells, fonts
+  and borders coloured by a slot follow it, and tabs keep Excel's own
+  colour. A save writes a changed palette to `styles.xml` as Excel does,
+  and leaves out Excel's own. 48 live cases agree,
+  `tests/fixtures/workbook_colors.json`. These report themselves
+  unsupported:
+  - an array of fewer than 56 colours, which crashed Excel once
+  - Null
+  - `ColorIndex` of a colour a changed palette does not hold
+
+- `Workbook.DeleteNumberFormat` works as Excel's does. Every cell, row,
+  column and cell style using the custom format shows General and keeps
+  the rest of its format. A built-in format, `""` or a protected sheet
+  is error 1004, and a format the workbook does not hold is passed over.
+  17 live cases agree, `tests/fixtures/delete_number_format.json`.
+
+- Workbook settings answer as Excel's do:
+  - `DefaultTableStyle` and `DefaultPivotTableStyle` read and set as
+    `TableStyle` objects and save to `styles.xml`. `ListObjects.Add`
+    takes the default table style.
+  - `ShowPivotTableFieldList`, `ShowPivotChartActiveFields` and
+    `InactiveListBorderVisible` read and set, and save to `workbookPr`.
+  - `DefaultSlicerStyle`, `DefaultTimelineStyle`, `CreateBackup`,
+    `HasPassword`, `CaseSensitive`, `UseWholeCellCriteria`,
+    `UseWildcards`, `Final`, `UpdateRemoteReferences`,
+    `ChartDataPointTrack` and `AccuracyVersion` read as Excel's, and
+    refuse what Excel refuses.
+  - `TableStyles(name)` finds a built-in style.
+  64 live cases agree, `tests/fixtures/workbook_settings.json`. Setting
+  a value Excel takes but saves outside the parts measured reports itself
+  unsupported.
+
+- 31 more Application switches read and set as Excel's do, among them
+  `AutoPercentEntry`, `ExtendList`, `EnableSound`, `DisplayPasteOptions`,
+  `DisplayFormulaAutoComplete`, `FlashFill`, `GenerateGetPivotData` and
+  `ShowToolTips`. `ConstrainNumeric` and `FlashFillMode` stay False
+  whatever is set, as in Excel. All 31 follow the live answers in
+  `tests/fixtures/application_settings.json`.
+
+- `Range.ApplyNames` turns the references in a range's formulas, or the
+  whole sheet's when the range is one cell, into the names that refer to
+  the same cells, as Excel does, with `Names:=` and
+  `IgnoreRelativeAbsolute:=` and Excel's two errors.
+
+- A defined name's `MacroType`, `ShortcutKey`, `Category` and
+  `CategoryLocal`, set on `Name` or given to `Names.Add`, as Excel keeps
+  them and saves them in a macro-enabled workbook; Excel leaves such names
+  out of an `.xlsx`. `WorkbookParameter` and `ValidWorkbookParameter`
+  answer as Excel does.
+
+- Twenty-four `Workbook` properties about the file and its sharing,
+  `IsAddin`, `KeepChangeHistory` and `CompatibilityVersion` among them,
+  read as Excel's do; those Excel lets a macro set are kept for the
+  session, and those it refuses give its error 1004.
+
+- `Range.Consolidate` combines source ranges by position or by their row
+  and column labels with any of its eleven functions, as Excel does, and
+  `Worksheet.ConsolidationFunction`, `ConsolidationOptions` and
+  `ConsolidationSources` read back the last one.
+
+- `Range.ID`, `Range.AllowEdit` and `Range.ListHeaderRows` answer as
+  Excel does; ListHeaderRows makes Excel's guess at a list's header rows.
+
+- `Workbook.PrecisionAsDisplayed` keeps every number as its format shows
+  it, as Excel does: turning it on rounds the workbook's numbers, and
+  numbers written, formats given and formula results round from then on.
+  It is saved and read as `calcPr fullPrecision="0"`.
+
+- `Worksheet.CustomProperties` adds, reads, changes and deletes a sheet's
+  custom properties as Excel does, and saves them as Excel's own parts.
+  A workbook read from a file brings its sheets' properties with it.
+
+- `Range.Errors` answers Excel's error checks for a cell, a number
+  stored as text, a two-digit text year, an error result, an inconsistent
+  formula, omitted or empty cells and an unlocked formula among them, as
+  Excel does. `Ignore` is kept until the cell changes and saved as
+  Excel saves it.
+
+- `Application.ErrorCheckingOptions` reads the error-checking settings a
+  new Excel session has, and keeps what a macro sets for the session.
+
+- Gradient fills work as Excel's do: `Interior.Pattern` takes
+  `xlPatternLinearGradient` and `xlPatternRectangularGradient`, and
+  `Interior.Gradient` reads and sets the degree, the rectangle and the
+  colour stops. A save writes the fill as Excel writes it.
+
+- `Range.AutoOutline` groups the rows and columns that formulas sum, at
+  one level, as Excel groups them, and sets the summary side it finds.
+  Summaries of summaries, which Excel nests, report themselves
+  unsupported.
+
+- `Worksheet.Scenarios` adds, shows, changes and deletes what-if
+  scenarios as Excel does, with its comments and errors, and saves and
+  reads them in the sheet part.
+- `Shapes.AddPicture` and `AddPicture2` of a PNG kept in the workbook, with its natural size from the file's density, and a new picture's `PictureFormat` reads, replayed from live Excel. It reads a file, so it needs `sandbox=False`. A linked picture, other image types and a picture's fill and line report themselves.
+- `Protection.AllowEditRanges`: ranges a protected sheet still lets a macro write to, with titles, passwords, `Unprotect`,
+  `ChangePassword`, `Delete` and `Users` for Everyone. A range follows its cells, a sheet's copy has its ranges, and a save
+  writes them as Excel does, over 85 live cases.
+- Raise the events a macro could not hear before, in Excel's order among the events around them: BeforeDelete, NewChart, NewWorkbook, WindowActivate, WindowDeactivate, WindowResize, BeforePrint and FollowHyperlink, in document modules and WithEvents sinks, over 70 live rows.
+- Add PrintOut on Worksheet, Workbook, Range and Window, Hyperlink.Follow for links inside the workbook, Window.Close, Window.Left and Window.Top. A workbook closing now raises WindowDeactivate, Deactivate, then Activate and WindowActivate for the window behind; a sheet delete raises Deactivate and Activate as Excel does.
+- Add Window.ActivePane, EnableResize, DisplayDataTypeIcons and ScrollWorkbookTabs, the Pane of a window with no split, and Windows' side-by-side members, over 19 live rows. The active pane of a split window reports itself.
+- Add Application.ExecuteExcel4Macro for reading a cell in R1C1, of an open or a closed workbook, and working out an expression, over 42 live rows. Excel 4 functions such as GET.CELL report themselves. Application.Build answers the measured build instead of 0.
+- Add Application's read-only option objects and values a macro meets with no screen: AutoRecover, MultiThreadedCalculation, SpellingOptions, AutoCorrect, DefaultWebOptions, DefaultPivotTableLayoutOptions, FileValidation, FormulaBarHeight and others, over 65 live rows. Setting an option reports itself, as it would change a user's profile.
+- Add Pane's Activate, ScrollRow, ScrollColumn and SmallScroll for a window with no split, Panes' item rules, Application.AddIns, COMAddIns, RecentFiles, UsedObjects and FileExportConverters holding nothing, OnWindow on Application and Window, RecordMacro, RegisterXLL for a file that is not there, GetPhonetic, and DDE calls on a channel that is not open, over 53 live rows. A real XLL reports itself and is never loaded.
+- Add Application.OnTime: a procedure runs once no macro is running or at DoEvents, not at Wait, the last scheduled first, with LatestTime and Schedule:=False as Excel takes them, over 36 live rows. `ExcelApplication.run_on_time` runs what a later time has made due.
+- A chart element's `Format` has `Glow`, `Shadow` and `SoftEdge`, which can be set one at a time and are saved, on series, points, axes, titles, areas, trendlines and error bars. `ThreeD`, `PictureFormat`, `TextFrame2`, `Adjustments` and `AutoShapeType` read as Excel does with nothing set; setting a bevel is reported as unsupported.
+- `TickLabels.Format` and `Delete`. `ChartGroup.CategoryCollection` and `FullCategoryCollection`, with `ChartCategory`. `Chart.DataTable`.
+- `Series.Shadow` can be set and is saved, and `LegendKey.Shadow` follows it. `Series.LeaderLines`. `Characters` on chart and axis titles. `LegendEntry.Format`.
+- Picture settings on series and points, and members only newer chart kinds have, raise Excel's errors.
+- `HasDataTable` reads False on pie, doughnut and scatter charts, though the file keeps the table.
+- A chart group's drop lines, high-low lines, up and down bars and series lines have `Border`, `Format` and `Select`, with their look saved. `DownBars.Border` and `DownBars.Delete` raise as Excel does.
+- `ChartGroup` keeps `BubbleScale`, `SizeRepresents`, `ShowNegativeBubbles`, `SecondPlotSize`, `SplitType`, `SplitValue` and `Has3DShading`; `HasRadarAxisLabels` and `RadarAxisLabels` raise off a radar chart.
+- `LegendKey` has its series' marker members, `ClearFormats` and `Application`. `ErrorBars.ClearFormats`. `LegendEntries` and `ChartGroups` have `Parent` and `Application`.
+- `GetProperty` and `SetProperty` on chart elements raise what Excel raises; a series answers `Name`.
+- A foreground colour on a series with no marker no longer turns the marker on.
+- `Chart.PageSetup` on a chart on a sheet, its own and not the sheet's, saved in the chart's print settings.
+- `Chart.ProtectData`, `ProtectFormatting` and `ProtectSelection` can be set and are saved. `Chart.Protect` and `Unprotect` raise 1004 on a chart on a sheet, as Excel does. `ProtectGoalSeek` takes True and answers False.
+- `QueryTable.WorkbookConnection` and `Workbook.Connections` answer for query tables over text files, with `TextConnection`, `WorkbookConnection.Refresh`, `Name`, `Description`, `RefreshWithRefreshAll` and `Delete`, and saving what they change. `Workbook.RefreshAll` refreshes those tables.
+- Deleting a query table while an open workbook has another of its name costs a file the second newest of them, as Excel does every time.
+- A copied sheet's name goes on from a number in brackets its name ends in: a copy of `Sheet1 (2)` is `Sheet1 (3)`, not `Sheet1 (2) (2)`.
+- `Connections.Add2` and `WorkbookConnection.Delete`, kept for the session, with the rest of an OLE DB connection's
+  settings; `Scenarios.CreateSummary` for one changing and one result cell; `Workbooks.CheckOut`, `OpenXML` and
+  `OpenDatabase` on a file that is not there; over 83 live cases.
+- `FillFormat.TwoColorGradient`, `OneColorGradient`, `PresetGradient`, `GradientAngle`, `RotateWithObject` and what they read, with `GradientStops` and `GradientStop`, on a new AutoShape and text box, replayed from 271 live cases with the spPr Excel saves. A gradient's colour type, style and variant follow from its stops and angle, as Excel's do.
+- `FillFormat.Patterned` and `Pattern`, with a pattern's fore and back colours, its transparency, and hiding and showing it, on a new AutoShape and text box, replayed from 28 live cases with the spPr Excel saves.
+- `Shapes.AddPicture` of JPEG and GIF files, with their natural size from the file, and `PictureFormat`'s `Brightness`, `Contrast`, their increments, `ColorType`, `TransparentBackground` and `TransparencyColor`, replayed from live Excel. A BMP, which Excel converts, and setting a crop report themselves.
+- `Worksheet.QueryTables` and `QueryTable` over local text files: `Add`, `Refresh`, `Destination`, `ResultRange`, `Delete`, the parsing and layout settings, the three refresh styles, saving, reading a saved table back, and copying a sheet with its tables. Refreshing goes behind the sandbox.
+- Other sources, a file with bytes past ASCII, `PostText`, `TextFilePromptOnRefresh = True` and a URL `Connection` are refused. A table the model could not write back as the file has it stays refused, with its parts saved as they came.
+- A refresh leaves column widths alone, where Excel's `AdjustColumnWidth` changes them: those differ from Excel. Formats in a refresh's way also differ.
+- `Range.QueryTable` finds the table whose result holds the cell. A field holding a comma stays text when the import's separators are neither comma.
+- `FILTERXML` and `WorksheetFunction.FilterXML`, on an XPath 1.0 engine: axes, unions, predicates and the core functions, reading what it selects as typing it into a cell would. A document with a DOCTYPE fails, as in Excel.
+- `PHONETIC`, #N/A for a cell a macro wrote. The model keeps no furigana from a file.
+- `Range.SoundNote`, `XPath`, `CellControl`, `ResetContents`, `RemoveControls` and `TogglePythonMarshalMode`, and the members that answer 1004 on a cell with no linked data or writeback: `AllocateChanges`, `DiscardChanges`, `DataTypeToText`, `RefreshLinkedDataType`, `SetCellDataTypeFromCell`, `EditionOptions`.
+- `DataTable.Border` and `DataTable.Format` on a chart's data table, read and saved as Excel does, with `Glow`, `Shadow` and `SoftEdge`.
+- `Shape.Adjustments` for every AutoShape type, `Shapes.AddConnector` and `Shape.ConnectorFormat`, replayed from live Excel.
+- `Shapes.AddShape` now saves every AutoShape type Excel takes. It used to save any type past 20 (other than the 5-point star) as a plain rectangle, with the wrong default name, and it took numbers Excel refuses with 1004. Callouts read `Type` 2, the 24 presets whose text starts in tx1 save it so, and a default name now follows `AutoShapeType`.
+- `Shapes.BuildFreeform` with `FreeformBuilder.AddNodes` and `ConvertToShape`, and `Shapes.AddCallout`, replayed from live Excel. `Fill` and `Line` of a freeform can now be read. A curve with `msoEditingAuto` reports itself, because Excel smooths it by a rule not measured.
+- `Shape.Callout` read from and written to a callout's adjustments, replayed from live Excel. `AddShape` now turns the callout types Excel treats as another into that one.
+- `TextFrame2.Column`, its `Number` and `Spacing`, replayed from live Excel.
+- `Shape.SetShapesDefaultProperties`: later AutoShapes in the workbook take the shape's fill, line and effects, and a save writes them to the theme, replayed from live Excel. Text settings carried by it report themselves.
+- `TextFrame.Characters.Font` on all of a shape's text, replayed from live Excel. Some of the characters, and font names beyond those measured, report themselves.
+- `TextFrame2.TextRange.Font` on all of a shape's text, with its underline, strike, caps, spacing, kerning and baseline, replayed from live Excel. Its `Fill`, `Line` and effects report themselves.
+- `LineFormat` arrowheads (`BeginArrowheadStyle`, `Width`, `Length` and the `End` set), `BackColor`, `Pattern` and `InsetPen`, and `ColorFormat` `Brightness`, `TintAndShade`, `SchemeColor` and a settable `ObjectThemeColor`, on a new AutoShape, text box and line, replayed from 277 live cases with the spPr Excel saves. `RGB` now computes shade, tint, lumMod and lumOff the way Excel does: shade and tint in linear light, lumMod and lumOff on HSL lightness, rounding only at the end. A `ShapeRange` refuses these members for now, and `SchemeColor` reports itself for a colour with no exact palette match.
+- `Shape.PickUp` and `Apply` between AutoShapes, through a `ShapeRange` too, and a freeform's `Nodes` and `Vertices`, replayed from live Excel. Other kinds of shape report themselves.
+- A `ShapeRange`'s `Shadow`, `Glow`, `SoftEdge` and `Reflection`, replayed from live Excel, including how each reads when its shapes differ. A preset `Shadow.Type` still reports itself.
+- A `ShapeRange` now takes the line arrowheads, patterns, `InsetPen`, fill patterns and gradients, theme colours, brightness and tint, `Adjustments` and `ConnectorFormat`, reading what its shapes share or the mixed value, replayed from 49 live cases. `TwoColorGradient` also reaches a line in the range, as in Excel, though the line goes on reading as having no fill.
+- A collection's hidden `_NewEnum`, and `_Default` on page breaks, sort fields, sparkline groups, icon sets, trendlines
+  and errors, as on a typed variable. `Application` and `Parent` where they were missing, `ListObject.Publish` and
+  `ExportToVisio`, `Trendline.GetProperty` and `SetProperty`, `DisplayDataTypeIcons` and `PhoneticCharacters`.
+- `Series.Formula` can be set, with plain references or a quoted name. `Series.Interior`, `Point.Interior` and `TextRange2.Length`.
+- `CellFormat.NumberFormatLocal`, `Characters.PhoneticCharacters`, `DisplayFormat.Characters`, `HeaderFooter.Picture`, `ListColumn.XPath` and `WorksheetView.DisplayDataTypeIcons`, as live Excel answers them on cells and sections with no phonetic text, picture or XML mapping.
+- `TableStyle.TableStyleElements` on the built-in table styles: each element's format, font, fill and borders.
+- `Workbook.Theme`, with its colours, which a macro can change and a save keeps, and its fonts; `CustomXMLParts`;
+  `ChangeFileAccess`; `Scenarios.Merge`; `Workbook.PivotTables`, `WebOptions`, `UserStatus`, `Model` and
+  `Signatures`; `Sheets.HPageBreaks` and `VPageBreaks`; `PageSetup.Pages` and the header and footer pictures; and
+  the shared-workbook, review and server members, which fail as Excel's do on a workbook that uses none of them,
+  over 222 live cases.
+- `Workbook.UpdateLink`, `ChangeLink`, `OpenLinks` and `SetLinkOnData`, measured over 102 live cases with what a save
+  writes of the links. `ChangeLink` to a file that is not there leaves `#REF!`, to a workbook without the sheets read
+  takes its first sheet, and numbers the links by name. While a linked workbook is open, formulas name it by its file
+  alone and read its cells as they stand; when it closes they keep what it last held.
+- `r = wb.Close(False)` answers True.
+
+### Fixed
+
+- `Range.End` and `SpecialCells(xlCellTypeLastCell)` see only visible lines, so a hidden or filtered last row is passed
+  over. `End(xlUp)` coming across a gap stops at a table's last row even when that row is empty, as after
+  `ListRows.Add`. `SpecialCells` on a protected sheet is error 1004.
+- `For Each` over something that cannot be walked is error 13, and over `Nothing` or a Range that has gone error 424,
+  raised at the header, so that under `On Error Resume Next` the body runs once and `Next` raises 92. `Exit For` from
+  such a loop raises 92 too.
+- Copy and Cut end on the members that end them in Excel, a list that follows no rule and stands in
+  `_clipboard_ends.py` as measured: `Font.Bold` ends them and `Font.Color` does not, `Calculate` ends them and
+  `CalculateFull` does not, and so on through 140 edits (`tests/fixtures/excel_everyday_7.json` and `_8.json`).
+  `Application.CutCopyMode` set to anything ends them. A `Range.Copy` to a destination ends what was on the clipboard.
+- `Worksheet.Paste` into the selection grows it to what it pasted, and where it already held that keeps its active
+  cell. `Range.PasteSpecial` selects what it pasted, wherever that was.
+- `Range.AutoFill` leaves the selection where it was.
+- `Range.ClearOutline` on cells: one cell clears every outline on the sheet, and a block the lines it crosses.
+- `Range.Delete` ends Copy and Cut, whatever it deletes. A `Font`, `Interior`, `Borders` or `Comment` taken from a range
+  goes when its cells go, a `Comment` follows its cell, and Ranges go when their workbook closes.
+- `Columns("8:9")` is error 1004. Copying several whole columns no longer says the destination is too large. A copied
+  range that turns over is respelled top-left first, so `=SUM($D$3:D4)` copied up three rows is `=SUM($D1:D$3)`.
+- A Range now follows its cells however it is held, by a variable, a `With` block, an argument or a collection, through
+  rows and columns inserted or deleted, cells shifted and `Cut`, and raises 424 once they have gone. It used to stay at
+  its old address. `For Each` over a range counts through it as it stands at each step, as Excel does, so deleting rows
+  in the loop skips some, and inserting one above the current cell can go on for ever.
+- `AdvancedFilter` with no criteria uses the ones last given on the sheet.
+- `Range.Cut` through a table. A block holding a whole table now takes the table along, to another sheet too, where it
+  used to leave the table behind. Cells cut out of a table keep the look its style gave them, the header row names its
+  columns afresh, and cells landing beside a table make it grow.
+- `Worksheets("Nope")` says "Subscript out of range" as Excel does.
+- An Error value assigned to a `String` variable, or passed to `Len`, `Format` or a
+  function's String argument, raises 13 as in VBA. `CStr` still spells it. `IndentLevel`
+  above 0 turns off a cell's `Orientation`, and `Orientation` on an indented cell changes
+  nothing, as in Excel.
+- `Chart.ChartTitle` raises as Excel does on a chart with nothing to name it: no series, or
+  one series with no name. It used to give such a chart a title. The value axis of a chart
+  whose series hold nothing no longer writes a number format.
+- Hiding every cell of a series now takes it out of `SeriesCollection` and
+  `FullSeriesCollection` until it is shown again, instead of being refused. It
+  stays in the saved file with no cached points. Hiding all of a chart's
+  categories leaves its series without them. A point's look and label stay with
+  their cell: hidden, they wait, and the file numbers the rest among the cells
+  shown. `NewSeries` and setting `PlotOrder` beside such a series stay refused.
+- Taking away the cells a chart reads now does what Excel does instead of being
+  refused. A reference becomes `#REF!`. A series whose values go keeps one point
+  and loses its own look, its points' looks and its labels, and `Formula` raises
+  error 2023. A name lost from every series leaves them named `Series1` and so
+  on, while one lost from only some reads `#REF!`. The saved chart part matches
+  Excel's in 127 measured cases. Still refused: cells an error bar reads, cells
+  a chart from a file reads, and deleting a sheet a chart reads.
+- `Series.Values` reads a text cell as 0, as Excel does, and `LegendEntries`
+  counts a chart's trendlines.
+- A chart read from a file now follows the cells it reads, as a new chart does:
+  rows and columns inserted or deleted, cells shifted or cut, and its sheet
+  renamed. Only the references and cached points in its part change. A sheet
+  whose drawing holds only charts can now be renamed once it has been saved or
+  read from a file. Its cached points also leave hidden cells out. Moving cells
+  between the points of a chart from a file that sets a point's look or label
+  is refused.
+- A chart leaves out hidden and filtered cells while `PlotVisibleOnly` is on, in what its series read
+  and in what it saves. A series or its categories wholly hidden, and a point's look or label on a
+  series with hidden cells, are refused.
+- `Series.XValues` on a scatter chart with text categories reads their places, as Excel does.
+- A chart's series, title links and custom error bars follow the cells they read when rows and
+  columns are inserted or deleted, cells shift or are cut, and the sheet is renamed, as a point's
+  look and label do. Before, they stayed put and the saved file read the wrong cells. Taking away
+  cells a chart reads is refused before anything moves, and so is moving cells a chart read from a
+  file reads.
+- `StrConv(text, vbFromUnicode)` is a String, as in Excel, not a Byte array. A String
+  can now hold an odd count of bytes, so `LenB`, `MidB`, `LeftB`, `RightB`, `AscB`,
+  `InStrB` and `&` count the last byte. `ChrB` exists. `StrConv(x, vbUnicode)` reads a
+  String's own bytes. `AscB` answers a Byte, `VarType` a Long, and `LenB` of a
+  fixed-length string an Integer.
+- A saved line takes the style Excel gives a line. It was written with an
+  AutoShape's style: a dark outline, a fill reference and light text.
+
+- Shape.Duplicate gives the copy its own text layout, so changing the
+  copy's margins no longer changes the original's.
+
+- Queries.Add refuses a name a query already has with -2147024809, and
+  Queries by a number out of range raises -2147352565, as Excel does.
+  Before, the model added a second query of the same name and raised 9.
+  Measured in `tests/fixtures/unassessed_members.json`, which also covers
+  a table's Slicers, PivotItemList.Parent, Workbooks.Count and the query
+  members.
+
+- The model no longer knows TimeSlicerStyleOther1 and TimeSlicerStyleOther2,
+  which Excel does not have, so DefaultTimelineStyle refuses them with
+  error 450 as Excel does.
+
+- Calling an object variable set to Nothing with arguments, as `o(1)`,
+  raises error 91, as VBA does, not 9.
+
+- The Excel checklist now lists ErrorBars, Trendlines, Trendline,
+  CommentThreaded, CommentsThreaded, Author, CalculatedItems and
+  TableStyle, which the model implements, and checks the chart classes
+  against what they register.
+
+- Assigning to a property the model only reads no longer raises a
+  trappable error 438 when Excel lets a macro set that property. It
+  reports the setter as not implemented, so `On Error` cannot hide the
+  gap. A property the type library marks read-only still raises 438. The
+  object inventory now records which properties each class lets a macro
+  set. Excel classes outside the main model now look their members up in
+  Excel's type library too.
+
+- Shape.Chart on a shape with no chart raises -2147024809, as Excel does,
+  not 1004. TextFrame.AutoSize reads the Boolean False, not 0.
+
+- WorksheetFunction members the type library types As String, such as
+  Bin2Dec, Hex2Dec and ImAbs, hand a number back as its text, as Excel
+  does. Application still hands back the number.
+
+- Calling a worksheet function with too few or too many arguments raises
+  error 1004 through Application as well, as Excel does. It gave #VALUE!.
+
+- RandArray(1, 1) is a one-item array, as Excel gives it, not a number.
+
+- XIRR, XNPV, NETWORKDAYS and WORKDAY read a date given as text in an
+  array, as Excel's cells do, so a VBA array of Dates works there. They
+  gave #VALUE! or ignored the holidays.
+
+- A series NewSeries made, with no values yet, is saved with no values
+  element, as Excel saves it. It was written with an empty list of
+  values.
+
+- SetSourceData with no PlotBy plots by rows unless what the block's
+  labels leave is taller than wide, as Excel does. It went by the whole
+  block, so three label columns and one column of numbers made three
+  series where Excel makes one. ChartObjects.Add counts the series it
+  plots from the selection the same way, so later unique ids are numbered
+  as Excel numbers them. A current region loses rows and columns that are
+  blank right across, which a selected block keeps. Measured in
+  `tests/fixtures/chart_add_plotted.json`.
+
+- SetSourceData reads a block's labels as Excel does. Several label
+  columns make categories of several levels, written as Excel writes
+  them, and several header rows make a name of several cells; by rows
+  the two swap. A blank top left corner sets how many rows and columns
+  label the rest. Otherwise the labels run to the last text or date in
+  the bottom row, and the names to the last in the right column. Before,
+  only one first row or column of text labelled, so a second text column
+  became a series. Series.Name reads a name's cells with a space between,
+  and XValues reads each point's levels the same way. Categories with
+  text among them read every cell as it shows, a blank as "". Numbers
+  with a blank among them raise the error Excel raises. A cell of text in
+  a series' values is cached as 0, where saving raised a type mismatch.
+  Measured in `tests/fixtures/chart_multilevel_categories.json`.
+
+- Comments and form controls are named by their place in the sheet's VML
+  ids, as Excel names them: a button after "Comment 1" is "Button 2".
+  Rectangles, charts and other drawing shapes keep a count of their own,
+  so a chart after a comment is "Chart 1" and a rectangle after a button
+  is "Rectangle 1" with id 2. A comment's box answers `ID` too. Measured
+  in `tests/fixtures/comment_shape_names.json`.
+
+- A member name in brackets after a dot, such as `ws.[_CodeName]`, is
+  read as VBA reads it. It was a compile error.
+
+- Pivot table, pivot cache and chart parts close an empty element with
+  `/>`, as Excel writes it. They were written with ` />`.
+
+- A pivot filter on a field with no other filter is saved ahead of the
+  table's other filters, as Excel saves it. It was saved after them.
+
+- `SetSourceData` takes a first column or row of dates as the chart's
+  categories, as Excel does, and the category axis shows them in their
+  cells' format. It made them a series.
+
+- `Shape.Placement` reads the anchor's `editAs`, and a loaded shape
+  keeps its `editAs` and `fPrintsWithSheet` when changed and saved. It
+  always answered xlMoveAndSize.
+
+- A new rectangle keeps the left-aligned paragraph Excel gives it after
+  its text is set. It was dropped.
+
+- A new text box is saved with the fill, line, style and `vert="horz"`
+  Excel gives one. They were left out.
+
+- `GroupItems` on a shape that is no group raises 1004, as Excel does.
+  It raised -2147024809.
+
+- `Shapes.Range(Array("A", "B"))` takes each name in the array, instead
+  of raising 13.
+
+- A Range given to `Series.Values`, `Series.XValues` or
+  `Axis.CategoryNames` by Let links the series to its cells, as in
+  Excel, instead of copying their values in. Properties can now take an
+  object by Let, through `setter(name, objects=True)`.
+
+- `SeriesCollection(n)` for a series the chart does not have raises
+  1004, as Excel does, instead of 9.
+
+- A save's new Default content types go in alphabetical order, as Excel
+  keeps them, which puts `vml` before `xml` for notes.
+
+- Charts made through `ChartObjects.Add` are saved with the chart part
+  Excel writes for them, which carries no formatting of its own, in
+  place of the styled `Shapes.AddChart2` template. `PlotBy` is worked
+  out from the series, `ChartTitle` gives a chart without a title its
+  automatic one instead of raising 1004, and an empty line chart reads
+  as one with markers. 50 live cases agree,
+  `tests/fixtures/chart_markup.json`.
+
+- A new shape carries the creation id Excel gives every drawing object,
+  and an AutoShape's empty paragraph is left-aligned, as Excel writes
+  them.
+
+- A workbook with `RemovePersonalInformation` on is saved with no
+  author, last author, manager or company, as Excel saves it.
+
+- A module whose procedures carry attribute lines, as an exported module
+  or `MacroOptions` leaves them, now runs: the lines are metadata VBA
+  never runs, instead of an unsupported statement.
+
+- `CodeModule.InsertLines` and `AddFromString` leave a blank line after
+  text that goes on with ` _` at the end of a module, as Excel's VBE
+  does. 16 live cases agree, `tests/fixtures/vbe_continuation.json`.
+
+- `VBComponent.Export` writes each procedure's attribute lines with it,
+  and `VBComponents.Import` keeps them with their procedures, out of
+  `CodeModule`'s lines, as Excel's VBE does.
+  `tests/fixtures/vbe_import_attributes.json`.
+
+- `AutoFilter.ShowAllData` on a sheet filter with no criteria does
+  nothing, as Excel's does, instead of raising error 1004.
+  `Worksheet.ShowAllData` still raises it there, as Excel's does.
+
+- A save leaves `PrintComments`, `PrintErrors` and `Order` out of the
+  `pageSetup` when a macro set them back to their defaults, as Excel
+  does, instead of writing `cellComments="none"` and the like.
+
+- `Names("Sheet1!Local")` finds the sheet's own name in a workbook
+  `Workbooks.Add(xlWBATWorksheet)` made, which Excel names Sheet1 after
+  its sheet, instead of raising error 1004.
+
+- The checklist's `Range.Sort` row was split by undoubled quotes. A test
+  now checks that every row has its eight fields.
+
+- A defined name that shares its word with a worksheet function, such as
+  `Rate`, keeps its own spelling in a formula written with it, as Excel
+  spells it, instead of being upper-cased.
+
+- `Range.Locked = Null` is taken without an error and changes nothing, as
+  in Excel, instead of raising "Invalid use of Null".
+- A save no longer leaves a file Excel refuses. A workbook Excel saved holds `xl/calcChain.xml`, and the model carried that part through every save unchanged. After a value or `ClearContents` over a formula, `Rows.Insert`, `Rows.Delete`, `Columns.Insert`, `Columns.Delete`, `Range.Insert`, `Range.Delete`, `Cut`, `Copy` over a formula, `Sort`, `Merge`, or deleting a sheet with formulas, the chain named a cell with no formula, and `Workbooks.Open` failed with error 1004. The chain now stays byte for byte while every entry can still be opened, and is dropped with its Override and Relationship when one cannot. Excel builds its own as it opens the file, and reads the same values. A dropped chain does not match Excel's bytes: Excel writes a reordered chain after the same edit, and matching it is a later measuring job. (`_calc_chain.py`, `scripts/measure_calc_chain.py`)
+- `ChartGroup`'s histogram bin members raise Excel's errors on the chart types the model draws. Data labels' `Format` reads `Glow`, `Shadow`, `SoftEdge`, `ThreeD`, `PictureFormat`, `TextFrame2`, `Adjustments` and `AutoShapeType`.
+- A saved file now holds the current value of a formula on a sheet nobody wrote to. A formula reading another sheet, a defined name, a table or a hidden row kept its old value in the file, though the session read the new one, and Excel opening the file read the old one too. Each changed cell's `t`, `<v>` and, in manual calculation, `ca="1"` are written, and the rest of the part keeps its bytes. `fullCalcOnLoad` is not used, as Excel's own files do not use it. (`_io._write_cached_values`, `scripts/measure_saved_values.py`)
+- Keep a hidden sheet hidden: Worksheet.Visible was neither read from a file nor saved to one, so a hidden or very hidden sheet came back visible. EnableSelection is now kept too, on a protected sheet or not.
+- `Application.StatusBar = ""` gives the bar back to Excel and reads False, where it read empty text. Semi-automatic Calculation and DisplayDrawingObjects read as Excel's Doubles, and ConflictResolution refuses 3, each measured typed and late bound.
+- Deleting a sheet other formulas read no longer stops a macro or leaves wrong answers. `=Gone!A1*2` became `=#REF!A1*2` as in Excel, but the model could not read that formula back, so reading the cell or saving ended the macro. It now reads as the error, and a file holds `#REF!*2`, as Excel writes it. A span of sheets shrinks to the sheets left (`First:Last!A1` to `First:Middle!A1`), where before it read `#REF!` and reopened as `#NAME?`. A reference to a table on the deleted sheet becomes `#REF!`, and a name of the sheet becomes `[0]!Name`, shown as `=Book.xlsx!Name`. `.Formula = "=#REF!A1"` is error 1004, as in Excel. (`_sheet_groups.gone_references`, `formula/_parse.py`, `formula/_calc/lexer.py`)
+- A macro that opens a workbook saved in manual or semi-automatic calculation and saves it keeps that mode, as Excel does, where the model wrote automatic. Setting Application.Calculation while it is open still decides. calcMode and calcOnSave are left out of the file at their defaults, as Excel leaves them.
+- Assigning to a read-only member that answers an object goes by the object: a Range takes the value, `Application` is error 450, and anything else, `Nothing` included, is 438. `Set` on a read-only member is 438 for an object, 450 for most values, and 13 where a plain assignment is 1004.
+- A collection's `Item` with `Null`, `Nothing`, an array or a date answers Excel's error for that class. `Shapes` and `ChartObjects` round a number as VBA does, so 1.5 of one is past the end. `SeriesCollection`, `Points` and `ChartObjects` take a number in text.
+- `o(99)` on a chart's `Points` is -2147467259, while `sr.Points(99)` stays 1004.
+- `x.Add(1, 2)` or `P(a:=1)` as a bare statement does not compile, as in Excel. Use `Call` or drop the parentheses.
+- `WorksheetFunction.Index` and `Choose` answer the range itself, so `.Address` works on them. Called through a variable `As Object` or a `Variant`, a function is not held to its signature: `Match(Array(1, 2), r, 0)` is an array and `Bin2Dec` a number, where typed they stay error 13 and text.
+- `CONFIDENCE` matches Excel to the last digit.
+- Measure the chart and effect members that had no evidence, over 90 live rows, and fix what differed: DataTable.Select selects the table, where a misread row had it refused; AxisTitle.Name answers on the category axis too; LegendKey.Smooth and InvertIfNegative set their series; asking a FullSeriesCollection or CategoryCollection for `_Default` by name is 438; SoftEdgeFormat.Parent is 438.
+- Application.DDERequest answers #REF!, as Excel does on a channel that is not open. No channel can be open here: DDEInitiate is out of scope.
+- UniqueValues.CalcFor is Excel's 438, read or set, where the model answered 0. Range.XPath refuses more than one cell, and XPath has its default member, Repeating and Clear, over 26 live rows.
+- Application.Path answers a fixed install path, `C:\Program Files\Microsoft Office\root\Office16`, chosen rather than measured, where it answered the current folder; LibraryPath is that path and `\LIBRARY`, as Excel's stands. Code that read Application.Path as the working folder gets a different answer.
+- Remove Workbook.Calculate, which Excel does not have: a macro now gets its error 438. Shape.Select refuses a hidden shape on any sheet. Shapes.SelectAll now selects every shape that shows, charts among them, and refuses when none shows.
+- Hyperlink, validation, column-name and window text past Excel's limits now raises its error, and TextToDisplay reads back 255 characters. Window.TabRatio takes the size of a number. Where late and early binding differ the model follows early until it tracks both, and such rows are PARTIAL.
+- Notes' Text and NoteText, table Add positions, Sort.SetRange and text limits answer as Excel does. Older VERIFIED rows were audited against a written standard, and VERIFIED goes down where they fall short.
+- Font, Interior and Border on cells take every kind of value as Excel does: Null usually changes nothing, True reads as 1 or -1 by property, text gives 1004, 5 or 13 by property, and Font.ThemeFont can be set. A mixed border edge answers its first cell along a top or left edge and its last along a bottom or right one.
+- A Range's alignment and protection take every kind of value as Excel does: Null changes nothing, True is 1, text that is no number is 1004, a code from a list refuses even text of a number, and a count or angle drops a fraction.
+- A collection's `Item` raises Excel's error for each kind of index on the collections measured: past either end, a fraction, text, a name it lacks, Empty, Null, True, an object or no argument.
+- Application and Worksheet settings answer bad values as Excel does. Null is error 94 and text that is no value 13, where they used to change nothing without an error. Values Excel refuses raise 1004 or 5: Cursor, FixedDecimalPlaces, ConstrainNumeric, GenerateTableRefs, ODBCTimeout, LargeOperationCellThousandCount, ScrollArea, EnableSelection, Visible and StandardWidth. A macro that relied on these being ignored without an `On Error` now stops, as it does in Excel.
+- `Application.Goto` outside a sheet's ScrollArea is error 1004, and selects nothing.
+- `Application.PrintCommunication = True` fails with error 1004 when a held PageSetup setting is refused. A header that is too long and text given to Orientation fail as they are set.
+- `Range.OutlineLevel` over rows or columns that differ answers the first's level, where it reported itself as not implemented. `Range.FormulaArray` over an array and cells past it reads Null.
+- More of Range's settable properties answer each kind of value as Excel does: Name, FormulaArray, NumberFormatLocal, MergeCells, Hidden, UseStandardHeight, UseStandardWidth, Formula2, FormulaR1C1, OutlineLevel and PageBreak.
+- Range.Value, Value2 and Formula = Null clear the cell, where a Null stored there broke reads and SaveAs. Numbers are saved as Excel spells them; a huge one in plain digits made Excel refuse the file. NumberFormat, Style, ColumnWidth and RowHeight take every kind of value as Excel does.
+- Assigning to a member Excel holds read-only now raises Excel's error, measured member by member: usually 450, 1004 or 438 on some, not 438 on all of them. `Set o.Parent = x` follows what Parent answers.
+- Parent and Application answer on objects that lacked them or answered wrongly: a format condition's and a CellFormat's Font, Interior and Borders, a data bar's colours, chart borders, GroupShapes, what an embedded chart holds, IconSet, ColorStop, LegendKey, Workbook.Windows and sparkline colours and axes. Creator is error 438 on the types Excel leaves it off, such as Protection and the conditional-format criteria.
+- Checklist: Application, Creator and Parent move to VERIFIED on the classes where every way measured agrees with live Excel.
+- The demo workbooks no longer record the folder they were saved in, nor do the test fixtures. `scripts/strip_fixture_save_paths.py` now covers every tracked workbook, and `tests/test_fixture_paths.py` guards both.
+
+## [6.6.0] - 2026-10-30
+
+### Added
+
+- `ExcelApplication(locale="ja-JP")` runs VBA as it runs under the
+  Japanese (Japan) Regional format (#252). `CStr`, `Format` and its era
+  codes, `FormatCurrency`, `FormatDateTime`, `MonthName` and
+  `WeekdayName` write Japanese dates, names and yen. `CDate`, `IsDate`,
+  `DateValue` and the number conversions read eras, 年月日 and 時分秒,
+  午前 and 午後, the yen sign and full-width digits. Live VBA under each
+  format agrees on 400 cases, `tests/fixtures/vba_locale_live.json`.
+  oleaut32 with LCID 1041 agrees on 4,309 more,
+  `tests/fixtures/vba_locale.json`.
+
+- Under `ExcelApplication(locale="ja-JP")` cells show and read as
+  Japanese Excel's do (#252). Built-in formats show Japanese Excel's
+  own codes, a bare `$` shows `¥`, and day and month names and AM/PM
+  are Japanese. `NumberFormatLocal` and `Application.International`
+  answer as Japanese Excel does. `DOLLAR` writes `¥`, and `VALUE` and
+  `DATEVALUE` read `¥` and year-first dates. 562 live cases agree,
+  `tests/fixtures/excel_locale_live.json`. A `*` fill and a formula
+  reading a month's name report themselves unsupported under ja-JP.
+
+- `Range.Sort` and the `Sort` object order kana, kanji, CJK symbols and
+  full-width forms as Excel does (#252). Kanji go in Japanese order under
+  ja-JP and in Unicode's under en-US. The model builds Windows' sort keys
+  from baked weights, equal to Windows' for 1,500 seeded strings in each
+  locale, `tests/fixtures/sort_keys_cjk.json`. Live Excel's sort of 25
+  such strings agrees under each format. Iteration marks report
+  themselves unsupported.
+
+- Custom lists work as Excel's do: `AddCustomList`, `DeleteCustomList`,
+  `CustomListCount`, `GetCustomListContents` and `GetCustomListNum`.
+  AutoFill steps along a list a macro added, in the case the cell shows.
+  `Range.Sort` takes `OrderCustom` and puts a list's items first, in the
+  list's order. 50 live steps agree, `tests/fixtures/custom_lists.json`.
+
+- `SortFields.Add` takes a `CustomOrder`, a list's items as text or the
+  number of a custom list, and puts those items first, in the list's
+  order. A sort matching case matches the items' case, there and in
+  `Range.Sort`'s `OrderCustom`. A save keeps the order as the
+  condition's `customList`, and opening reads it back. A number past
+  the last list is error 1004. `AddCustomList` of a range leaves its
+  numbers out. 11 live cases and 8 saved files agree,
+  `tests/fixtures/custom_orders.json`; `Range.Sort` still writes no
+  `sortState`.
+
+- Tables answer more of `ListObject` as Excel does. `Comment`,
+  `AlternativeText`, `Summary` and `ShowAutoFilterDropDown` save where
+  Excel saves them and read back. `Active`, `SourceType`,
+  `InsertRowRange`, `DisplayRightToLeft`, `Slicers` and `XmlMap`
+  answer, and `Refresh`, `QueryTable`, `TableObject` and
+  `SharePointURL` raise Excel's error. 33 live cases and 7 saved
+  table parts agree, `tests/fixtures/table_members.json`.
+
+- `Range.ListNames`, `Range.AutoComplete` and `Range.Parse` work as
+  Excel's do. ListNames pastes the visible names beside their formulas
+  as text. AutoComplete finishes a beginning from the text above and
+  below the cell, and gives "" where more than one entry fits. Parse
+  cuts a column at the fields a bracket pattern marks and types each as
+  TextToColumns does. 27 live cases agree,
+  `tests/fixtures/range_text_helpers.json`.
+
+- `Sheets.FillAcrossSheets` copies a range to the same cells of every
+  other sheet of a group, or of the workbook, as Excel does: values and
+  formulas, formats or both. A formula is copied as it is spelled, and
+  a blank cell clears its place. One Change event is raised for each
+  sheet filled, the last first. 15 live cases agree,
+  `tests/fixtures/fill_across_sheets.json`.
+
+- Workbook settings the file keeps work as Excel's do:
+  `DisplayDrawingObjects`, `DisplayInkComments`,
+  `RemovePersonalInformation`, `ReadOnlyRecommended` and
+  `EnableAutoRecover`. Each saves where Excel saves it, in the
+  workbookPr, fileSharing or fileRecoveryPr, and reads back. Setting
+  the first and third leaves the workbook unsaved, as in Excel; the
+  others don't. 12 live cases and 7 saved files agree,
+  `tests/fixtures/workbook_options.json`.
+
+- `FormControl.set_font` gives a UserForm control a font of its own:
+  face, size in points, bold, italic, underline, strikethrough and the
+  Windows character set, 128 for Japanese. Excel reads each font back as
+  set. A control took only the form's font, Tahoma 8.25 pt (#248).
+
+- Window settings everyday macros set work as Excel's do:
+  `DisplayOutline`, `DisplayRuler` and `DisplayWhitespace`, each the
+  active sheet's; `GridlineColor` and `GridlineColorIndex`, a colour
+  taking the nearest palette slot; and `AutoFilterDateGrouping`, the
+  workbook's. A save writes each where Excel does, and opening reads it
+  back. `SmallScroll` moves `ScrollRow` and `ScrollColumn`, kept on the
+  sheet. `WindowNumber` and `Type` answer too. 29 live cases and 7
+  saved files agree, `tests/fixtures/window_settings.json`.
+
+- `Range.DataSeries` fills a series as Edit > Fill > Series does, to the
+  bit. A linear value is first + k * Step in Doubles, with no rounding
+  to 15 digits, and growth is first * Step^k by repeated squaring.
+  Dates count in days, weekdays, months or years, months and years kept
+  on the first cell's day. AutoFill fills as AutoFill does. Stop ends a
+  line, the cells after it keeping what they held. The filled cells take
+  the first cell's format, and one Change event covers them. A Trend
+  over two or more numbers, which Excel fits by least squares, reports
+  itself unsupported. 48 live series agree,
+  `tests/fixtures/data_series.json`.
+
+- Small members everyday macros read answer as Excel's do. `Creator`
+  is xlCreatorCode on every object. `Range.InsertIndent` raises each
+  cell's indent, and is error 1004 for 0 or past 0 to 250.
+  `Workbook.HasVBProject` says whether the project holds code.
+  `CheckCompatibility` is saved in the file. `Name.Index` and the
+  `Parent` and `Application` of `Names` complete the set. 34 objects
+  and 25 cases agree, `tests/fixtures/small_members.json`.
+
+- `Range.CreateNames` makes names from a range's labels as Excel does.
+  A label on a top or bottom edge names its column's data, one on a
+  left or right edge its row's, and a corner where two used edges meet
+  names all of it. A side left out is guessed from the cell beside its
+  corner. A label is text, or a date as it shows. It is cut to 255
+  characters and cleaned: `South East` makes `South_East`, `A1` makes
+  `A1_`, `R1C1` makes `_R1C1` and `3rd` makes `_3rd`. 16 side
+  combinations, 20 guesses and 57 labels agree,
+  `tests/fixtures/create_names.json`.
+
+- `Range.RowDifferences` and `ColumnDifferences` find the cells Go To
+  Special's row and column differences find. Each cell's `FormulaR1C1`
+  is compared with the comparison cell's in its row or column, without
+  regard to case: `=A1` and `=B1` in one row are alike, and so are 1,
+  1.0 and the text "1". A blank and 0 differ, and so do `=A1+1` and
+  `=A1 + 1`. The comparison must be one row high and inside the range,
+  or the call is error 1004. 34 live cases agree,
+  `tests/fixtures/row_differences.json`.
+
+- A workbook's links to other, closed workbooks are managed as Excel
+  manages them. `LinkSources` lists the linked workbooks' full names in
+  the file's order. `LinkInfo` answers a link's status: its file gone,
+  a sheet a formula reads gone, or out of date. `BreakLink` turns each
+  formula that reads the link, itself or through names, into the value
+  it shows, array formulas and spills too, and points each name that
+  reads it at `#REF!`; the link leaves the file and the later ones are
+  renumbered, with no event raised. `UpdateLinks` and `SaveLinkValues`
+  read and set the workbook's two link settings, and a save without
+  link values keeps none. A save writes the links' parts as Excel's
+  does, adding the sheet Excel names after a linked workbook whose own
+  names a formula reads. A live workbook of two links, 15 error cases
+  and 10 saved files agree, `tests/fixtures/workbook_links.json`.
+  Excel refuses `BreakLink` with error 1004 on a workbook a macro has
+  just opened until its links are listed; the model breaks the link at
+  once.
+
+- `Worksheet.SaveAs` saves as Excel's does. In a text format it writes
+  that sheet, hidden or not, rather than the active one, and that sheet
+  takes the file's name (but in the MS-DOS formats) while the active
+  sheet stays as it was; in a workbook format it saves the workbook, as
+  `Workbook.SaveAs` does. 9 live saves agree,
+  `tests/fixtures/sheet_save_as.json`.
+
+- Application members everyday macros use answer as Excel's do:
+  `PathSeparator`, `Value`, `OperatingSystem` and `MeasurementUnit`;
+  `InchesToPoints` and `CentimetersToPoints`, to the bit, the second
+  multiplying by 72 / 2.54 worked out first; `SheetsInNewWorkbook`, 1 to
+  255 and error 1004 past them, which sets how many sheets
+  `Workbooks.Add` makes with no template; and `ThisCell`, the cell
+  whose formula runs a VBA Function, error 1004 from a macro. 45 live
+  answers and 32 values converted agree,
+  `tests/fixtures/application_members.json`.
+
+- `Workbooks.OpenText` reads a text file as Excel does: every
+  delimiter, runs of them, qualifiers, StartRow, FieldInfo's kinds and
+  fixed widths, separators, a trailing minus, and the code pages Origin
+  names, xlWindows, xlMSDOS, 1252 and 65001 among them. Each line is a
+  record, a fixed-width field loses the spaces round it, and a .csv file
+  reads as `Workbooks.Open` reads one. The delimiters,
+  ConsecutiveDelimiter and Origin it is not given are those the session
+  last used. Excel shares them with `TextToColumns` and resets them with
+  `Workbooks.Open`'s Format, and the model does the same. 44 live files and
+  18 opens and splits in sequence agree, `tests/fixtures/open_text.json`.
+
+- `Workbook.SaveAs` writes CSV and text files as Excel does: xlCSV,
+  xlCSVWindows, xlCSVMSDOS, xlCSVUTF8, xlUnicodeText,
+  xlCurrentPlatformText, xlTextWindows and xlTextMSDOS. The active sheet
+  is written alone, its used block from its first cell, every line as
+  wide as the block, each cell as its own format shows it whatever its
+  column's width, a fill left out. A field holding a comma, a quote, a
+  tab or a line end is quoted, a character the code page lacks is `?`,
+  and every line ends with CR LF. The workbook takes the file's name and
+  Excel's FileFormat for it, its active sheet the file's name too but in
+  the MS-DOS formats, and one of more than one sheet is left unsaved; a
+  later Save writes the same way. SaveAs takes all of its arguments. 40
+  live saves agree byte for byte, `tests/fixtures/text_saves.json`.
+
+- `Workbooks.Open` reads CSV and text files as Excel does. A .csv file
+  splits at commas, or at the character a first line of `sep=` names; a
+  text file, and a .csv of three bytes or fewer or in UTF-16, splits at
+  the delimiter the session's last Format named, a tab until one does.
+  Quotes keep delimiters and line ends, a field holds 32,759 characters
+  and the rest starts a new line, and each field is typed as
+  TextToColumns types it, a formula worked out as the file opens. Bytes
+  are Windows-1252 unless a byte order mark says UTF-8 or UTF-16. The
+  workbook takes the file's name, its sheet the name without the
+  extension, and FileFormat answers xlCSV, xlCSVUTF8, xlUnicodeText or
+  xlCurrentPlatformText. Open takes all of its arguments: ReadOnly makes
+  `Workbook.ReadOnly` True until a SaveAs to another file, and SaveAs to
+  its own file is error 1004. 76 live files and 12 opens in sequence
+  agree, `tests/fixtures/text_files.json`.
+
+- `Range.Characters` reads and changes part of a cell's text and its
+  font as Excel's does: `Text`, `Caption`, `Count`, `Insert`, `Delete`
+  and `Font`, with Start and Length taken as Excel takes them. A cell's
+  own font is its first character's, and the rest of its text keeps runs
+  in fonts of their own, which files read and write, copies and sorts
+  keep and a value written drops. A run's font makes its row as tall as
+  a cell in that font would, and AutoFit measures each run in its own
+  font, an italic first run reaching as its font does alone and each
+  later italic run a fifth of its font's ascent. Any font or text set
+  leaves the workbook unsaved, one that changes nothing too. 99 live
+  answers and 68 layouts in Aptos Narrow and Calibri from 8 to 72pt
+  agree, `tests/fixtures/characters.json` and
+  `tests/fixtures/rich_text_fit.json`.
+
+- How far calculation has got, and the settings that steer it, follow
+  Excel: `Application.CalculationState`, `CalculationVersion`,
+  `CalculationInterruptKey` and `CalculateUntilAsyncQueriesDone`,
+  `Workbook.CalculationVersion` and `ForceFullCalculation`, and
+  `Range.Dirty` and `CalculateRowMajorOrder`. CalculationState is
+  xlCalculating while a formula's VBA Function runs, and xlPending while
+  a formula waits under manual calculation, so a macro waiting for
+  xlDone stops where Excel's does. Range.Dirty marks formulas to work
+  out again, at once under automatic calculation.
+  CalculateRowMajorOrder works a range out a row at a time, a cell
+  reading what a later cell still holds. ForceFullCalculation True
+  holds every workbook to full calculation until Excel quits, as Excel
+  does, and is saved and read. 24 live edits, 17 settings and 10 files
+  opened two ways agree, `tests/fixtures/calculation_state.json`.
+
+- `Application.ConvertFormula` turns a formula's references from A1 to
+  R1C1 or back and makes them absolute or relative, as Excel's does.
+  Relative references are relative to RelativeTo's first cell, or the
+  active cell, and an offset wraps round the sheet's edge as it is read.
+  A reference to a sheet of the active workbook names the workbook too,
+  `[Book1]Data!A1`, and a sheet the workbook has not got keeps its
+  spelling. A name, or a function Excel has not got, is spelled as Excel
+  first saw it in any formula it converted. A range given as the
+  formula converts each cell's value. What Excel cannot convert is the
+  error value #VALUE!: a table's reference, a space in an array
+  constant, a formula longer than 255 characters, and one whose text
+  does not fit the 254 characters Excel writes it into, keeping room
+  for the longest each number and reference could be. 784 live cases
+  agree, `tests/fixtures/convert_formula.json`.
+
+- `Range.Precedents`, `DirectPrecedents`, `Dependents` and
+  `DirectDependents` answer as Excel's do. A formula's precedents are
+  its references on its own sheet in the order it gives them, a name's
+  cells among them; another sheet's are left out, and so is what
+  INDIRECT names. A reference a legacy formula cuts to one value counts
+  as the cell the formula's row meets. Direct dependents are the
+  formulas reading the range, a dynamic array by its whole spill, by
+  rows and then columns. The full answers go level by level, each
+  formula once, and join their areas as Excel joins them, which is why
+  a chain of four answers `$B$1,$A$1:$A$4`. Nothing found is error 1004,
+  "No cells were found." 264 live answers over eleven layouts, one of
+  them saved and opened again, agree, `tests/fixtures/precedents.json`.
+
+- The Worksheet settings macros set beside Protect or on dashboards
+  follow Excel: `ScrollArea`, `EnableAutoFilter`, `EnableOutlining`,
+  `EnablePivotTable`, `EnableCalculation`, `TransitionExpEval`,
+  `TransitionFormEntry` and `DisplayRightToLeft`, and
+  `Window.DisplayRightToLeft`. `ScrollArea` takes what `Range` takes on
+  the sheet, one area of it, and reads back its address; anything else
+  changes nothing, with no error, and `""` clears it. Set while the
+  active cell is outside it, and by `Goto` outside it, Excel selects its
+  first cell, while a macro's `Select` still goes outside.
+  `EnableCalculation = False` keeps the sheet's formulas as they are
+  through every calculation, a formula written there reading 0, and a
+  save writes the values kept; True again works the sheet out under
+  automatic calculation. A save writes the Transition settings and
+  right-to-left as Excel does, and a copied sheet keeps them and the
+  three Enable switches; the rest are not saved. 209 live settings, 21
+  cases and a workbook saved and opened again agree,
+  `tests/fixtures/worksheet_settings.json`.
+  `EnableFormatConditionsCalculation` is left out, since Excel's reading
+  of it lags behind a setting, and `TransitionExpEval`'s 1-2-3 rules of
+  evaluation are not modelled.
+
+- The Application settings everyday macros switch read back what a
+  macro set, as Excel's do, where the model knew none of them:
+  `DisplayStatusBar`, `DisplayFormulaBar`, `DisplayScrollBars`,
+  `DisplayFullScreen`, `EnableAnimations`, `Interactive`,
+  `AskToUpdateLinks`, `AlertBeforeOverwriting`, `CellDragAndDrop`,
+  `CopyObjectsWithCells`, `EditDirectlyInCell`, `EnableAutoComplete`,
+  `FixedDecimal`, `MoveAfterReturn`, `UserControl`, `Cursor`,
+  `EnableCancelKey`, `MoveAfterReturnDirection`, `DisplayCommentIndicator`,
+  `DisplayNoteIndicator`, `FixedDecimalPlaces` and `Caption`, and
+  `Worksheet.DisplayPageBreaks`. A switch takes any value VBA turns into
+  a Boolean, and Null or text that is none leaves it as it was, with no
+  error; a numbered setting ignores a value Excel does not name, with
+  `EnableCancelKey` and `MoveAfterReturnDirection`'s own exceptions.
+  `Caption` reads after the active window's caption, as Excel's does.
+  `PrintCommunication = False` holds PageSetup settings back as Excel
+  does: they read as before and a save writes them as before, until
+  `PrintCommunication = True` applies them in the order they were made,
+  dropping without an error any Excel refuses; the print area and print
+  titles, which are names, apply at once. 595 live settings and 25 cases
+  of settings together agree, `tests/fixtures/application_settings.json`.
+  The model draws nothing and takes no keystrokes, so only
+  PrintCommunication changes what it does.
+
+- PageSetup's headers and footers read, set and save as Excel's do:
+  `LeftHeader`, `CenterHeader` and `RightHeader`, the three footers,
+  `DifferentFirstPageHeaderFooter`, `OddAndEvenPagesHeaderFooter`,
+  `ScaleWithDocHeaderFooter` and `AlignMarginsHeaderFooter`, and
+  `FirstPage` and `EvenPage` with each section's `Text`. Excel keeps a
+  header as one string, its sections marked `&L`, `&C` and `&R` in
+  either case, and text before the first mark is the center's. Setting
+  a section cuts its parts out and adds its mark and the new text at the
+  end, so sections come in the order they were set, and a mark in the
+  text set reads as another section. A string is at most 255
+  characters: a longer setting is error 1004, and a file holding a
+  longer one is one Excel will not open, which the model refuses to
+  read. A copied sheet keeps its headers. 40 live cases and 27 headers
+  read from files and saved again agree,
+  `tests/fixtures/page_headers.json`. Header pictures report themselves
+  unsupported.
+
+- `Workbook.SaveCopyAs` writes a copy as Excel does: the file a save
+  would write at that moment, a workbook under manual calculation
+  calculated first, in the workbook's own format whatever the name's
+  extension, so a `.xlsm` name gets a macro-free workbook's file. It
+  raises no save event, and the workbook keeps its name, its path and
+  its Saved flag, while its Last save time and Last author move as a
+  save's do. A file already there is replaced without a prompt, alerts
+  on or off. An empty name writes nothing and raises nothing. `Null`, a
+  missing folder, the workbook's own file and another open workbook's
+  file are error 1004 with Excel's message. Copied into another folder,
+  Excel writes a workbook's hyperlinks to files relative to the copy and
+  moves the workbook's own links there too, so every later save writes
+  them wrong; the model refuses that copy, and one into another folder
+  of a workbook whose formulas link to other workbooks, which is not
+  measured. 34 live copies agree, `tests/fixtures/save_copy_as.json`.
+
+- `Range.AdvancedFilter` matches text beyond ASCII as Excel does, and
+  takes text comparisons such as `>m`, which it reported unsupported
+  before. Excel's AdvancedFilter compares text as its AutoFilter does:
+  an `=` with no wildcard by Windows' word sort, case aside, `>` and `<`
+  in word sort's order, and a wildcard pattern one character at a time.
+  A plain criterion is a beginning, and keeps text whose first
+  characters, as many as the criterion has, word sort cannot tell from
+  it: `aesop` begins `Æsop`, while `ae` does not. The model compared
+  text by its characters in lower case. 51 criteria, 26 wildcard
+  patterns and 20 beginnings agree, `tests/fixtures/advanced_filter_text.json`.
+  Headers and the records `Unique` compares stay within ASCII.
+
+- `Sheets(Array(...))` and `Worksheets(Array(...))` group sheets as
+  Excel does, where they were error 13. A group holds the sheets the
+  array names, by name or by place, in the array's order, and a name
+  no sheet has is error 9. `Select` makes the array's first sheet
+  active and the group the window's selected sheets, and
+  `ActiveWindow.SelectedSheets` lists them in tab order; `Replace:=False`
+  adds a group, or one sheet, to the selection. `Copy` with no place
+  makes a new workbook of the group's sheets, their references to one
+  another kept, and beside a sheet makes copies whose references to one
+  another read the copies. `Move` with no place makes a new workbook of
+  them. Beside a sheet they move together in tab order, with Excel's
+  own quirk: the group goes one place further when the array's first
+  sheet stands past the place the anchor gives and some of the group
+  before it, as 608 live moves bear out. `Delete` takes them all, and
+  setting `Visible` selects the group first, so it is error 1004 while
+  a sheet of it is hidden. A workbook's whole `Worksheets` collection
+  acts as a group of every sheet, so `Worksheets.Copy` copies them all
+  to a new workbook. While sheets are grouped, `Worksheets.Add` is error
+  1004, as in Excel. A save marks each grouped sheet's tab selected,
+  and opening the file selects the group again. 74 live cases agree,
+  `tests/fixtures/sheet_groups.json` and `sheet_group_moves.json`, and
+  a live gate has Excel open the model's grouped and copied workbooks.
+
+- AutoFilter filters text beyond ASCII as Excel does. An `=` with no
+  wildcard, and each value of an xlFilterValues list, keeps the text
+  Windows' word sort cannot tell from it, case aside: `=aesop` keeps
+  `Æsop` and `=strasse` keeps `straße`, while `=resume` leaves out
+  `résumé`. `>` and `<` order text by word sort. A wildcard pattern
+  matches one character at a time by each one's word-sort key, so `ae*`
+  leaves out `Æsop`, `*ss*` leaves out `straße`, and `k*` keeps a
+  Kelvin sign, while a dotless i is no I. A saved list keeps its values
+  in word sort's order. Any letter beyond ASCII in a filtered column
+  reported itself unsupported before. 36 spellings, 51 criteria, 6
+  lists and 13 pairs of letters agree, `tests/fixtures/filter_text.json`,
+  and a live gate has Excel read the model's filters as its own. Letters
+  past Latin, Greek and Cyrillic still report themselves unsupported.
+
+- `Range.RemoveDuplicates` compares text beyond ASCII as Excel does, by
+  Windows' word sort ignoring case: `ae` is a duplicate of `æ` and `ss`
+  of `ß`, `É` of `é`, while `e` stays beside `é`. It reported such text
+  unsupported before. The two measured cases that showed it,
+  `accents` and `ligature` in `tests/fixtures/remove_duplicates.json`,
+  now replay.
+
+- `Range.Sort` and the Sort object order text beyond ASCII as Excel
+  does. Excel orders text by Windows' word sort, and the model builds
+  Windows' own sort key for each string from the weights of Latin and
+  its extensions, combining marks, Greek, Cyrillic, punctuation,
+  currency and letterlike symbols, and control characters. An accent
+  comes after the letter it sits on, a ligature sorts as its letters and
+  a sharp s as ss. Case breaks ties, lower case first under MatchCase,
+  and hyphens, apostrophes and dashes count only after everything else.
+  Text with any character beyond printable ASCII reported itself
+  unsupported before. Excel's sort agrees over 400 strings, case
+  ignored and matched, and the keys are Windows' LCMapStringEx keys over
+  1,500 more. Text in other scripts, and text that begins with a
+  combining mark, still report themselves unsupported.
+
+- Renaming a sheet works in a workbook that holds a table. It reported
+  itself unsupported before. The rename reaches every formula that
+  names the sheet, as Excel's does: the cells', the defined names', and
+  the table's own calculated columns and totals row, in the table part
+  a save writes. A table's references name no sheet and stay as they
+  were. 7 live cases agree, and so does a workbook Excel saved with a
+  table, opened, renamed and saved again,
+  `tests/fixtures/rename_tables.json`.
+
+- `Workbook.BuiltinDocumentProperties` and `CustomDocumentProperties`
+  read, set, add, rename, retype, link and delete a workbook's
+  properties as Excel does. A new workbook's author is the user, its
+  company empty and its creation date the moment it was made; a file's
+  properties are what its docProps parts keep. A value set turns into
+  the property's type as Office turns a Variant, a Boolean -1 or 0 in
+  text, and each error is Excel's, its number and description.
+  Office keeps a date to the second in UTC, by the machine's time zone
+  as Windows gives it year by year, so a time in the hour the clock
+  skips reads back an hour early, a date before day zero is kept a day
+  early, and one before 1601 fails, as in Excel. A custom property
+  linked to a named range takes the range's first cell's value, and its
+  type, when the workbook is saved. A save writes the last author, the
+  save time, a creation date where there is none, and core.xml, app.xml
+  and custom.xml byte for byte: each property where Excel keeps it,
+  control characters escaped as Excel escapes them, and the sheets and
+  named ranges Excel lists, with custom.xml's relationship and content
+  type coming and going with the custom properties. The model wrote the
+  template's own parts before, its author, dates and one sheet's name.
+  38 live cases agree, each workbook saved and opened again, and a live
+  gate has Excel read the model's files as its own. A custom.xml with a
+  value type Excel does not write is kept as it is, and its properties
+  report themselves unsupported.
+
+- `Range.Subtotal` and `Range.RemoveSubtotal` put subtotal rows into a
+  list and take them out as Excel's Data > Subtotal does. A single cell
+  takes the region around it and a larger range is cut to the cells the
+  sheet uses; the first row is the header. Rows whose GroupBy cell shows
+  the same text, case and spaces at either end aside, make a group. Each
+  group gets a row of its own with the group's first text and the
+  function's word in bold, `East Total`, and `=SUBTOTAL(9,C2:C3)` in each
+  TotalList column. A Grand row closes the list. The rows go in whole,
+  each taking the formats of the row it follows, or with
+  `SummaryBelowData:=xlSummaryAbove` above each group, taking the row
+  after's. The list is outlined, and `Outline.SummaryRow` follows, its
+  own setting the default. All eleven functions, by constant or by the
+  dialog's numbers 1 to 11, label as Excel labels them. Under the data a
+  blank key gets no row; over it each blank row gets a ` Total` row.
+  Where TotalList totals the GroupBy column, the labels move to the
+  nearest column left of it that it does not total, or into a column put
+  in before the list. Replace takes the old subtotals out first, and
+  `Replace:=False` subtotals inside them in their summary place, adding
+  a Grand row only where Excel does. RemoveSubtotal deletes every row of
+  the list holding one SUBTOTAL call alone and takes the list's rows and
+  columns out of the outline, showing those in a group. The first label
+  takes the number format a macro last read or formatted a cell with, as
+  Excel's leftover state gives it. Neither call raises Change; Subtotal
+  raises Calculate. `PageBreaks` puts a break after each group, and a
+  call leaving it out takes the setting of the sheet's last call, which
+  Excel keeps on the sheet. 166 measured cases agree cell by cell, in
+  each saved cell's xf, outline row and page break, and Excel reads the
+  model's file as its own. A filtered list reports itself unsupported.
+
+- `HPageBreaks`, `VPageBreaks`, `Range.PageBreak` and
+  `Worksheet.ResetAllPageBreaks` add, read and take away manual page
+  breaks as Excel does. `Add` puts a break before a range's first row or
+  column, not the first; the collections count the breaks before the
+  rows or columns the sheet uses and the one after them, in order, and
+  each break answers its `Location`, `Type` and `Extent` and can
+  `Delete` itself. `PageBreak` reads on whole rows and columns and sets
+  `xlPageBreakManual` or `xlPageBreakNone` on them or on a cell's row
+  and column. Breaks move with rows and columns put in, go with the line
+  after them when it goes, stay through cell shifts and come with a
+  copied sheet. A save writes them as the sheet's `rowBreaks` and
+  `colBreaks`, and a file's breaks read back. 80 measured cases agree,
+  and Excel reads the model's file as its own. Automatic breaks, which
+  Excel works out only as it lays the pages out, are not modeled, and
+  breaks on a sheet with a print area report themselves unsupported.
+
+- `Worksheet.Tab` colours a sheet's tab as Excel does. `Color`,
+  `ColorIndex`, `ThemeColor` and `TintAndShade` set the colour and read
+  it back. `Color = False` and `ColorIndex = xlColorIndexNone` take it
+  away, and any other `Color` is its low 24 bits, so xlNone is a pale
+  blue. A slot beyond 1 to 56 or a theme colour beyond the twelve is
+  error 9. A tint is cut toward zero to n / 32767 and kept in 16 bits,
+  so 1.5 reads back as -0.5000763. A colour off the palette reads the
+  `ColorIndex` a tab finds, not a cell's: a near-grey takes the nearest
+  grey, and any other colour the nearest slot in Windows' HLS, the hue
+  not wrapped round. 1,397 colours agree with Excel. A save writes the
+  colour as the sheet's `tabColor`, a copied sheet keeps it, the file
+  reads back as Excel's does, and Excel reads the model's file as its
+  own.
+
+- `Range.PivotCell`, `Range.PivotTable`, `Range.PivotField` and
+  `Range.PivotItem` say what a cell of a pivot table stands for, as in
+  Excel. `PivotCellType` tells a value from an item, a subtotal, a custom
+  subtotal, a grand total, a data field's caption, a field's name, a page
+  field's item, the Values button and a blank. `PivotField`, `PivotItem`,
+  `DataField`, `RowItems`, `ColumnItems` and `CustomSubtotalFunction` name
+  what the cell stands at. A value names its data field and the items of
+  its row and column. A label names the field and item of the column or
+  row it sits in, and an outline field's cell on a subtotal's line names
+  the subtotal. A cell outside every table, the row under the page fields
+  and the column between two page fields are error 1004, as in Excel.
+  Every cell of 595 tables Excel saved for the other fixtures agrees:
+  compact, outline and tabular layouts, subtotals at the top or bottom,
+  custom subtotals, blank lines, collapsed items, the Values field on
+  either axis and page fields. The tables the model makes itself agree
+  too.
+
+- Pivot tables that share a cache refresh together on every sheet, as
+  in Excel. `RefreshTable` on one of them, or `PivotCache.Refresh`, lays
+  out every table made from the cache, sheet by sheet in their order and
+  each sheet's newest table first, and fits each one's columns. The
+  cache moves to the end of `PivotCaches`. `Workbook.RefreshAll`
+  refreshes every cache a table uses, from the last to the first,
+  passing over one whose `EnableRefresh` is off without an error. The
+  model refused a refresh whose tables were on more than one sheet, and
+  `RefreshAll` left pivot tables alone. `ClearTable` lays out every
+  table of its cache again too, from the cache as it is, so a table
+  whose style flags wait fits its columns to them. 18 scenarios agree
+  with Excel before a save and once the file is opened again, the saved
+  caches and cells are Excel's, and Excel reads the model's files as its
+  own.
+
+- Pivot tables fit their columns to their cells each time they are laid
+  out, as Excel's Autofit column widths on update does, narrower as well
+  as wider and over a width a macro set, and a save writes those widths
+  with `bestFit` beside them. A cell is measured in the bold its table
+  style draws there, as each of Excel's 144 built-in pivot and table
+  styles draws its header rows, totals, subheadings and page fields, less
+  what the style's flags turn off. A dropdown adds 16 pixels. A compact
+  label beside the +/- buttons starts 88/7 pixels in, and each depth a
+  step of 9 pixels for each compact indent, 90/7 at least. A subtotal's
+  label sits at its plain indent. Outline and tabular forms keep an outer
+  row field's column as it is, and make each run of item columns a total
+  column closes as wide as its widest. A change of style fits the columns
+  again; a style's flags and the +/- buttons wait for the next layout, and
+  `HasAutoFormat` off fits nothing, as in Excel. 1,280 measured labels,
+  44 edited tables and every column of the pivot tables the earlier
+  fixtures saved agree with Excel.
+
+- `PivotTable.ShowPages` makes a sheet for each item of a page field as
+  Excel does, each holding a copy of the table that shows that item
+  alone. The sheets come from the field's last item to its first, each
+  put before the sheet active then, so they end in the field's order
+  with the first item's sheet active, in the table's workbook whichever
+  is active. A hidden item and the item the field chooses get no sheet.
+  A copy keeps all the table has but its name, the next default name,
+  and stands at the top left of its sheet. A sheet takes its item's
+  name cut to 26 characters, with ` (2)`, ` (3)` and on where another
+  sheet has the name in any case, and keeps the `Sheet` name it was
+  added with where no sheet can take the item's: past 31 characters,
+  with a character no sheet's name holds, or an apostrophe first or
+  last. The field goes by its name in any case or as a `PivotField`, or
+  is left out for the first page field. As in Excel, a field that is
+  not a page field and a table with none are error 1004, and the
+  events come once every sheet is made, sheet by sheet. 35 scenarios
+  agree with Excel before a save and once the file is opened again, the
+  saved tables agree with Excel's files, and Excel reads the model's
+  files as its own.
+
+- Pivot fields take calculated items as Excel's do.
+  `PivotField.CalculatedItems.Add` makes an item of a field on the rows
+  or columns whose formula names the field's other items: bare, in
+  apostrophes, as `Region[East]` or by place as `Region[1]`, with
+  numbers, text and worksheet functions. The table works the item out
+  in every cell from the items it names there, their hidden items too,
+  and a total over the field takes every item's value together by the
+  data field's function, summed, the greatest, the least or multiplied.
+  The item shows under every item outside it, sorts last by name and
+  with the others by value, and reads back its formula as Excel spells
+  it. `PivotItem.Formula` changes it, `Delete` takes it away, leaving
+  #NAME? where another's formula named it, and `IsCalculated` and
+  `StandardFormula` read it. A refresh keeps calculated items, and the
+  file keeps each one as Excel's does. As in Excel, a name an item has,
+  an unknown item, a field on no axis or the page area, a data field,
+  a field of groups and an average, standard deviation or variance
+  beside one are error 1004, and so are moving its field to the page
+  area, custom subtotals and grouping its numbers by ranges. 70 layouts
+  agree with Excel before a save and once the file is opened again,
+  the saved tables and caches agree with Excel's file, and Excel reads
+  the model's file as its own.
+
+- Pivot tables group their fields as Excel does. `Range.Group` on one
+  item's cell groups a field of numbers into ranges by `By` from `Start`
+  to `End`, the field's least and greatest where those are True or left
+  out, with Excel's default step where `By` is left out: the largest
+  power of ten no more than a third of the span. The ranges carry
+  Excel's labels, `10-19` for whole numbers and `22.5-35` otherwise,
+  with `<Start` ahead of them and `>` the last range's end after them. A
+  field of dates groups into a field for each period `Periods` chooses,
+  seconds to years, months where it chooses none, `Months (Date)` and
+  the like, which take the date's place on the axis, the coarsest
+  outermost; days by a `By` above one are ranges of days. The cells of
+  two items or more gather them into `Group1`, the lowest number free,
+  in a field of groups, `Region2`, which comes outside the field; groups
+  can be grouped again, and a group takes the items it gathers from the
+  groups they were in. `Range.Ungroup` takes each grouping back, the
+  last group taking its field of groups with it. A refresh works an
+  automatic `Start` or `End` out again and gives a new item a place of
+  its own. `PivotItem.LabelRange` and `DataRange` give an item's cells,
+  and `ParentField`, `ChildField`, `GroupLevel`, `TotalLevels`,
+  `ParentItems`, `ParentItem` and `ChildItems` say how groups relate.
+  Text, a page field's cell, a data or total cell, a `By` of 0, a
+  `Start` past `End` and a `Periods` choosing nothing are error 1004, as
+  in Excel. Workbooks Excel grouped read, lay out, refresh and save as
+  Excel's do. 134 layouts agree with Excel before a save and once the
+  file is opened again, the saved tables and caches' groupings and every
+  cell's format agree with Excel's file, and Excel reads the model's
+  file as its own.
+
+- Pivot items collapse and expand as Excel's do. `PivotItem.ShowDetail`
+  False collapses an item of a field on the rows or columns: it shows its
+  total alone, with no line inside it and no subtotal line, in compact,
+  outline and tabular form and wherever its subtotals go, and a line for
+  each data field where the Values field is inside it. A collapsed middle
+  item collapses under every outer item. `PivotField.ShowDetail` sets
+  every item's, its subtotals' entries too, and the file keeps each as
+  Excel does, `sd="0"`. An item of a field on no axis takes it, its field
+  then listing its items, and an innermost field's item takes it without
+  changing what shows. The innermost field on an axis, a data field, the
+  Values field and a page field's item are error 1004, reading a field's
+  `ShowDetail` is error 1004 and an item of the Values field reads #N/A,
+  as in Excel. 24 layouts agree with Excel before a save and once the
+  file is opened again, the saved tables and every cell's format agree
+  with Excel's file, and Excel reads the model's file as its own.
+
+- Names in a pivot table take new values as Excel takes them. A data
+  field's `Caption` or `Name` renames it, error 1004 where a field shows
+  by the name or another data field has it, in any case; a name with a
+  space more, an item's name and an empty name are all names, as in
+  Excel. The Values field's names the table's Values caption. A field's
+  `Caption` names it as its table and formulas show it, error 5 where
+  another field or a data field has the name, an empty one taking the
+  field back to its source's name, and `Name` does the same on a field
+  on an axis. On a field on no axis `Name` lists the field's items, takes
+  the name and then raises error 1004, as Excel does. An item's `Name`,
+  `Caption` and `Value` give it a caption, which it shows, sorts by, is
+  chosen by as a page field's item and is found by from then on, its
+  `SourceName` still its value; another item's name is error 1004. A
+  table built with a data field alone now clears the empty table's
+  placeholder borders, which the file kept. 42 layouts agree with Excel
+  before a save and once the file is opened again, the saved tables and
+  every cell's format agree with Excel's file, and Excel reads the
+  model's file as its own.
+
+- Pivot tables take calculated fields. `PivotTable.CalculatedFields.Add`
+  adds a field whose formula names the table's fields by their captions,
+  and the field goes into the data area as any other. Each cell works the
+  formula out over the sums of the fields it names, whatever function its
+  data field shows, so a cell no record reaches works it out over zeros,
+  and a subtotal by another function leaves it empty, as in Excel. Any
+  worksheet function works, through the model's formula engine, TRUE
+  comes out as 1, text that reads as a number as that number, and other
+  text as #VALUE!. `Formula` reads and sets a calculated field's formula,
+  spelled back as Excel spells it: field names in their own case without
+  needless apostrophes, functions in capitals, numbers as a formula spells
+  them, and spaces moved as Excel moves them. `Delete` removes a
+  calculated field and its data fields, leaving #NAME? where another
+  formula named it. `Caption` renames any field for its table and its
+  formulas, `IsCalculated`, `StandardFormula` and `DataType` read, and a
+  refresh keeps the calculated fields. Value sorts and filters, Show
+  Values As and running totals take a calculated field's values, a
+  running total now carrying an error on as Excel's does. A formula Excel
+  refuses adds nothing while alerts are off, as in Excel, and reports
+  itself unsupported while they are on, where Excel shows a message. 59
+  layouts agree with Excel before a save and once the file is opened
+  again, the saved tables, calculated cache fields and every cell's value
+  and format agree with Excel's file, and Excel reads the model's file as
+  its own.
+
+- Pivot data fields show their values as Excel's calculations, Show
+  Values As. `PivotField.Calculation` takes all fifteen: a difference,
+  percent or percent difference from a base item or from the item before
+  or after, a running total plain or as a percent, a percent of the grand
+  total, the row, the column, the parent row or column or a parent field,
+  an index, and a rank either way. `BaseField` and `BaseItem` take a
+  field and an item by name. `(previous)` and `(next)` step over the
+  items a group lacks, and setting a base field takes the base item back
+  to the field's first, as in Excel. Each cell comes out as Excel's does,
+  empty, 0, #NULL! or #N/A, the index in Excel's own order of
+  operations, and subtotals by another function count as Excel counts
+  them. A percent shows 0.00% unless the field showed one already, and an
+  index and a rank show General. A data field's `NumberFormat` now sets.
+  A field a data field steps along by the item before or after shows in
+  its items' order, and Excel takes its value sort out of the file, which
+  the model does too. A calculation beside the innermost field's own
+  subtotals by another function reports itself unsupported. 117 layouts
+  agree with Excel before a save and once the file is opened again, the
+  saved tables and every cell's format agree with Excel's file, and
+  Excel reads the model's file as its own.
+
+- Pivot tables take Excel's table options. `TableStyle2` takes a pivot or
+  table style by name in any case, and the five `ShowTableStyle` flags
+  read and set. `NullString` and `ErrorString` show in the value cells no
+  record reaches and in those that work out an error, read as a whole
+  number where they are one, as Excel reads them, and `DisplayNullString`
+  off shows 0. `PageFieldOrder` and `PageFieldWrapCount` lay the page
+  fields out, `ShowValuesRow` shows the Values row, and `Tag`,
+  `AlternativeText`, `Summary` and fourteen flags read and write.
+  `AddFields` puts fields on the rows, columns and page area,
+  `ClearTable` empties the table back to its placeholder, `Location` moves
+  it, `Update` lays it out again, and `VisibleFields` lists the fields it
+  shows. `ManualUpdate` holds the table's lines back as Excel does: on,
+  any change lays it out as its captions alone, and off lays it out in
+  full. `SaveData` off saves a new cache without its records until
+  another table is made from it. `RowGrand`, `ColumnGrand` and the
+  members raise Excel's errors, and options only a table from a cube has
+  are error 1004 or 5 as in Excel. Putting a table in no style, which
+  Excel draws with borders of the cells themselves, reports itself
+  unsupported. 61 layouts agree with Excel before a save and once the
+  file is opened again, the saved tables and every cell's format agree
+  with Excel's file, and Excel reads the model's file as its own.
+
+- Pivot tables lay out as Excel lays them out in compact, outline and
+  tabular form. `PivotTable.RowAxisLayout` puts every field in one form,
+  and a field's `LayoutForm` and `LayoutCompactRow` lay out that field
+  alone, each in its own column or sharing its parent's, indented, its
+  items on lines of their own or on their first child's line.
+  `PivotField.Subtotals` reads and sets the twelve flags: Automatic, or
+  any of Sum, Count, Average, Max, Min, Product, Count Numbers, StdDev,
+  StdDevp, Var and Varp, each a subtotal line of its own, labelled with
+  the function, and an innermost field's functions adding a line for each
+  item ahead of the grand total. `LayoutSubtotalLocation` puts a lone
+  subtotal on the item's own line or below, `LayoutBlankLine` leaves an
+  empty line after each item, `RepeatLabels` and
+  `PivotTable.RepeatAllLabels` repeat the labels down the lines, and
+  `SubtotalName` and `LayoutPageBreak` read and write. The table's
+  `CompactLayoutRowHeader`, `CompactLayoutColumnHeader`, `GrandTotalName`,
+  `DisplayFieldCaptions`, `CompactRowIndent`, `LayoutRowDefault`,
+  `RowGrand` and `ColumnGrand` read and set, `DataLabelRange` reads, and
+  a data field's `Function` sets its function and the name it gives. The
+  members raise Excel's errors. Every pivot cell now takes the format
+  Excel gives it: a field's button on its caption, a label aligned left
+  and indented by its depth where a field is compact, its field's number
+  format, and every value cell its data field's format, an empty one too,
+  each made in Excel's order. A table the model makes carries Excel's own
+  attributes and extensions, and a refresh, a rename or a save takes a
+  table in any of these layouts from a file. StdDev, StdDevp, Var and Varp
+  work their values out in two passes, as Excel does, where the model's
+  running mean could land a unit in the last place away. `MergeLabels`
+  reads, and merging the labels reports itself unsupported. 122 layouts
+  agree with Excel before a save and once the file is opened again, the
+  saved tables and every cell's format agree with Excel's file, and Excel
+  reads the model's file as its own.
+
+- Pivot tables filter dates. `PivotFilters.Add` takes Excel's date filters
+  on a date field: a specific date, before, after, between and their
+  opposites, Value1 a Date, a serial or text CDate reads; and a period
+  counted from today, yesterday to next year and year to date, keeping
+  the days it covered on the day it was added, or a quarter or month of
+  any year. A date filter compares each moment as it is, a time of day
+  included, unless `Add2`'s WholeDayFilter has it compare days; it takes
+  the place of a field's label filter, and both are error 1004 on the
+  wrong kind of field. `PivotFilter` reads a date filter back, its Value1
+  and Value2 as Dates or a period's days as text, and `WholeDayFilter`.
+  Date fields work on any axis: an item reads, and its label cell shows,
+  the date in its field's format, or m/d/yyyy where the source's cells
+  differ, and a refresh drops a date the source lost, as Excel does,
+  where it keeps text and numbers. Every field now takes the number
+  format its source's cells share, and so its items' names and label
+  cells, and each data field shows its values in it, as Excel does;
+  `PivotField.NumberFormat` is error 1004 on a field of text and the
+  Values field. The cache spells its dates to the second and its maxDate
+  as the midnight after the last day, as Excel does. The model refused
+  date filters and a date item's name. 79 layouts agree with Excel,
+  before a save and once the file is opened again, and Excel reads the
+  model's file as its own.
+
+- Pivot tables filter their items by caption and by value.
+  `PivotField.PivotFilters.Add` puts a label filter on a field, an item's
+  caption tested as a worksheet AutoFilter tests a cell, any case alike
+  and `*` and `?` wild; a value filter on a data field's totals, compared
+  among the items inside the same outer items, which then total only what
+  is left; or a top 10 filter keeping the items with the highest or
+  lowest totals by count, ties at the last place kept, or until their
+  running total reaches a percent of the whole or a sum. A field holds one
+  label filter and one value filter beside its hidden items; label
+  filters and hidden items leave their records out first, then value
+  filters, outer fields first. `PivotFilters` lists a field's filters,
+  label first, and `PivotFilter` reads each back, its type, values, data
+  field and Active, and Deletes it; `ClearLabelFilters`,
+  `ClearValueFilters`, `ClearManualFilter` and `ClearAllFilters` take
+  them away, and `PivotTable.AllowMultipleFilters` reads and sets the
+  table's setting. `PivotFields("Sum of Amount")` finds a data field by
+  its caption. Add raises Excel's errors for a page field, the Values
+  field, an unknown type, a value filter given no data field or text, a
+  between given one value and a top count below 1. A refresh filters new
+  items and new totals. The file keeps each filter as Excel's does, the
+  autoFilter that spells its test, and a file's filters read back; a new
+  table is written with Excel's multipleFieldFilters. Date filters report
+  themselves unsupported. The model had no PivotFilters. 73 layouts agree
+  with Excel, before a save and once the file is opened again, and Excel
+  reads the model's file as its own.
+
+- Pivot tables sort their items. `PivotField.AutoSort` sorts a field by
+  its items' names, keeping them in that order, or by a data field's
+  values, which orders the items as the table lays them out, inside each
+  outer item, totals over the records that show; equal values keep the
+  field's order, a descending sort is the ascending one turned round, and
+  xlManual keeps the order as it stands. `AutoSortOrder` and
+  `AutoSortField` read the sort back, and `PivotItem.Position` moves an
+  item among those showing, a hidden one showing again, and reads its
+  place, #N/A for an item that does not show. A refresh sorts new items
+  in among a field sorted by names and sorts by the new values. An order
+  or a field AutoSort does not know moves nothing, as in Excel. The file
+  keeps each sort as Excel's does, and a file's sorts read back; the
+  model also writes a pivot table's row and column lines as Excel does,
+  each repeating the items it shares with the line before it. The model
+  had none of these members and Position could not be set. 45 layouts
+  agree with Excel, before a save and once the file is opened again, and
+  Excel reads the model's file as its own.
+
+- Pivot tables filter by their items. `PivotItem.Visible = False` hides an
+  item of a row, column or page field, and every record holding it counts
+  nowhere, subtotals and the grand total included; the last item showing
+  cannot be hidden, error 1004. `PivotField.CurrentPage` chooses the item a
+  page field shows, or "(All)", and reads back a PivotItem;
+  `EnableMultiplePageItems` lets a page field show several items, the
+  hidden ones left out, its cell reading the one item left, "(All)" or
+  "(Multiple Items)". `ClearAllFilters` on the table or a field shows every
+  item again, and `VisibleItems` and `HiddenItems` list them. Each follows
+  Excel's rules: Visible on a page field choosing one item says whether the
+  item is the chosen one; hiding the chosen item moves the choice to the
+  next item showing; CurrentPage turns off the choice of several and keeps
+  the hidden items, and cannot choose a hidden one; a field outside the
+  layout filters nothing, and Excel's PivotItems hands back its first item
+  for any name it finds there until the field hides one; a field hiding
+  items comes to the page area allowing several. A refresh keeps each
+  field's items in their order, hidden ones by their values, marks an item
+  the source lost and keeps its value in the cache unused, and adds a new
+  one at the end, hidden where the field hides any. The file keeps all of
+  it as Excel's does, and a file's filters read back. Excel saves a page
+  field that chooses an item and allows several, and then cannot open its
+  own file; the model saves such a field as choosing the one item. The
+  model had no CurrentPage, EnableMultiplePageItems, ClearAllFilters,
+  VisibleItems or HiddenItems, and Visible could not be set. 65 layouts
+  agree with Excel, before a save and once the file is opened again, and
+  Excel reads the model's file as its own.
+
+- The Sort object sorts on a conditional format's icons: a field with
+  SortOn:=xlSortOnIcon puts the rows showing the icon its `SetIcon` gave
+  it on top, or at the bottom with xlDescending, the rest in their order,
+  as a colour field does. An icon of another set and a field given none
+  move nothing. SortOnValue reads the Icon, Nothing until set, and the
+  file keeps the icon's set and its place, which a file's sort reads
+  back. The model refused SortOn:=xlSortOnIcon; a table's sort on icons
+  still reports itself unsupported. 8 layouts agree with Excel, before a
+  save and once the file is opened again, and Excel reads the model's
+  file as its own.
+
+- AutoFilter on a conditional format's icons: xlFilterIcon with an Icon
+  as Criteria1 keeps the cells an icon set shows that icon, and
+  xlFilterNoIcon those it shows none. The model works out the icon each
+  cell shows as Excel does: a number shows the icon of the highest
+  criterion it reaches, at or above its value or above it where the
+  criterion says so, the criteria a percent of the way from the range's
+  lowest number to its highest, a percentile of them, a number or a
+  formula's answer; the order turned round turns the icons round, and a
+  place given no icon shows none, as a word, a blank and an error do. A
+  filter matches an icon's set and place, not one alike in another set.
+  It reads back xlFilterIcon and the Icon, or xlFilterNoIcon and Empty,
+  and saves and reads as Excel's does. The model refused both. 13 icon
+  sets filtered by every icon and by none agree, before a save and once
+  the file is opened again, and Excel reads the model's file as its own.
+
+- AutoFilter's dynamic filters on dates: xlFilterDynamic with xlFilterToday
+  through xlFilterYearToDate keeps the date cells in a period counted from
+  today, yesterday to next year, a week running from Sunday, and
+  xlFilterAllDatesInPeriodQuarter1 through ...December a quarter or a
+  month of any year. The filter reads back as xlFilterDynamic and its
+  Criteria1, and the file keeps a period counted from today as Excel
+  does, its first serial and the one after its last. The model refused
+  all but above and below average. All 32 agree with Excel over dates
+  around the day it made them, the model's clock stood at that moment,
+  before a save and once the file is opened again, and Excel reads the
+  model's file as its own.
+
+- AutoFilter on dates by year, month, day, hour, minute or second, as the
+  macro recorder writes it: `Operator:=xlFilterValues` with Criteria2 as
+  pairs of a level and a date, `Array(1, "3/1/2025")` for March 2025. A
+  year needs a date to name it, `"2025"` alone being error 1004 with the
+  filter turned on. An array Criteria1 adds its values beside the dates;
+  a single one is passed over. A cell passes holding a date in a date
+  format inside a group. The filter reads back as its values alone do,
+  Operator 0 and no criteria where there are none. The file keeps it as
+  Excel does, in the column filter's Excel 2017 extension, the dates with
+  the latest year first and within one the earliest moment; a file's
+  classic filters element of dates reads back as xlFilterValues and is
+  saved as it was. The model refused them. 26 live layouts agree, before
+  a save and once the file is opened again, with three files written the
+  classic way, and Excel reads the model's files as its own.
+
+- AutoFilter on a colour: xlFilterCellColor, xlFilterFontColor,
+  xlFilterNoFill and xlFilterAutomaticFontColor, on a sheet's filter and
+  a table's. A row shows where its cell has a solid fill of the colour, a
+  conditional format's or a theme colour's included, as a colour sort
+  finds it; a patterned fill, white and no fill are not yellow. A font
+  filter wants the colour set outright, so black is not the automatic
+  font, which xlFilterAutomaticFontColor shows. Each filter reads back its
+  operator and one criterion, Criteria1 an Interior holding the colour,
+  white with no pattern for no fill, or a font's colour as a number. The
+  file keeps the colour in a dxf of its own, made as the filter is, which
+  ShowAllData or a new filter on the column lets go; a file's colour
+  filters read back and apply. The model refused them. 15 live layouts
+  agree, before a save and once the file is opened again, the file's
+  filters and dxfs as Excel saved them, and Excel reads the model's file
+  as its own.
+
+- `CreateObject("VBScript.RegExp")` and `New RegExp` work in memory. Test,
+  Replace and Execute run VBScript's dialect, with MatchCollection, Match
+  and SubMatches. `\d`, `\w`, `\s` and `\b` are ASCII's, and IgnoreCase
+  folds every letter. `^` and `$` treat a carriage return as a line's end,
+  and `{` is text unless it makes a quantifier. Replacements take `$1` to
+  `$99`, `$&`, `` $` ``, `$'` and `$$`; a group that took no part gives
+  nothing. A bad pattern is error 5017 to 5021 where it is used. 56 live
+  cases and the collections' edges agree.
+
+- `CreateObject("Scripting.FileSystemObject")` takes paths apart and puts
+  them together as the real one does: GetFileName, GetBaseName,
+  GetExtensionName, GetParentFolderName, GetDriveName and BuildPath, over
+  37 live paths with slashes, drives, shares, roots and trailing spaces.
+  Its members that read or write the disk report themselves unsupported,
+  as VBA's own file statements do.
+
+- `Range.Insert CopyOrigin:=xlFormatFromRightOrBelow`: the new rows,
+  columns or cells take the formats, row height or column width of the
+  line after them, which they pushed along, the top row included.
+
+- `AdvancedFilter` copying to a single blank cell copies every column
+  under its headers, and the sheet's Extract name spans that header row;
+  a blank row of extract headers is error 1004.
+
+- A second sweep of 77 everyday macros, run in Excel and the model side by
+  side, now agrees in full. It covers copies and pastes, cuts, inserts,
+  sheet copies and moves, names, finds, filters, lookups, worksheet
+  functions, VBA's conversions, strings and dates, regular expressions,
+  dictionaries, paths, colours, borders, validation, tables, charts and
+  AutoFit.
+
+- A table's own AutoFilter. `Range.AutoFilter` on a range inside a table
+  filters the table, the field counted from the table's first column
+  whatever the range, and a range reaching past the table is error 1004.
+  `ListObject.AutoFilter` is the table's filter, Nothing while
+  `ShowAutoFilter` is False, with its Range, FilterMode, Filters,
+  ApplyFilter and ShowAllData; `ShowAutoFilter = False` takes its criteria
+  away and shows its rows. The criteria are saved in the table's part and
+  read back from it, the totals row is never hidden, and a table made over
+  the sheet's filtered range takes that filter over.
+
+  `Worksheet.AutoFilter`, `ShowAllData` and `AutoFilterMode = False` reach
+  the filter at the active cell, a table's where it is in one.
+  `FilterMode` follows that filter as Excel fixes it, when the sheet is
+  activated, its selection moves or a filter changes, so deleting a
+  filtered table leaves it True. Edits hold back from hidden rows by it,
+  and SUBTOTAL passes over every hidden row once any filter has criteria.
+  76 live layouts, Excel's file read back sheet by sheet, 11 steps taken
+  on that file opened again, and the model's own file opened in Excel
+  agree. Filtering a table with no header row, rows put in or taken out
+  inside a filtered table, deleting a column it is filtered by, and
+  resizing a filtered table wider or longer report themselves unsupported.
+  A table resized smaller over data it leaves below reads a longer
+  `AutoFilter.Range` in Excel once its file is opened again; the model
+  reads the block the file gives.
+
+- Sorting on a cell's colour or its font's: `SortFields.Add` with
+  `SortOn:=xlSortOnCellColor` or `xlSortOnFontColor`, and its
+  `SortOnValue.Color`, on a sheet's Sort object and a table's. The rows
+  showing the colour go on top, or at the bottom with xlDescending, the
+  rest keeping their order, before or after value fields. A solid fill
+  shows a colour, a conditional format's and a theme colour's included; a
+  patterned fill, white and no fill do not, but a field whose colour was
+  never set sorts on no fill. A font shows only a colour set outright, so
+  the automatic colour matches nothing. `SortOnValue` is an Interior or a
+  Font, error 1004 on a field of values. The file keeps each colour as a
+  dxf, as Excel does, and reads it back. 26 live layouts, Excel's file
+  read back and sorted again, and the model's own file opened in Excel
+  agree. Sorting on icons reports itself unsupported, and Excel's making a
+  `Range.Sort` the sheet's sort settings is a known gap.
+
+- Colour scales: `FormatConditions.AddColorScale` with two or three
+  colours, the ColorScale, its ColorScaleCriteria and each criterion's
+  Type, Value and FormatColor. A cell's DisplayFormat shows the colour
+  Excel blends for it: numbers alone, the first colour at or below the
+  lowest point and the last at or above the highest, and between them a
+  blend Excel works in doubles, the cell's place as a fraction of the whole
+  span and then of its segment, each channel cut toward zero. The lowest
+  and highest values, numbers, percents, percentiles and formulas serve as
+  points, and colours may be RGB or a theme colour with its tint. A scale
+  is a fill at its priority. The file keeps it as Excel writes it. 29 live
+  layouts, all 246 colours measured, Excel's file read back, and the
+  model's own file opened in Excel agree.
+
+- Data bars: `FormatConditions.AddDatabar` and the Databar, with MinPoint
+  and MaxPoint and their Modify, BarColor, BarFillType, BarBorder,
+  Direction, ShowValue, PercentMin and PercentMax, AxisPosition, AxisColor
+  and NegativeBarFormat, each with Excel's defaults and errors. A bar with
+  ShowValue False hides a number's text. The file keeps a bar as Excel
+  writes it: an Excel 2007 rule while it needs nothing newer, with Excel
+  2010's extension beside it once it does (a length of 0 or 100, a solid
+  fill, a border, a direction, negative bars of their own, an axis, an
+  automatic point), and in the extension alone when a point's formula
+  names another sheet.
+
+- Icon sets: `FormatConditions.AddIconSetCondition`, the IconSetCondition,
+  its IconCriteria and `Workbook.IconSets`, with Excel's 20 sets and their
+  icons, each criterion's Type, Value, Operator and Icon, custom icons,
+  ReverseOrder, ShowIconOnly and PercentileValues. A new set keeps or
+  resets the criteria as Excel does. Stars, triangles, boxes and custom
+  icons go in Excel 2010's extension alone, as Excel writes them.
+
+- A workbook's data bars, icon sets and colour scales in Excel 2010's
+  extension are read with the rest, and kept through a save: a rule keeps
+  its id, a new one takes a new GUID, and one read without an id takes the
+  id Excel makes of its sheet and priority. 248 live layouts, Excel's file
+  read back, that file changed and saved again, and the model's own files
+  opened in Excel agree.
+
+- Conditional formats move with rows, columns and cells inserted and
+  deleted, as Excel moves them. A rule's range shifts, stretches and
+  shrinks as a reference does, takes the inserted lines it copies its
+  formats from, and goes when its cells go. A block a cell shift runs
+  through is cut into Excel's strips, in Excel's order. Formulas, points
+  and references from other sheets follow their cells or become `#REF!`.
+  Where Excel makes a rule anew, after a `#REF!` or a statistical or drawn
+  rule cut as whole lines are, it takes Excel's new priority unless one of
+  its areas moved whole. 303 live layouts, Excel's file read back, that file
+  edited and saved again, and the model's own files opened in Excel agree.
+  What Excel splits, joins or numbers in ways not measured reports itself
+  unsupported.
+
+- Conditional formats read from a workbook without a VBA project are
+  joined as Excel joins them: an area of a cell-value, expression, text,
+  blank, error or date rule that makes one block with an area of an alike
+  rule before it in priority goes to that rule, unless a rule between them
+  covers it. Alike means the same kind, settings and formulas as each rule
+  reads them, and the same fill, font and border, a number format counting
+  only where both have one. Top 10, average, unique, duplicate, colour
+  scale, data bar and icon set rules never join, and a workbook holding a
+  VBA project keeps its rules as the file has them. Saved again, such a
+  workbook's rules are written in Excel's order, joined. 84 live layouts in
+  three file formats, Excel's files saved again, and the model's own file
+  opened in Excel agree.
+
+- A conditional format's number format is numbered and spelled as Excel
+  writes it. A built-in format takes its place in the list Excel's Custom
+  category shows, `0%` 13 where a cell's is 9, and a custom one the next
+  id of the table the cells' formats use, so a rule and a cell holding one
+  code share its id. The file spells the code with every literal escaped,
+  `#,##0\ "kr"`. Excel reads a rule's format by its code alone, whatever
+  id the file gives it: opening a file numbers its rules' custom formats
+  after the cells' own, in the order the file lists its dxfs, one code
+  under one id, and a file saved again holds those ids and Excel's
+  spelling. 88 live layouts, every printable character in four kinds of
+  section, Excel's file opened and saved again, and 11 files numbering and
+  spelling rules' formats as other programs might agree.
+
+- A third sweep of 65 everyday macros agrees with Excel in full: newer
+  worksheet functions, tables, shapes, charts, pivots, workbooks, the Sort
+  object, AutoFilter, hyperlinks, notes, protection, conditional formats,
+  data bars, icon sets, outlines, page setup, number formats and VBA's
+  Format, Split and arrays.
+
+- A worksheet function a macro calls takes a range of another open
+  workbook as that workbook's cells, whichever workbook is active:
+  `WorksheetFunction.Sum(w.Worksheets(1).Range("A1:B2"))`, VLookup, CountIf,
+  Subtotal over its hidden rows, a row Index takes from it, and the same
+  through `Application.Sum`. Two workbooks' sheets of one name stay apart.
+
+- AutoFit, `Range.Text` in narrow columns and the widening a format gives
+  a column work at every font size from 8pt to 72pt, in Aptos Narrow and
+  Calibri, where they took 11pt alone. A text is as wide as GDI makes it at
+  the font's height in pixels, the size times 4/3. A big font adds 2 pixels
+  to the column for every 4 its digits are wider than 5: none to 12pt, 2
+  from 13pt, 22 at 72pt. Italic reaches further by a fifth of the font's
+  ascent, in steps. `Range.Text` keeps the same pixels beside a text. The
+  widths of 191 characters at 86 heights, in both fonts and four styles,
+  are baked from GDI, which gave live Excel's 11pt widths exactly. 35 sizes
+  of 31 texts in each font and style, ten sizes of `Range.Text` at every
+  width and seven of widening agree. Below 8pt Excel draws both fonts in
+  another, which reports itself unsupported.
+
+- Setting `Font.Size` widens a column wherever AutoFit would make it wider
+  for a number one of its cells shows, as a number format does, even to
+  the size the font had; a date written by value widens on it.
+  `Font.Bold` widens nothing.
+
+  A number General shows widens its column too, when General is set on it
+  or its font's size is set. That width is not AutoFit's for the whole
+  number: 1234.5 at 24pt widens to show 1235, 98765.4321 at 18pt to show
+  98765.4. The model leaves such a column as it is, and those cases, out
+  of 12 numbers measured at 6 sizes, are known gaps.
+
+- `Range.Text` in a column too narrow for what a cell shows, as Excel
+  shows it on a 96-DPI display. A number in General loses decimals, then
+  goes to scientific notation, then shows 0 or -0 where it rounds to that;
+  General beside other text, as in `General" kg"`, does the same in what
+  the text leaves. Any other number, a date, a logical or an error fills
+  the column with `#` once it no longer fits. A cell has its column's width
+  less 5 pixels to show its text in, less 9 for each indent level and a
+  little for italic; a merged cell has its columns', and one that shrinks
+  its text shows it all. Text shows whole, unless a section with a fill
+  lays it out. Measured at every width from 2 to 130 pixels in Aptos
+  Narrow and Calibri 11, regular, bold and italic.
+
+- `*` fills: `Range.Text` repeats the fill's character as often as it fits
+  beside the rest, each `_x` counted a space wide, to 255 characters in
+  all. The Comma, Currency and Accounting styles now read as Excel's do,
+  where `Range.Text` refused any fill before. AutoFit counts a fill as
+  nothing, an `_x` as wide as `x` and a `?` with no digit to show as wide
+  as a 0.
+
+- Setting `NumberFormat`, `NumberFormatLocal` or `Style` widens a column
+  wherever AutoFit would make it wider for a number one of the cells now
+  shows, as Excel does, even where the number already shows whole. A
+  column sized by hand or hidden, a merged cell, text, logicals and errors
+  widen nothing, and a column never narrows. A saved file keeps the width
+  with `bestFit="1"`, as AutoFit's.
+
+  What is not measured reports itself or is left: Excel shows a negative
+  number General shows beside a fill as 0 in the five pixels where a digit
+  fits and its sign does not; a hidden column's text depends on what Excel
+  drew there before and is unsupported; in another font `Range.Text` is
+  unsupported where the text may not fit, and a format leaves such a
+  column as it is. A General number without a decimal point is measured by
+  its characters, one with a point by its digits, so `-2E-100` fits where
+  Excel shows it, and a number that rounds to 0 shows 0 until five digits
+  fit.
+
+- Column AutoFit: a column is as wide as Excel makes it for the text its
+  cells show. Each character of ASCII and Latin-1 is as wide as GDI makes it
+  in Aptos Narrow or Calibri 11, in any style, italic reaching a little
+  further. A number in General is a digit wide for each digit, point and
+  exponent sign. The text's width becomes the column's by Excel's rule, at
+  most 255 characters. Hidden and filtered rows count, merged cells and
+  empty text do not, a hidden column is shown, and a file keeps the width
+  with `bestFit="1"`. `Range("A2:A3").Columns.AutoFit` fits the range's
+  cells alone, and `Range("A2:A3").AutoFit` is error 1004. Nearly 14,000
+  live widths, 1,302 random texts, 138 numbers and a saved workbook agree.
+  Text that wraps, is indented or turned, another font and Windows-1252's
+  characters past Latin-1, whose widths GDI makes depend on their
+  neighbours, report themselves unsupported. The Normal
+  style's font now changes between Aptos Narrow 11 and Calibri 11, which
+  make the same digit and row, and `Application.StandardFont` and
+  `StandardFontSize` read Aptos Narrow and 11.
+
+- What-if data tables: `Range.Table` with a row input cell, a column input
+  cell or both, over one block or several. Each cell of a table works out
+  the block's formula with the value it tries put in the input cell and
+  every formula reading the input, on any sheet, worked out again; then
+  everything is put back, an input cell holding a formula included. A
+  blank formula comes to 0. The cells say `=TABLE(,A1)`, are an array to
+  `HasArray`, `FormulaArray` and `CurrentArray`, and hold 0 until first
+  worked out. In semi-automatic calculation they wait for
+  `Application.Calculate` or `Worksheet.Calculate`; `Range.Calculate`
+  does not work them out. Writes, clears, inserts, deletes and cell shifts
+  through a table are refused or ignored as Excel does, with its messages;
+  a table moves whole and its input cells follow, one taken away being
+  `#REF!`. A copy of its cells is their values. A file keeps the table as
+  Excel does, `<f t="dataTable">` on its first cell, and Excel opened the
+  model's files without a repair. 44 live probes and six workbooks agree.
+
+- Circular references and iterative calculation: `Application.Iteration`,
+  `MaxIterations` and `MaxChange`, and `Worksheet.CircularReference`. A loop
+  is found as Excel finds it, through the cells a formula reads as it is
+  worked out, so ROWS, an IF branch not taken or a MATCH that stops at its
+  match closes none. With iteration off, the formula closing a loop is 0,
+  as is any formula reading the loop, and the loop's other cells keep what
+  they hold. With it on, every calculation works the loops out over and
+  over, a sheet at a time in the order the sheets were made and row by row,
+  until no number changes by `MaxChange` or `MaxIterations` passes are done.
+  The settings are saved on `calcPr` and brought by the first workbook
+  opened. 93 live probes, 24 repeated runs and three saved workbooks agree.
+  Excel names either cell of a loop as `CircularReference`, run to run.
+
+- `Workbook.Date1904`: each workbook keeps its own 1900 or 1904 calendar,
+  read from and saved to `workbookPr`. Cells, typing, Value, Text, formulas,
+  Text cells, Find and Replace, AutoFill, TextToColumns, AutoFilter and
+  validation criteria, Evaluate and WorksheetFunction follow it as Excel's
+  do, over 8 native controls and 14 probes. A PivotCache holding dates in a
+  1904 workbook reports itself unsupported.
+
+- The formula engine takes in pyOfficeEditor's work to its commit 4723383:
+  ODDFPRICE, ODDFYIELD, ODDLPRICE and ODDLYIELD, GROUPBY, PIVOTBY and
+  BAHTTEXT, a function passed by name where a LAMBDA goes, YIELD, PMT, IPMT,
+  PPMT, CUMIPMT and CUMPRINC to the bit, and dates and times read from text
+  as Excel reads them over 18,937 measured strings. 501 of Excel's 525
+  functions are there now. 194 odd-coupon cells measured on their own match
+  to the bit but for nine long-first-period yields within 1.6e-11.
+
+- Formulas read a closed linked workbook from the copy of its cells and
+  names the file keeps, `[1]Sheet1!A1` and `[1]!Rate`, a 3D range across
+  its sheets among them. Range.Formula shows the link as the path of the
+  workbook it points at, a macro may name it by that path or its file's
+  name, and calculation, full calculation and a row put in follow Excel
+  over 19 measured formulas and pyOfficeEditor's 25 cases. Saving keeps
+  the link's parts. A formula naming a workbook the file has no link to
+  is reported unsupported.
+
+- 3D references, `Jan:Mar!A1`, work out as Excel's do over 277 measured
+  formulas, every function that takes a range among them: alone, with an
+  operator or behind `@` they are #REF!; 62 functions read every sheet,
+  SUM to NPV, CONCAT and TOCOL; 41 that take an array give #REF!; any
+  other function given one gives #VALUE!. VSTACK, HSTACK, TOCOL and TOROW
+  take each area of a union or a 3D reference in turn. Excel writes the
+  pair first sheet to last, and reads `Q1:Q4!A1` and `(ThreeA:ThreeB!A1)`
+  otherwise, which the model follows.
+
+- A formula's cell takes the format Excel gives the financial functions:
+  DB, DDB, FV, IPMT, NPV, PMT, PPMT, PV, SLN, SYD and VDB the currency
+  format, so the cell's Value is a Currency, and IRR, MIRR and RATE 0%.
+  Every one of the engine's 501 functions was written alone to a General
+  cell in Excel to find them.
+
+- A sheet's name in a formula is quoted as Excel quotes it, over 100
+  measured names and pyOfficeEditor's tables of the characters past ASCII
+  Excel quotes for: plain names in any script, full stops included, are
+  bare, and read back bare, while names like cells (`'Q4'`), R1C1 rows and
+  columns (`'R2'`, `'C1A'`) and logicals are in apostrophes.
+
+- `Application.ReferenceStyle`, `International`, `DecimalSeparator`,
+  `ThousandsSeparator` and `UseSystemSeparators`, as Excel answers them in
+  en-US. In the R1C1 style Evaluate reads R1C1 references, and a workbook
+  saved in it keeps `refMode` on calcPr. A sweep of 77 everyday macros now
+  agrees with Excel throughout.
+
+- VBA PivotTable.GetPivotData returns the matching displayed cell as a Range,
+  with fourteen optional field/item pairs, named arguments, native defaults
+  and error 1004 for invalid selections. Native controls include grouped,
+  filtered and renamed reports, Currency/Decimal selectors, sparse arguments
+  and trailing Null pairs. Fresh PivotTable proxies reuse report metadata.
+
+- GETPIVOTDATA reads displayed cached PivotTable results, including multiple
+  row/column fields, subtotals and suppressed totals, page filters, renamed
+  fields/items, manual groups, numeric bins and grouped dates. Native controls
+  cover cells, Evaluate, legacy/CSE/dynamic arrays, defined names and formula
+  text. Report metadata is reused while result cells are read afresh. The
+  implementation distinguishes reference arguments, conflicting selectors,
+  error precedence and Evaluate's handling of INDIRECT references; Formula2
+  preserves array evaluation even where its text matches a legacy formula.
+
+- Imported Excel PivotTables now expose table/cache collections, source and
+  cache metadata, report ranges, field collections and cached PivotItems to
+  in-memory VBA. Native fixtures cover row, column and page reports, multiple
+  data fields (including the synthetic Values field), and shared caches.
+  Original pivot/cache parts remain byte-identical through unrelated cell
+  edits and saves. Creation, refresh, layout mutation, grouping and full
+  multi-axis field ranges remain unsupported; this does not recalculate a
+  pivot report from changed source cells.
+
+### Fixed
+
+- `CDbl`, `CDec`, `IsNumeric` and `CDate` refuse full-width and other
+  non-ASCII digits, as en-US VBA does. They read `CDbl("１２")` as 12.
+
+- Text with full-width digits typed into a cell stays text, as Excel
+  keeps `１２`. It became the number 12.
+
+- Cells show `aaa` and `aaaa` as the day's name, `[$-411]ggge` as the
+  Japanese era and year, and `ggge` without the tag as the year alone,
+  as en-US Excel does. `[$-F800]` and `[$-x-sysdate]` show the system's
+  long date, `Monday, January 5, 2026`. NumberFormat keeps `aaa` and
+  spells `[$-ja-JP]` as `[$-411]`. A cell formatted `\$#,##0` reads
+  back as a Double, not a Currency. The live cases are in
+  `tests/fixtures/excel_locale_live.json`.
+
+- `ListObjects.Add` over a header row alone reports itself unsupported.
+  It made a one-row table. Excel adds an empty insert row under the
+  header that ListRows does not count, which the model does not hold.
+
+- Sorting text with a combining mark after a hyphen, a control character
+  or a character Windows ignores, or with marks whose diacritic weights
+  pass 255, reports itself unsupported. Excel orders such text as
+  Windows' CompareString does, inconsistently in the first case, and the
+  model ordered it by sort key. A Windows test of 20,000 random pairs
+  found one now and then.
+
+- `ReDim a(1 To 0)` is error 9, as in VBA, for any dimension whose upper
+  bound is below its lower bound, with Preserve or without. It made an
+  empty array (#255).
+
+- A variable holding a deleted sheet fails as Excel's does. Each member
+  is error -2147221080, "Method 'Rows' of object '_Worksheet' failed",
+  and a range or PageSetup taken from the sheet is error 424. It went on
+  answering, and read a new sheet given the old name (#246).
+
+- `docs/excel_checklist.csv` counts the events the model raises: 29 of
+  Application's, Workbook's and Worksheet's, Change, Calculate, Open,
+  BeforeSave and the rest, which it listed as missing because no member
+  holds an event. The model declares them as `raised_events`, which the
+  checklist builder and its test read.
+
+- `Names.Add` takes and refuses the names Excel does. It refused `a?b`,
+  and took `R1C1_`, `C1R1`, `R1x` and `RC1C`, which Excel refuses as
+  names that start like an R1C1 reference. 324 live names agree,
+  `tests/fixtures/name_validity.json`.
+
+- `Application.Intersect` keeps every area. It read only the first area
+  of each range, so `A1:A3,C1:C3` with `A1:C10` gave `A1:A3`. Pieces
+  that make a rectangle together are joined, as in Excel (#257).
+
+- `Range.Formula2` no longer puts an @ before a reference to one cell of
+  another workbook. The colon of the path's drive, `C:\`, was read as a
+  reference across sheets.
+
+- A defined name that reads a deleted sheet or a broken link saves each
+  reference it lost as `#REF!`, and a name read from a file shows each
+  `#REF!` as `#REF!#REF!`, as Excel's do: `=#REF!$A$1:$B$3*2` saves as
+  `#REF!*2` and reads back `=#REF!#REF!*2`. `Name.RefersTo` shows a
+  name that reads a linked workbook by that workbook's path.
+
+- `Application.Caller` in a VBA Function an array formula calls answers
+  the array's whole block, as Excel's does. Excel works such a function
+  out once for the whole block; the model answered the block's first
+  cell.
+
+- `Range.TextToColumns` splits at the delimiters the session last used
+  where a macro leaves them out, as Excel does: a tab in a new session,
+  or what an earlier TextToColumns or OpenText named. The model split at
+  none. A fixed-width field also loses the spaces round it now. Given
+  other separators, a field that does not read with them stays text:
+  `234.5` where `.` separates thousands. Before, the model read such a
+  field with `.` as the decimal point.
+
+- A UserForm is reported with `VBAUnsupportedError`, as the README
+  promises for what the interpreter does not run. `Load frmTest` and
+  `Unload frmTest` were error 35, and `frmTest.Show` or a property of the
+  form error 424, both of which `On Error` could trap (#251).
+
+- Typing reads a percent sign before a number, `%5` as 5%, and a euro
+  sign before or after one, `€5` and `5 €` as 5, as Excel does; a
+  percent of an exponent, `1e2%`, keeps the scientific format, and of a
+  whole part and a fraction, `1 1/2%`, shows as 1.50%. The model left
+  all of them text. Typed into a cell a euro amount brings no format;
+  read from a file or by TextToColumns it brings Excel's euro format.
+  60 amounts typed into cells, read by TextToColumns and read from a
+  file agree, `tests/fixtures/text_files.json`.
+
+- `Workbooks.Open` of a file that is not there, or of one that is no
+  workbook, raises Excel's error 1004 with Excel's message, which
+  `On Error` traps. The model raised an error of its own that VBA could
+  not trap.
+
+- A cell's rich text survives a save of its sheet. The model read only
+  the text of a string Excel saved in runs of fonts, so a sheet it wrote
+  again kept the cell in its first font alone.
+
+- AutoFit that finds the width a column already shows changes nothing,
+  as in Excel. The model gave the column that width as its own with best
+  fit, so a standard column stopped following the sheet's StandardWidth
+  and a file kept a column record Excel leaves out. 20 live answers and
+  the columns Excel saved agree, `tests/fixtures/autofit_unchanged.json`.
+
+- A form or control caption beyond U+00FF, such as Japanese, set over a
+  caption already stored compressed now saves as UTF-16. It kept the
+  compression, so a new control's `Caption` of 実行 showed as `??` or
+  garbled text in Excel (#247).
+
+- A file whose calcId is below 191028, or that has none or asks for
+  fullCalcOnLoad, is worked out in full as it opens, as Excel works it
+  out; under manual calculation it keeps the file's values until the
+  next Calculate. The model took every value the file kept, so a file
+  another program wrote with values out of date read them. A save
+  writes the workbook's calcId, 191029 once it is worked out so.
+
+- Adding, redefining or deleting a defined name works out again only
+  the formulas that name it, as Excel does, and a name's Comment or
+  Visible works nothing out. The model worked out every formula of the
+  workbook after any change to a name, a VBA Function among them.
+
+- Sorting or filtering text with a combining mark before anything word
+  sort weighs, after only a control character or a hyphen, reports
+  itself unsupported, as text that begins with a mark already did.
+  Windows' CompareString, which orders Excel's text, orders such text
+  otherwise than its sort key, and the model ordered it by the key. The
+  random comparison with CompareStringEx in
+  `tests/test_excel_sort_text.py` found it in one run in twenty.
+
+- A function's name written with no bracket after it reads back in
+  capitals, `=sum` as `=SUM`, as Excel spells it; the model kept the
+  case it was written in. Where a range, an intersection or a union
+  wants cells, Excel refuses one, `=SUM (A1)` or `=SUM:A1`, and so does
+  the model now, with error 1004, over 7 live formulas in
+  `tests/fixtures/formula_spelling.json`.
+
+- Clearing whole rows after `Cells.Font.Name` or another whole-sheet
+  format no longer runs out of memory. The model gave every position of
+  every cleared row a cell of its own. Excel gives each row a format of
+  the default when three columns or more carry a format, and clearing to
+  the last row moves the columns' formats onto the rows above (#256).
+
+- `Application.StatusBar` reads False, a Boolean, until a macro sets it,
+  as Excel's does; the model read the text FALSE from the start. Once a
+  macro sets it, it reads as text as before.
+
+- An `Optional` parameter typed by `As` or a type character compiles
+  without a default, as in VBA, where the model refused it:
+  `Sub Report(Optional rows As Long)` now runs, `rows` holding 0 when
+  it is left out. One a `DefType` types with no default and an optional
+  array are compile errors with VBA's message, and a fixed-length String
+  parameter is the compile error VBA gives it, over 29 live
+  declarations, `tests/fixtures/vba_semantics/optional_types.json`.
+
+- `Application.Wait` moves a frozen clock on to the time it waits for,
+  so `Now` reads that time after it. Under the real clock it still
+  returns at once.
+
+- Deleting a sheet rewrites the formulas and names that read it as
+  Excel does: `=Two!A1+1` becomes `=#REF!A1+1`, and a name's
+  `=Two!$A$1` becomes `=#REF!$A$1`. The model left them reading a
+  sheet that was gone. Deleting another sheet now leaves the active
+  sheet active; the model held the active sheet by its place, so
+  deleting a sheet before it made the next one active. Deleting or
+  hiding the active sheet makes the next visible sheet after it
+  active, or the last visible one before it, and deleting or hiding
+  the last visible sheet is error 1004, as in Excel. A conditional
+  format, validation, link, control or chart that reads a deleted
+  sheet reports itself unsupported. Measured in
+  `tests/fixtures/sheet_groups.json`.
+
+- The VBA in issue reports #249, #253, #254, #258, #259, #260 and #261
+  answers as live Excel does, and a test now holds it so. Each was wrong
+  in 6.5.0: Variant comparisons of a number with text, a Function
+  `As Long()`, a `ByVal` array, `&HFF01&`, the `Mid` statement, `Value`
+  of a block past the used range, and a formula read under manual
+  calculation.
+
+- Sheet names and defined names beyond ASCII are kept apart and found
+  as Excel does. Excel compares them by Windows' word sort, case aside,
+  in two ways. A sheet's name must differ from every other sheet's, and
+  a formula's sheet is found, where the two are as long as each other
+  and word sort cannot tell them apart: a Kelvin sign is a K and a final
+  sigma a sigma, while `aesop` can stand beside `Æsop`.
+  `Worksheets(...)` and `Sheets(...)` find the first sheet in tab order
+  that word sort alone cannot tell from the name, so
+  `Worksheets("AESOP")` is `Æsop` even beside `aesop`. Defined names
+  compare by word sort alone. `Names.Add "aesop"` redefines `Æsop` and
+  keeps its spelling, while `ÉCLAIR` replaces `éclair` and its spelling
+  too. `Names("AESOP")` and `=AESOP` in a formula both reach `Æsop`.
+  The model compared names by Python's lower case or casefold, which
+  keeps the ash apart from ae and joins a long s to an s. 25 sheets, 27
+  names and 17 pairs of spellings agree,
+  `tests/fixtures/name_equality.json`.
+
+- A formula may call a name that starts like a cell and goes on past
+  ASCII, such as `=f1é`, or a name holding the micro sign or an ordinal
+  indicator. The model read `f1é` as the cell F1 and a stray letter, and
+  refused the formula with error 1004.
+
+- A defined name may hold a combining accent after its first character,
+  as in Excel. The model refused one with error 1004.
+
+- Cell styles named beyond ASCII are told apart as Excel tells them. A
+  name is another style's in any case, and in any spelling Windows' word
+  sort cannot tell from it: `Styles("AESOP")` finds `Æsop`, and
+  `Styles.Add "oeuvre"` is error 1004 where `œuvre` exists. An accent
+  makes another name. The Styles collection lists the names, and a save
+  writes them, in word sort's order. The model matched names by
+  Python's casefold, which keeps ae apart from the ligature, and a style
+  named beyond ASCII stopped the collection being listed or added to.
+  38 live names and 19 lookups agree, `tests/fixtures/style_order.json`.
+
+- `Option Compare Text` takes effect. The model compared as binary
+  whatever a module said, so `"a" = "A"` was False there, and `Like`,
+  `Select Case` and `InStr` or `StrComp` without a Compare were too.
+
+- A text comparison ignores kana type and width, as VBA's does:
+  `StrComp` with `vbTextCompare`, and `=` or `<` under `Option Compare
+  Text`, take あ as ア, ａ as a and ｶﾞ as ガ. `InStr`, `Like`, `Replace`,
+  `Split` and a Dictionary still tell them apart, as in Excel (#252).
+
+- `Val` reads ASCII digits only, as VBA does. It read full-width digits,
+  `inf` and `1_000` as numbers (#252).
+
+- `ListObject.Name` takes any text, and `DisplayName` follows the
+  defined-name rules, beyond ASCII too, as in Excel. A non-ASCII name
+  such as 明細 was refused. Setting `Name` to `a b` keeps it as the
+  table's name and makes its DisplayName `a_b` (#252).
+
+- Opening a workbook that holds a chart sheet, a dialog sheet or an
+  Excel 4 macro sheet reports itself unsupported. The model holds
+  worksheets alone. It read a chart sheet's part as a worksheet's and
+  stopped with a ValueError about its namespace.
+
+- A defined name beyond ASCII takes the place Excel gives it in the
+  Names collection, in workbook.xml and among the named ranges app.xml
+  lists: `eclair` before `éclair`, beside it, by Windows' word sort. The
+  model put such a name after the ASCII ones, by its characters.
+
+- `Workbooks.Add(xlWBATWorksheet)` names its workbook Sheet and the next
+  of its own numbers, `Sheet1`, as Excel does, apart from the Book
+  numbers a workbook with no template takes; neither number is taken
+  back when a workbook closes. The model named every new workbook Book.
+
+- A Date with part of a second rounds to the second as VBA rounds it,
+  in `CStr`, `Format`, `Hour`, `Minute` and `Second` alike. VBA goes
+  through oleaut32's VariantTimeToSystemTime. It adds half a second to
+  the serial away from zero and cuts the days, then the seconds, from
+  what that leaves. A time before day zero that rounds past midnight
+  takes the next day. A time on 9999-12-31 is cut rather than rounded.
+  The model rounded the part of a day half to even, so `0.5 / 86400`
+  showed `12:00:00 AM` where VBA shows `12:00:01 AM`, and a time on the
+  last day of 9999 could show a second late. Measured against
+  oleaut32 on 7,013 serials, `tests/fixtures/variant_time.json`; the
+  last 11 of the 152 live time-rounding cases now agree.
+
+- `MsgBox` with no answer queued comes back with the button
+  `vbDefaultButton2`, `3` or `4` names, as Windows' message box answers
+  Enter. It always came back with the first button, so
+  `vbYesNo + vbDefaultButton2` answered Yes (#250).
+
+- A Date may fall on 100-01-01 after midnight: -657434.5 is
+  `1/1/100 12:00:00 PM`, as in VBA, where the model raised error 6 for
+  any serial below -657434.
+
+- A defined name holding a backslash saves as it is. `a\b` was written
+  as `a` and a backspace, which the model could not read back: the
+  names went into workbook.xml as a regular expression's replacement.
+
+- An xlsx the model makes declares no bin parts in [Content_Types].xml,
+  as Excel's own does. The macro-enabled template it starts from kept
+  its vbaProject Default.
+
+- `Names.Add` takes a structured reference as Excel does. Excel
+  refuses a name's A1 formula that names one column of a table on the
+  sheet the name is read on: `=Sales[Qty]` or `=SUM(Sales[Qty])` is
+  "There's a problem with this formula", and `=Sales[@Qty]` is "The
+  syntax of this name isn't correct". That sheet is the active one for
+  the workbook's Names and the sheet itself for a sheet's. The whole
+  table, `[#All]`, `[#Data]`, `[[#Headers],[Qty]]` and a span of
+  columns go in, as does any of them from another sheet. The model
+  refused every structured reference in RefersTo.
+
+- An unqualified name added to the workbook's Names changes the active
+  sheet's own name of it where there is one, as in Excel. The model
+  added a workbook name beside it.
+
+- `Names("Twin")` finds a name as Excel does. A sheet's Names find only
+  the sheet's own. The workbook's find the first sheet's own before the
+  workbook's, whichever sheet is active, and never another sheet's.
+  Where there is none it is error 1004, Application-defined or
+  object-defined error. The model looked on the active sheet first.
+  `Name.Parent` is the sheet of a sheet's own name, and a name Excel
+  will not take, a cell's address among them, raises Excel's own
+  message.
+
+- `Names.Add` spells a sheet in RefersTo as Excel does, quoted only
+  where it has to be: `='Data'!$C$2` reads back `=Data!$C$2`.
+
+- `Outline.SummaryRow` set on a sheet whose file had no `outlinePr`
+  wrote `<outlinePr  summaryBelow="0"/>` with two spaces; it is written
+  as Excel writes it.
+
+- Inserting or deleting whole rows or columns no longer reads every
+  formula of the workbook's other sheets, only those that name the sheet
+  edited, so a workbook of many formulas edits faster.
+
+- A new workbook saved as xlsx no longer gives its first sheet the
+  template's code name, which Excel's own xlsx leaves out. A tint whose
+  15 digits end in a zero is written with 17, as Excel writes
+  `-0.50007629627368999`.
+
+- Sheets raise Calculate in the order they were made, whatever the
+  order of their tabs, as in Excel: for `Application.Calculate`, an
+  edit, `Worksheet.Calculate` and a pivot refresh alike. A workbook
+  numbers each sheet it makes, a deleted sheet's number goes to no
+  other, and a save writes the numbers as each sheet's `sheetId`, so a
+  file opened again keeps the order. The model raised them in tab order
+  and numbered sheets by their tabs, so a sheet `Worksheets.Add` put
+  first was saved as sheet 1.
+
+- A pivot refresh ends with the calculation Excel does after one. The
+  formulas reading the tables and volatile formulas are worked out, and
+  every sheet that worked one out or holds a notification from formulas
+  written while events were off raises Calculate. `RefreshAll` does it
+  once, after all its caches, and manual calculation not at all. The
+  model raised one Calculate on the source's sheet. The Calculate a
+  refresh raises for each table's sheet no longer uses up the
+  notification that sheet holds.
+
+- A pivot cache saves as Excel saves it. A field lists its shared items
+  only where a table of the cache lists items for it, a field it puts on
+  its rows, columns or page area; the other fields' values go in the
+  records themselves. A field's sharedItems carries only the attributes
+  that differ from the schema's defaults, in the schema's order, and its
+  count only where it lists items, and numbers are spelled as Excel
+  spells them, `1000` and not `1000.0`. The model listed every field's
+  values, wrote every attribute and spelled whole numbers with a point.
+  Every cache of 715 tables the fixtures replay, its fields and its
+  records, is now Excel's own, and Excel reads the model's caches as its
+  own.
+
+- A pivot table made without a name is `PivotTable` and the next number
+  of one count through the session, as in Excel, whatever workbook it is
+  in and whatever was closed or opened before, stepping past a name the
+  sheet's own tables have in any case. The model took the lowest number
+  no table in the workbook had. Two sheets' tables may share a name, as
+  in Excel; the model refused a name any table in the workbook had.
+
+- A page field added to a pivot table with no room above it moves the
+  table down until the page fields fit with a blank row under them, as
+  in Excel. The model raised error 1004. Taking page fields away leaves
+  the table where it is.
+
+- A pivot page field showing a number or a date shows it aligned left,
+  as Excel does in every form of table. The model left it unaligned.
+
+- A sheet's relationships to the pivot tables the model adds are saved
+  in the order Office writes a part's relationships.
+
+- A pivot table's standard deviations and variances are Excel's to the
+  last bit. A sample's comes from the sum of the squares less the square
+  of the sum over the count, and a whole population's from the count
+  times the sum of the squares less the square of the sum, over the
+  count squared, neither below 0. The model worked them out in two
+  passes, which keep digits Excel loses: 100000001, 100000002 and
+  100000003 came to a deviation of 1 where Excel's is 0, and a total of
+  2, 5, 8, 5 and 6 to a variance of 4.7 where Excel's is
+  4.700000000000003.
+
+- A pivot cache over a field of numbers with a blank cell is one Excel
+  opens. The model declared such a field not semi-mixed, and Excel
+  refused the whole workbook.
+
+- A pivot cache's latest date is the latest moment where it has a time,
+  as in Excel. The model wrote the midnight after its day.
+
+- A pivot data field that sums its values leaves `subtotal="sum"` out of
+  the file, the schema's default, as Excel's files do. The model wrote it.
+
+- A pivot cache made from source text naming a sheet, such as the
+  `"data!R1C1:R13C3"` a recorded macro gives `PivotCaches.Create`, reads
+  that sheet whichever sheet is active. The model read the active sheet
+  and refused CreatePivotTable from any other. A sheet also renames while
+  such a cache is in the workbook; the model refused every rename once
+  the cache had a report, reading the R1C1 text as an A1 formula.
+
+- `Set` with a value that is not an object is error 424, Object required,
+  into an object variable, and error 13, Type mismatch, into a Variant,
+  as VBA has them. The model raised error 438 for both. Four probes in
+  live Excel agree.
+
+- A workbook whose parts spell SpreadsheetML's namespace under a prefix,
+  `<x:worksheet xmlns:x="...">` where Excel writes `<worksheet
+  xmlns="...">`, opens with its sheets and saves. Excel reads such a
+  workbook as the same workbook spelled its own way, and saves every part
+  so but a pivot cache's records; the model now spells the parts again as
+  it opens the file. It found no sheets in such a workbook and could not
+  save it, and wrote a stylesheet so spelled, whenever it wrote the
+  stylesheet, with its fonts, fills and borders outside it. Seven copies
+  of workbooks Excel saved read and save as the workbooks they were made
+  from, and Excel reads the model's saves of them.
+
+- A pivot table the model makes is saved with SpreadsheetML's namespace
+  the default and the relationship id as `r:id`, as Excel writes its
+  cache, records and table parts. The model wrote them under prefixes of
+  its own, `ns0:` and `ns1:`.
+
+- `FormatCondition.Delete` on a rule a range's FormatConditions reached
+  takes that range's cells out of the rule, as Excel does, rather than
+  deleting the whole rule: `Range("A1").FormatConditions(1).Delete` on a
+  rule over A1:A3 leaves it over A2:A3. The rule keeps its priority and
+  its dxf, its first formula moving to the first cell left, and goes only
+  when the range holds all of it. 22 live layouts agree, through a cell,
+  a block, a hole, one area of two and a second rule, on cell rules,
+  expressions, a top 10, a colour scale and a data bar, and Excel reads
+  the model's saves of them as it reads its own.
+
+- A save keeps the dxf of a rule a macro took away by a Delete,
+  ClearFormats, Clear or a paste, where the rule's was, as Excel's saves
+  do until the workbook is opened again. A rule that goes with its rows
+  or its sheet takes its dxf with it, as does a format a new one replaces.
+  The model left out every dxf nothing named. 16 files Excel saved agree,
+  a rule made in the session or read from a file, saved once or twice and
+  opened again, and Excel reads the model's saves of them as its own.
+
+- Excel's editor adds a module to a project this saved, however many
+  sheets it has. A storage's entries form a red-black tree, and the writer
+  left every entry it placed red. Windows refuses to add to a tree with
+  runs of red entries, so once a macro had added about 65 sheets,
+  `VBComponents.Add` on the saved file failed with "Device I/O error".
+  Every tree the writer builds is now coloured as the format requires, and
+  a save mends a tree with a red entry under a red one, as earlier versions
+  wrote them. A tree Word or PowerPoint wrote is kept as it was. Excel
+  added modules at 66, 100 and 255 sheets, and Windows' own storage code
+  added, renamed and deleted streams at every count from 0 to 300.
+
+- Conditional formats are written as Excel writes them: a new rule's
+  `conditionalFormatting` under no prefix of the model's own (it was
+  `ns0:conditionalFormatting`), a changed rule's without the worksheet's
+  namespaces declared on it again, and each `cfRule`'s attributes in the
+  schema's order.
+
+- A rule a macro adds to a range a loaded workbook already formats joins
+  that range's `conditionalFormatting`, after the rules the file held, as
+  Excel adds it. The model wrote a second element for the same range.
+
+- A colour scale criterion's Type and Value follow Excel. Made a number,
+  its value is 0; a percent, its share of the way, 0, 50 or 100; a
+  percentile, 10, 50 or 90; a formula keeps the value. The lowest and the
+  highest belong to the ends, error 5 elsewhere. A Value given as text is a
+  formula, "40" reading back as "=40" until the file is opened again and
+  "abc" a string, where the model took it as a number or refused it. A
+  formula naming the scale's own sheet loses the sheet's name. A scale
+  whose formula names another sheet goes in Excel 2010's extension alone,
+  as Excel keeps it. A formula point that answers text leaves the scale
+  colouring nothing, its lowest and highest reading 0. `FormatColor.Color`
+  is a Long, as Excel's is.
+
+- Renaming a sheet reports itself unsupported where a colour scale's, data
+  bar's or icon set's point formula would need rewriting. The model checked
+  a rule's own formulas alone and left a point's naming the old sheet.
+
+- A whole-column conditional format is saved as `B1:B1048576` and a
+  whole-row one as `A2:XFD2`, as Excel saves them. The model wrote `B:B`.
+
+- A colour scale's or data bar's point reading `#REF!` stays in the
+  Excel 2007 rule. The model took the `!` for a sheet's name and moved the
+  rule into Excel 2010's extension.
+
+- Conditional formats read from a file show their areas in Excel's order:
+  a rule a formula decides by each area's top row, then its bottom, then
+  its left column; a colour scale, data bar or icon set in the file's
+  order, as top 10, average and unique rules already did.
+
+- A colour scale's lowest and highest points read 0 until the scale has
+  coloured a cell, as Excel's do, in a session and in a file just opened.
+
+- A conditional format's file follows Excel's spelling: StopIfTrue set to
+  False leaves `stopIfTrue` out, where the model wrote `stopIfTrue="0"`; a
+  font's flags come in the schema's order, one that is on written bare,
+  `<b/>`; a number format names its id before its code; and a border given
+  a line and no colour takes the automatic one, `<color auto="1"/>`.
+
+- NumberFormat, a cell's and a conditional format's, refuses with error
+  1004 the codes Excel refuses. A section may not mix a number's, a date's
+  and text's characters, `0 m` and `@0`; a text section comes last and a
+  fourth section is text; a bracket must be closed and Excel's; a fill, a
+  skip or an escape needs a character after it; and `E` outside an
+  exponent and `N` are refused anywhere. An accented letter is read as the
+  letter under its accent, so `dÝm` reads `dyym` and `0é` is refused. The
+  model took them all. 664 printable characters in four kinds of section
+  and 330 whole codes agree, for a cell and a rule alike.
+
+- NumberFormat reads back three codes as Excel rewrites them: `[Red]` as
+  `[Red]General`, `[>0]0` as `[>0]0;General` and `;@` as `;;;@`.
+
+- A sheet added to a workbook opened from a file is listed in
+  xl/workbook.xml with its name first, `<sheet name=".." sheetId=".."
+  r:id=".."/>`, as Excel lists one. The model put the name last.
+
+- Saving a workbook opened from a file numbers its own number formats as
+  Excel does, though no macro changed a format. Opening the file, Excel
+  gives every format it lists the next id from 164, in the order it lists
+  them: one nothing uses takes an id too, one code listed twice takes one,
+  and a built-in id over another code or an id below 164 is a custom
+  format like the rest. A save writes them under those ids, spelled as
+  Excel spells them, and leaves out those nothing names; a pivot table's
+  formats follow. The model kept the file's ids and spelling where nothing
+  changed the stylesheet. 11 files Excel opened and saved unchanged agree,
+  and Excel reads the model's saves of them as it read the files.
+
+- A pivot table's NumberFormat reads the format its id names in a file
+  whose formats Excel numbers afresh. The model read the file's id against
+  Excel's numbering, the wrong format or none.
+
+- Saving a workbook opened from a file writes its stylesheet as Excel
+  does though no macro changed a format: what is in use and nothing else.
+  An xf no cell, row or column uses is left out, with the fonts, fills,
+  borders and number formats only it named; an xf alike to an earlier one
+  is joined to it, whatever its apply flags; a built-in style nothing uses
+  is left out; and every cell, row and column points where its xf went. A
+  font no xf names stays, as Excel keeps the fonts a form control's label
+  and a note's text are in. The model kept such a stylesheet as the file
+  had it. 12 files Excel saved unchanged agree, and Excel reads the
+  model's saves of them as it read the files.
+
+- A save writes the dxfs as Excel does. Excel keeps them as a stack: a
+  dxf made for a rule, a sort or a filter goes first, and a save writes
+  them from the first down and leaves out those nothing names. A format a
+  macro gives a rule is a new dxf, first, though another rule's says the
+  same, and the one it had goes. Opening a file, each name of a dxf takes
+  one of its own, so two rules naming one dxf are saved with two. Excel
+  reads the names in a fixed order: the table styles; each sheet, the
+  active one first, with its filter's and sort's colours, its tables and
+  its pivot tables; then every sheet's conditional formats by priority.
+  Every part names its dxfs where the save wrote them, and a rule kept in
+  the worksheet's Excel 2010 extension has its number format numbered
+  with the rest. The model kept the file's dxfs as they stood and put a
+  new one last. 13 files Excel saved unchanged and two it edited agree,
+  and Excel reads the model's saves as it read its own.
+
+- A pivot table field's button stays on its cells through a save. Its xf,
+  alike to the default one in every other part, kept `pivotButton` only
+  while no macro changed a format; a save that wrote the stylesheet joined
+  it to the default xf and dropped the button.
+
+- `Sort.Apply` with no range or no field sorts nothing and raises no
+  error, as Excel does. The model raised error 1004.
+
+- A sheet's saved sort settings keep the rows sorted, under the header
+  when the Sort object was given xlYes, as Excel saves them. The model
+  kept the header row in, so a sort read back from the file sorted it in
+  with the data. Each sort condition's attributes come in Excel's order.
+
+- A new dxf, a conditional format's or a sort's, is written into
+  styles.xml as Excel writes it, `<dxf>` in the stylesheet's own
+  namespace. The model wrote it under a prefix of its own, `ns0:dxf`.
+
+- A sheet whose own AutoFilter has criteria is saved with
+  `filterMode="1"` on its sheetPr, as Excel saves it. The model wrote it
+  for an AdvancedFilter alone.
+
+- `Application.StatusBar` reads back a String, as Excel's does: `FALSE`
+  while Excel has the status bar, `TRUE` after it is set to True, and a
+  number as its text.
+
+- `Hidden` on the rows or columns `EntireRow` or `EntireColumn` makes of
+  cells in several areas hides or shows each of them, and reads the first
+  area's, so `Range("A3,A5").EntireRow.Hidden = True` hides rows 3 and 5.
+  Rows of several areas that an address or `Union` names stay error 1004
+  to read or write, as in Excel.
+
+- A value past 32,767 characters is cut to that, as Excel cuts what a macro
+  writes to a cell, with no error.
+
+- A cell whose format has an `@` and no section showing digits or a date is
+  a Text cell, as Excel makes it: `"x"@`, `@" kg"`, `@*-`, `;;;@` and
+  `General;;;@` keep a formula, or a string that would read as a number or
+  a date, as the text written, where only `@` did. `0;@`,
+  `General;0;0;@`, `m/d/yyyy;;;@` and the Comma style do not. A Currency
+  written to one shows as text and the cell keeps its format; only `@`
+  itself gives way to the Currency's. 50 formats under 11 writes agree.
+  Excel refuses `@;@`, `[>5]@` and `mm/dd @` as formats and rewrites `;@`
+  as `;;;@` and `0;0;@` as `0;0;0;@`, which the model does not yet.
+
+- `Range.Rows` and `Range.Columns` answer a range, as Excel's do, not a list
+  of rows or columns: every Range member works on them, so
+  `UsedRange.Columns.ColumnWidth`, `.Rows.Hidden` and `.Columns.Font` act on
+  the cells. Count is the first area's rows or columns, an index a row or a
+  column counted from the first, a second index error 1004, and For Each
+  walks every area's. Offset, Resize and a row or column taken from one stay
+  rows or columns, so `Columns(2)(3)` is the column two to the right; Cells,
+  Areas, Union, Intersect and the selection are cells again. A range of
+  whole rows or columns follows the same rules, `Columns("A:C")(2)` being
+  column B. `Rows("1:2,5:5")` is a type mismatch. 79 live probes agree.
+
+- AutoFill by months from a single date that ends its month carries on
+  through month ends, 2/29 then 3/31 and 4/30, as Excel does.
+- A TextToColumns date column reads a colon as a separator, so `12:30` in an
+  MDY column is 30 December; `FieldInfo:=Array(1, xlMDYFormat)` is one pair.
+- `EDATE(0,1)` is 31, not 32.
+- Range.Formula takes `#REF!` where a function wants a reference, and the
+  function hands the error on, as Excel does: `=COUNTIF(#REF!,1)` is #REF!.
+- In a formula written with Range.Formula, `INDEX(TRANSPOSE(A1:A3),1,2)` is
+  #VALUE! in a row the range does not reach.
+- `Worksheet.Range` given cells, a reference or a name on another sheet, and
+  `Union` or `Intersect` of ranges on two sheets, are error 1004 as in
+  Excel; `Application.Range` still takes another sheet's cells.
+
+- The in-memory VBA library implements Rate, IRR, MIRR, NPV, IPmt and PPmt,
+  including typed Double arrays, named/optional arguments, convergence errors
+  and financial return-type checking. NPV retains extended register precision;
+  IRR and Rate use VBA-specific iteration rather than worksheet convergence.
+  Existing Pmt/FV/PV/NPer timing arguments use Long coercion, and zero-period
+  Pmt raises error 5. A 263-case native corpus covers numeric and compiler
+  behavior, with model/native XLSM and worksheet-UDF persistence checks.
+
+- Known VBA calls reject missing, excess, duplicate and invalid named
+  arguments before the selected caller executes, with measured ByRef type
+  compatibility and typed array arguments. Late-bound calls retain runtime
+  errors. Parameterless functions can apply arguments to returned default
+  members; empty-parenthesis recursion and named property indices also work.
+  A 268-case native matrix covers binding, coercion, ParamArray, constants, deferred
+  unused routines and deep member chains; memoized type resolution bounds
+  compilation work. Full host/library signatures and interface typing remain
+  incremental.
+
+- VBA declarations reject a type character combined with an As clause,
+  including procedure, parameter and Declare headers. Invalid local
+  declarations stay deferred in unused routines. Typed function and member
+  references validate against their declared type, including enum identity
+  and fixed strings; implicit type conflicts fail before body execution.
+  Typed member dispatch preserves ByRef storage and property setters while
+  late-bound suffixes are ignored. Literal CallByName names remain exact.
+  Seventy-three native controls cover these rules, Me/New class contexts and measured intrinsic
+  exceptions; general compiler and library reference typing remain partial.
+
+- Numeric For counter validation runs before the selected procedure executes,
+  rejecting nonnumeric or whole-array storage, class member properties,
+  constants, function calls and indexed scalar Variants. Nested UDT fields,
+  With temporaries, typed array parameters and class fields referenced by
+  their bare names remain valid. Fifty-nine native controls cover compiler
+  acceptance, implicit types and unused invalid routines; project edits
+  refresh validation against changed global declarations.
+
+- Numeric VBA For loops use the declared element or field type for bounds
+  and steps, including qualified module storage. Next reevaluates array indices
+  once and follows storage replaced by ReDim Preserve. Thirty-one native
+  controls cover these targets and jumps that skip loop initialization.
+
+- Runtime module loading retains malformed-body diagnostics for compilation
+  on demand, preserving valid calls beside unused invalid routines. Explicit
+  parsing stays strict and module/header syntax failures remain eager. Ampersand
+  type characters, numeric-literal boundaries and known-variable suffix
+  conflicts match 53 native controls. The recorded VBE string-import repair
+  is distinguished from raw-source validation.
+
+- VBA DefType directives now supply module-local type defaults for untyped
+  declarations, implicit variables, parameters, function returns and arrays.
+  Explicit types take precedence and constants retain expression inference.
+  Native compiler restrictions, skipped ReDim declarations and array retyping
+  replay 105 fresh Excel probes. Project edits refresh cached symbol bindings;
+  ReDim Preserve rejects element-type changes with error 13. Procedure-local
+  compile errors remain deferred until a call requires the affected procedure,
+  including errors in unused optional signatures or body directives.
+
+- Procedure-wide VBA control flow supports labels inside structured blocks,
+  including GoSub returns, computed jumps and error-handler Resume. Native
+  loop reentry, skipped headers, enumeration locks, For header coercion and
+  Select Case value capture replay 253 uninstrumented Excel traces. Duplicate
+  or missing labels and invalid Exit statements fail before the affected
+  procedure executes.
+
+- Ordinary VBA calls and successful worksheet UDFs preserve Err. Raw native
+  remeasurement corrects five lifetime expectations and one class/UDF control
+  each that had reflected injected On Error handlers. Probe recording now
+  defaults to uninstrumented source. Event callbacks recover locally; an error
+  escaping a callback bypasses caller/raiser error handlers and stops delivery,
+  verified by 78 native host/custom traces and their persistent workbook state.
+  Ten further raw controls correct Erl clearing on On Error, Resume and active
+  handler exit while retaining it for Err.Clear and Err.Number = 0.
+
+- Handlers that disable EnableEvents suppress later workbook and application
+  notifications while completing the current event's callbacks. Eighteen native
+  traces cover Calculate, Change and SelectionChange at each listener stage;
+  another 42 cover bounded Calculate-handler reentry and its following cycle.
+
+- Attaching Worksheet, Workbook or Application WithEvents listeners preserves
+  dirty formula caches in manual calculation mode. Twelve native Excel traces
+  cover ordinary formulas, UDF call counts and the next Calculate event.
+
+- Calculation scopes preserve foreign-sheet caches for worksheet requests
+  and resolve dependencies inside manual range requests. Automatic range
+  requests calculate the workbook. A shared queue spans tabs, learns
+  automatic UDF update order and includes recursively calculated sheets in
+  event reporting. Deferred Calculate notifications survive disabled events
+  and are delivered once on a later calculation request; manual range work
+  defers its notification, and manual entries retain initial caches while
+  joining the next requested pass. Native probes distinguish these behaviors
+  over 192 scope, cache, call-count and event traces, with 1,080 additional
+  UDF scheduling observations. Four native XLSM files and model-written
+  readback gates preserve partial caches and per-cell dirty flags; reopening
+  no longer dirties every formula merely because calcCompleted is false.
+  Thirteen native post-reopen CSE traces correct an assumed equivalence with
+  fresh calculation and preserve clipped-array dirty-state differences.
+
+- Explicit formula assignments obtain initial values in manual mode,
+  including scalar/bulk Formula, Formula2, Value and replacement formulas.
+  Volatile formulas retain caches between reads, invalidate their dependents
+  for calculation, and settle once per pass. Calculation retains learned
+  dependency order and retries provisional UDF calls on unresolved UDF
+  precedents. Application.CalculateFull and CalculateFullRebuild force
+  calculation of every formula, with the latter rebuilding dependencies.
+  Provisional errors retry without poisoning final results, and Range
+  information intrinsics inspect their default values. MULTINOMIAL overflow
+  returns #NUM! rather than escaping as a Python exception. Valid formula
+  text remains editable when its calculation is unsupported.
+  Row visibility and filter operations invalidate SUBTOTAL, AGGREGATE,
+  nested defined names and dependents while retaining manual caches and
+  leaving unrelated nonvolatile UDFs cached. Coverage adds
+  404 native probes, 390 additional scheduling observations,
+  and six XLSM fixtures with native changed-input readback. Lifecycle and
+  file measurements now use direct native calls between observations to
+  avoid dispatcher rewrites resetting VBA globals; all prior 88 lifecycle
+  results were reproduced. Wider graph/iteration/external-link behavior
+  remains incomplete.
+
+- VBA function source edits invalidate UDF results and their dependents
+  while preserving cached reads. Worksheet functions retain edited bindings
+  during the editing macro and refresh project text/globals on subsequent
+  calculation; removed functions become #NAME?. Ordinary macro calls keep
+  their separate compiled-code behavior. Manual Range.Text shows cached
+  values, and saved dirty formula dependents carry native recalculation
+  markers. Coverage adds 88 native lifecycle probes and six macro-enabled
+  source/cache files, including native Excel readback of model-written files.
+
+- AutoFill carries legacy CSE arrays through repeated and clipped blocks,
+  rebases their references and retains manual caches; partial array edits
+  fail before mutation. Replace operates on the array anchor and reports
+  the whole changed block, immediately computes replacement array formulas,
+  and converts literal replacements into ordinary cells. RemoveDuplicates
+  refuses array data rows but permits arrays confined to excluded headers.
+  Calculate events include already-computed replacements and newly installed
+  worksheet handlers. Coverage adds 155 native probes (eight event traces)
+  and twelve native workbooks, with native readback of model-written files.
+
+- Legacy CSE array fragments copy as arrays with their own ranges and
+  correctly rebased references. Whole-array cuts and cell shifts carry
+  metadata, including overlaps and cross-sheet moves; partial cuts, split
+  destinations and sorting array cells are refused before mutation with
+  error 1004. PasteSpecial preserves array fragments and transposition,
+  handles value/formula/format and arithmetic cases, and retains manual
+  caches. FormulaArray entry computes its initial result in manual mode.
+  ROW/COLUMN preserve reference errors after copies invalidate a reference.
+  Coverage includes 189 native API cases and fourteen native file gates; the
+  older partial-array-copy expected failure is now a passing regression.
+
+- Manual-calculation edits retain cached spill results while rows, columns
+  and partial cells move. Copies carry only the copied cached output,
+  including partial and overlapping copies; edits to spill children
+  invalidate output immediately without evaluating the formula. One hundred ten
+  native API probes cover cached and explicitly calculated states, dependent invalidation and application/
+  worksheet versus range calculation scopes. Saved
+  values and dynamic-error metadata survive reopening; nine native files
+  cover caches and calculation settings. `Application.CalculateBeforeSave`
+  controls recalculation on save, and first-opened workbook settings seed
+  the application without overriding an existing workbook's mode. Wider
+  calculation scheduling, iterative calculation, event interactions and
+  mixed-feature structural edits remain incomplete.
+
+- Dynamic-array edits now clear cached spill children displaced beyond the
+  old spill bounds. Sorting spill output raises error 1004 before changing
+  cells. Copies carry the formula without treating its spilled output as
+  independent values; overlapping bulk copies invalidate affected spills.
+  Thirty-five native Excel cases cover row/column and partial-cell edits,
+  sorting, cuts and copies, with offline save/reopen regressions.
+
+### Added
+
+- Embedded ChartObjects, Chart, SeriesCollection, Series and ChartTitle
+  objects share worksheet drawing state: creation, naming, geometry,
+  deletion, eight common chart kinds, literal/range series and basic row/
+  column source-data inference. Thirty-two native probes cover these
+  interfaces; two window-dependent placement cases remain expected gaps.
+  Chart parts, relationships and caches persist, linked caches refresh
+  without replacing unrelated chart XML, and eight model-written chart
+  kinds open and report their data in native Excel. The writer reuses
+  pyOfficeEditor's measured chart markup at revision
+  4723383e5d3039763e64ecd2a3ee092786c91bb5. Imported chart-content mutation,
+  richer source inference, axes/formatting, chart sheets, structural edits,
+  object lifetimes and automatic window placement remain incomplete.
+  An Excel-authored SmartArt fixture also verifies that non-chart graphic
+  frames are excluded and report their native SmartArt shape type.
+
+- Application.Volatile registers the calling UDF formula for recalculation,
+  with False to opt out. Cached reads stay cached, dependents calculate once,
+  manual-mode entry and later edits retain their native calculation phases,
+  and disabled events do not prevent calculation. UDF lookup uses the owning
+  workbook's project, including pending VBIDE source. Twenty-four native
+  probes cover registration, helper calls, errors returned as values,
+  worksheet/workbook scope and switching back to automatic calculation.
+  General calculation-chain scheduling, source-edit lifetime and wider
+  UDF/error interactions remain incomplete.
+
+- User-defined functions: a cell's formula calls a VBA Function of the
+  project, `=Twice(A1)`, as in Excel. References arrive as Ranges, arrays as
+  Variant arrays, a left-out argument as missing; the result, an array, an
+  Error value or a run-time error (#VALUE!) goes into the cell;
+  `Application.Caller` is the calling cell; a UDF cannot write to cells; and
+  what it leaves in Err reaches the macro that wrote the formula. They were
+  all #NAME?. 51 native probes in `tests/fixtures/excel_vba_udfs.json`.
+
+- Typed record-array parameter checks and standard-module record Variant
+  barriers, guided by fifteen native Excel probes. Fixed/dynamic matching
+  arrays remain mutable ByRef; mismatched types, scalar/array substitutions,
+  parenthesized array arguments, Variant assignment/parameters and TypeName
+  report their native compile errors before body execution.
+
+- Record Len/LenB widths and 64-bit memory padding, guided by sixteen native
+  probes covering numeric fields, pointers, objects, variants, strings,
+  fixed arrays and nested records. Fixed-length string declarations retain
+  their size, initialize with null characters and pad/truncate assignments;
+  constant sizes resolve in the defining
+  module. LongPtr uses 64-bit LongLong storage. Dynamic array field lengths,
+  enum layouts, 32-bit layouts and broader marshaling rules remain incomplete.
+
+- Nominal record type checks reject statically known mismatched ByRef
+  arguments and assignments before procedure execution. Records with
+  identical layouts remain distinct types. Eight native probes cover
+  variables, array elements, function results, assignment and prohibited
+  ByVal record signatures; Application.Run reports error 1004 for a target
+  module with such a signature. Expression inference retains the defining
+  module of fields and return types. Wider static checking remains incomplete.
+
+- Record-valued functions and Property Get procedures start with initialized
+  record storage, allowing direct writes to scalar, nested and fixed-array
+  return fields. Twelve native probes also verify private type visibility,
+  qualified disambiguation and local type precedence. Known inaccessible
+  or ambiguous record declarations fail before the called procedure body;
+  general static type/reference checking remains incomplete.
+
+- Module-qualified record declarations (`As Helpers.RecordData`) allocate
+  scalar, fixed-array and dynamic-array values with the defining module's
+  field types. Eight native Excel probes cover nested records, ByRef calls
+  and parenthesized record-expression compile errors. Runtime allocation
+  and demand validation share record-type lookup; broader reference and
+  visibility checking remains incomplete.
+
+- Procedure-demand validation of statically known whole-record arguments
+  forced to temporary values by parentheses. Nine native compiler probes
+  cover implicit/explicit calls, dead branches, deferred unused procedures
+  and accepted function-result temporaries. Checks precede body execution
+  and revalidate after dependency changes. Full static name/type/visibility
+  checks and wider expression/member inference remain incomplete.
+
+- Arrays of records allocate independent fixed/dynamic/multidimensional
+  elements and preserve their type factory through copies, ReDim and Erase.
+  Thirteen native probes verify copying, preservation and borrowed field
+  storage. Borrowed scalar fields and nested fixed-array elements lock the
+  containing record array; cell copies retain their field addresses and
+  failed calls release locks. Wider layout, type and compiler checks remain
+  incomplete.
+
+- Record and array value copying, guided by 24 native Excel probes. Record
+  assignment and function returns copy nested fields/arrays while retaining
+  contained object references and active field aliases. Array assignments,
+  ByVal and parenthesized arguments copy values; ParamArray array elements
+  retain their native storage references. Borrowed array elements prevent
+  replacement, ReDim and Erase with error 10, and failed calls release the
+  borrows. Full static/fixed-array checks and record layout
+  operations remain incomplete.
+
+- ByRef aliases to class/document instance array elements and user-defined
+  record fields, including nested fields and fixed array elements. Twelve
+  native Excel probes cover fixed/dynamic/Variant arrays, named arguments,
+  local shadowing and parenthesized temporary values. Instance arrays now
+  bind their owning instance rather than duplicate module storage. Static
+  argument-type checks and wider record/value-copy conformance remain incomplete.
+
+- VBIDE structural source edits refresh worksheet event handlers before
+  dispatch. Twelve native probes cover handler additions, replacement, removal
+  and per-module compiled source caching. `ReplaceLine` preserves already
+  executed code until a structural edit invalidates it, while updating the
+  editable and saved text. Modules not yet executed use the replacement.
+  Wider compilation and instance-lifetime behavior remain incomplete.
+
+- Invalid-source Excel workbooks open with their complete editable VBA
+  project, allowing inspection, saving and repair before execution retries
+  compilation. Explicit Python source imports remain strict and atomic.
+  Eleven native lifecycle probes verify that edits and component renames
+  reset the affected module while other module variables survive. Wider
+  event/compilation/lifetime conformance remains incomplete.
+
+- VBIDE standard/class source import, standard/class/document export and
+  `CodeModule.AddFromFile`, guided by 29 native file/editor probes. Export
+  headers differ from stored class streams; imported class code is verified
+  by native Excel execution after saving. Blank, leading and trailing editor
+  lines retain their native counts through save/reopen. UserForm file
+  import/export and wider file-format/encoding cases remain incomplete.
+- Standard-module qualified calls, variables, arrays, constants and
+  properties. Eighteen native probes cover namespace lookup, shadowing,
+  private calls inside their owning module, ByRef variables/array elements,
+  class calls and parenthesized arguments. Parentheses pass a temporary
+  value; public class fields behave as property values rather than direct
+  storage aliases. Wider name/reference/type-checking conformance remains
+  incomplete.
+- In-memory `Workbook.VBProject`, component lookup/enumeration, standard
+  and class component creation/removal, document/component/project renaming,
+  and editable `CodeModule` buffers. Source edits compile on execution;
+  incomplete source can be inspected, corrected and saved. Line operations
+  and procedure queries are guided by 128 native Excel probes. A native
+  persistence gate verifies renamed project/document identities and executes
+  edited document code and a newly added standard module. References,
+  designers, import/export, Find, full procedure-boundary conformance and
+  project reset/lifetime behavior remain incomplete.
+- Worksheet document code follows Copy and cross-workbook Move into the
+  destination project with fresh document variables. Delete removes its
+  runtime and saved VBA module. Copies preserve unloaded code when opened
+  with `with_vba=False`, without executing it. A native Excel gate executes
+  copied code and verifies deleted modules are absent.
+- Lazy workbook/worksheet code-name allocation, monotonic in-session sheet
+  captions and multiple-sheet `Worksheets.Add(Count)` with fractional
+  truncation, backed by 22 native document-lifecycle measurements. VBA
+  project editing materializes pending code names in tab order. A fresh
+  empty workbook starts Saved=True. Other sheet types report unsupported.
+- Independent VBA projects for each open Excel workbook, including module
+  globals, class instances, document bindings and saved source. `add_module`
+  and `load_vba` accept an explicit `workbook`; `open_workbook` imports its
+  project by default and accepts `with_vba=False`. Twenty-one native probes
+  cover Application.Run lookup, caller/callee ThisWorkbook, nested calls,
+  private functions, class rejection, document-module return values and Err
+  propagation. Shared application event subscriptions execute in each
+  subscriber's project. Native Excel gates execute the saved subscriptions
+  and workbook/worksheet code.
+- Workbook_Open and application WorkbookOpen, followed by workbook
+  activation, plus workbook Activate/Deactivate callbacks on window changes.
+  Four native traces cover open, suppression, repeated open and activation;
+  opening a workbook twice does not run Open again. VBA syntax failures
+  during import are reported and a failed new open is rolled back.
+- Runtime-added standard, class and workbook/worksheet document modules
+  now persist in macro-enabled Excel saves, and replacing a module updates
+  its saved source. Native Excel executes the saved project in a live gate.
+  Unchanged projects retain their VBA bytes; edits reuse the file writer's
+  protection gates, signature removal warnings and compiled-cache invalidation.
+  Source is not copied into another open workbook, and XLSX saves omit it.
+- Workbook BeforeSave, AfterSave and BeforeClose events, with cancellable
+  ByRef flags delivered to workbook sinks, document modules and application
+  sinks in Excel's order. Twenty-two live cases cover cancellation, reversal,
+  SaveAsUI, changed FileFormat after a failed write, Close saving order,
+  event suppression, workbook counts and created files. The Python `save()`
+  convenience API also respects cancellation, raising `VBARuntimeError(1004)`
+  if a handler prevents the requested write; VBA Save/SaveAs return normally
+  when cancelled. Save prompts and filename-omitted SaveAs remain gaps.
+- `Workbook.FileFormat` and the SaveAs FileFormat argument, currently for
+  XLSX (51) and XLSM (52) writes. Converting to XLSX removes the VBA project
+  and its signature parts; converting XML workbook packaging preserves
+  unrelated parts. A live Excel gate verifies formats and project presence.
+- Class-module `WithEvents` subscriptions and custom `RaiseEvent` delivery,
+  with shared ByRef arguments, isolated ByVal arguments, binding order,
+  rebinding, detachment, listener lifetime and nested delivery measured in
+  15 real Excel cases. Worksheet, workbook and application sinks now hear
+  the model's Change, Calculate, SelectionChange, Activate, Deactivate and
+  NewSheet events, with 14 measured Excel cases establishing delivery order.
+  Unimplemented event sources and complete signature
+  validation remain tracked gaps.
+- Execute `GoSub`, `On ... GoSub` and `Return` using the current procedure's
+  variables and a separate return stack per call. Nesting, loop call sites,
+  numeric labels, procedure exits and error handlers replay 42 real Excel
+  measurements. `Return` without a pending subroutine raises VBA error 3.
+  Jump targets currently must be labels in the procedure's outer body;
+  jumping into a structured block remains a control-flow gap.
+
+### Fixed
+
+- `Application.Calculate` raises Calculate events only for sheets it
+  recalculates; formulas already current no longer cause spurious events.
+  Explicit calculation also recalculates volatile formulas in manual mode.
+- `On ... GoTo` and `On ... GoSub` coerce their index to Integer and reject
+  values outside 0–255 as Excel does, including overflow and half-to-even
+  rounding. Previously `On ... GoTo` silently skipped invalid indices.
+- A variable, parameter, function result, array or record field typed as an
+  enum is a Long, as in VBA. It was treated as an object reference: it
+  started as Nothing and every assignment failed with error 13. An enum's
+  member now reads through the enum's name (`Colour.Blue`) and through its
+  module (`Palette.Shade.Light`); an enum type qualified by its module is the
+  compile error VBA gives. Eleven native probes.
+- `ReDim` resizes a record's dynamic array field: `ReDim r.B(0 To 9)`, nested
+  fields, an array element's field and `.B` inside a With block, with or
+  without Preserve. It was a syntax error. Six native probes.
+- `Len` and `LenB` of a record measure an enum field as a Long and a dynamic
+  array field as an 8-byte pointer, as Excel does over 14 more native probes.
+  An enum field was counted as 8 bytes and a dynamic array field was refused
+  as unsupported.
+
+- `StrConv`, `Error` and `Error$` work; they reported themselves
+  unsupported or undefined. `LSet` and `RSet` pad and cut text; they were
+  refused. 109 native probes in `tests/fixtures/vba_builtins.json`.
+- Numeric text reads as Office reads it: `1,000`, `$5`, `5-`, `(5)` and the
+  other forms 52 native strings show are numbers to `IsNumeric`, `CDbl`,
+  `CLng` and arithmetic alike. `CDbl("$1,000")` was a type mismatch and
+  `IsNumeric` disagreed with `CDbl`.
+- A dynamic array is unallocated until a ReDim and after an Erase, so
+  `UBound` of it is error 9 as in VBA; it answered -1. `For Each` over it is
+  error 92.
+- A String assigned to a dynamic Byte array is its bytes, and a Byte array
+  reads as a String; both were type mismatches.
+- `CallByName(c, "Count", VbMethod)` reads a Collection's count, where it
+  was error 438, and `VbGet` is now error 438, as in VBA.
+
+- Text reads as a date as Office reads it. `CDate` and `IsDate` took a
+  fixed list of 17 patterns, so `2024-03-04 13:00`, `Mar 4 2024`,
+  `4-Mar-24`, `13/4/2024`, `1PM` and most other forms were type mismatches.
+  They follow Office's own rules now: month names by prefix, month-day-year
+  then year-month-day then day-month-year, two-digit years 1950 to 2049, a
+  time before or after the date. 182 native strings.
+
+- `Format` is VBA's own: number, date and text formats, sections, named
+  formats and AM/PM as native Excel formats them over 245 calls
+  (`tests/fixtures/vba_format.json`). It went through Access's field
+  formats, where `#.##` pads with zeros, `\x` shows its backslash, `E+`,
+  `c`, `ttttt` and `ddddd` are not tokens and Empty is an error.
+- A String against a number compares as VBA does: a type mismatch only
+  when neither is a Variant. A Variant holding text is read as a number
+  when it is one and is otherwise greater, and Select Case holds its
+  subject as a Variant. 20 native probes in `tests/fixtures/vba_language.json`.
+- `Err.Source` of an error raised without one is the project's name.
+- `DatePart("ww")` follows its first day and first week arguments; it
+  ignored both. `Format`'s `w` and `ww` take them too.
+
+- `Class_Terminate` runs when an object's last reference goes, as in VBA:
+  `Set x = Nothing`, a reassignment, the end of the procedure that held it,
+  `Erase`, a collection or array freed (its items first to last). It never
+  ran. A variable declared `As New` makes its object where it is first used,
+  not where it is declared, and makes it again after `Set x = Nothing`. A
+  `For Each` that runs to its end leaves its variable Empty, or Nothing,
+  releasing the last element. 26 native probes in
+  `tests/fixtures/vba_object_lifetime.json`.
+
+- `Implements` works: a variable typed as an interface calls the class's
+  `Interface_Member` procedures, and so does an Object or Variant it is set
+  on to; `Is`, `TypeName` and `TypeOf` see the object, setting a class that
+  does not implement the interface is error 13, and setting the view back
+  on to the class's own type gives the class's members. Calls through the
+  interface were error 438. 18 native probes in
+  `tests/fixtures/vba_interfaces.json`.
+- `Rnd` and `Randomize` give Excel's numbers: a negative argument seeds from
+  the number's Single bits, and `Randomize` replaces the seed's middle 16
+  bits as VBA does. Every `Rnd(-n)` gave the same number.
+- `Round` with negative digits is error 5. `Round`, `Fix`, `Int` and `Abs`
+  keep a Currency or a Single; they gave a Decimal or a Double.
+- A Decimal holds what VBA's does, a 96-bit integer and up to 28 places:
+  `CStr`, `CDec` of text and arithmetic keep all 29 digits of the largest
+  one, which lost its last digit.
+
+- Null as an If, ElseIf, While, Do, IIf or Case condition is False, as in
+  VBA; it was error 94. `^` groups left to right (`2 ^ 3 ^ 2` is 64, it was
+  512).
+- `Static Function` keeps all its locals; `On Error GoTo -1` parses and ends
+  the current error; a ParamArray's elements are the caller's variables, so
+  changing one changes theirs; `Show (a), b` passes `(a)` as the first
+  argument rather than indexing the result of `Show(a)`.
+- `DateDiff` counts hour, minute and second boundaries as it counts days;
+  `DateAdd` past the years a Date holds is error 5, where a Python
+  `ValueError` escaped.
+- `Str` writes no zero before the point (`" .5"`) and keeps True and dates
+  as text; `InStr` and `InStrRev` follow VBA with an empty search and a start
+  past the end; `Chr` is Windows-1252 0 to 255 and `Asc` its code; `ChrW`
+  out of range is error 5; `IsNumeric(Empty)` is True; `Split` honours
+  `vbTextCompare`; hex text is read at the target's width
+  (`CInt("&HFFFF")` is -1).
+- `LeftB`, `RightB`, `MidB`, `AscB`, `InStrB` and `Erl` exist; a numbered
+  line written `40:` is a label.
+
+- A sheet name Excel refuses is error 1004: empty, past 31 characters, any
+  of `\ / ? * [ ] :`, an apostrophe first or last, or History in any case.
+  The emulator took any name. `Range("B2:C3")(5)` is `Range.Item(5)`, B4, as
+  in Excel; it read the range's values and indexed the array. 26 native
+  probes in `tests/fixtures/excel_vba_idioms.json`.
+
+- A function can return a typed array: `Function F() As Long()` was a
+  compile error.
+- `Round` of a Double rounds as VBA does, in floating point after scaling:
+  `Round(2.345, 2)` is 2.35 and `Round(1.255, 2)` 1.25, where the emulator
+  rounded the shortest decimal text. `Fix`, `Int` and a tie in `Round`
+  keep a zero's minus sign; `Abs` drops it.
+- `0 / 0` is error 6, not 11. `Val` reads hex text at a literal's width
+  (`Val("&HFFFF")` is -1). `AscW` past 32767 is negative. `IsDate` of a
+  number is False.
+- A dot separates a time's parts in date text: `CDate("1.5")` is 1:05 AM,
+  not the number 1.5.
+- A Collection key that is not a String is error 13; `Before` with `After`
+  is error 5; a position in an empty Collection is error 5.
+- `FormatNumber`, `FormatCurrency` and `FormatPercent` take their
+  leading-digit, parentheses and grouping arguments (they were refused), and
+  -1 digits means 2; `FormatDateTime`'s long date writes `March 5`, not
+  `March 05`. 51 native probes in `tests/fixtures/vba_runtime_edges.json`.
+- Calling a class object's member leaves `Err` as the caller had it; the
+  emulator cleared it as it does for a call into a standard module.
+- Arguments a member takes none of go to what it returns: `b.All(3)` on a
+  parameterless `Property Get All() As Collection` was error 450, and
+  `p.Items(1)` on a public Collection field was error 449.
+- `q = p` or `o = 5` into an object variable holding Nothing is error 91;
+  `Is` on Empty, Null or a number is error 424; an array of an object type
+  is `Object()` to `TypeName` and 8201 to `VarType`. 39 native probes in
+  `tests/fixtures/vba_class_objects.json`.
+- `Range("A1:B2").Value` over empty cells is a 2 by 2 array; the emulator
+  clipped it to the sheet's used cells, so `v(2, 2)` was error 9.
+- Two Error values compare by number: `v = CVErr(xlErrNA)` was error 13. An
+  Error beside any other value, Null included, is error 13, and so is
+  `"x" & CVErr(2042)`, which the emulator spelled out.
+- Arithmetic gives the type Excel gives, cell for cell over a measured matrix
+  of twelve operand types and eight operators. The emulator ranked Double
+  above Currency and Decimal, so `CCur(1.5) + 1.5` was a Double and
+  `CDec(2) + 1#` a Double; a Currency divided to a Currency, a Single beside
+  a Long stayed a Single, `x - aDate` lost the Date and `Decimal + Date` kept
+  it. `0 ^ -1` is error 5, where a Python `ZeroDivisionError` escaped.
+- `Not` and the bitwise operators on Bytes stay a Byte (`Not` overflowed),
+  `&H8000&` is 32768, `Mid$(s, 1, 1) = "q"` is the Mid statement, a fixed
+  `As New` array makes each element where it is first used, and `Like`'s
+  `"[[]"` no longer warns from Python's regular expressions. 16 native probes
+  in `tests/fixtures/vba_operator_types.json`.
+- `Split` and `Filter` return String arrays (they were Variant arrays), and a
+  typed dynamic array takes only an array of its own type: `b() As Long =
+  Array(1, 2)` is error 13. `ReDim Preserve` that moves a lower bound is
+  error 9. `outer(0)(1) = 9` writes into the nested array; it was refused as
+  something that cannot be assigned. A procedure's `Const` can size its
+  `Dim`; it was "Variable not defined". `(Not a) = -1` finds an unallocated
+  array; it was an error. 35 native probes in `tests/fixtures/vba_arrays.json`.
+- `lr.Range(1, 2)` on a ListRow, or any host property without parameters that
+  answers a Range, is that Range's `Item(1, 2)`; it went to `Value` and was
+  error 450. 29 table, name, copy, find and replace idioms were swept with
+  it, and all match but `ListObject.Unlist`, which stays unimplemented.
+- A Double becomes a Decimal through its 15 significant digits and a Single
+  through its 7: `CDec(1 / 3)` was 0.3333333333333333 and `CDec(CSng(0.1))`
+  0.10000000149011612. `CDec(CSng(3.4E+38))` is error 6; it made a 39-digit
+  Decimal. `CByte(True)` and `b = True` give 255; they overflowed. Every other
+  cell of an 11-function, 32-input conversion matrix already matched. 16
+  native probes in `tests/fixtures/vba_conversions.json`.
+- `Replace(Null, ...)` and `InStrRev(Null, ...)` are error 94 (they gave
+  Null), and `String(2, Null)` is Null (it was error 94). The other 104 edge
+  calls of the string functions already matched; 11 native probes in
+  `tests/fixtures/vba_string_functions.json`.
+- A Date before 12/30/1899 made from its parts counts its time forward:
+  12/29/1899 6:00 AM is -1.25, not -0.75, so `Hour(#12/29/1899 6:00 PM#)`
+  was 6 and `DateAdd` around day zero landed on the wrong day.
+- `DateAdd` cuts its number (`1.5` days is one, it was two) and gives Null for
+  a Null date; `DateDiff("w")` backwards counts toward zero; `DateSerial(30,
+  1, 1)` is 2030 (it was 1930); `TimeSerial(0, 0, 86400)` is error 6; the
+  part functions give error 13 for a number past the Date range.
+- With Monday and four-day weeks, `DatePart("ww", #12/31/2024#, 2, 2)` is 1;
+  it was 53. `Format`'s `ww` keeps Excel's defect of 53 for the week's first
+  day when next year is a leap year, as measured over 496 year-end days. 14
+  native probes in `tests/fixtures/vba_date_functions.json`.
+- Calculate events as Excel raises them: `Worksheet.Calculate` and
+  `Range.Calculate` raise the sheet's Calculate when they work a formula out
+  (they raised none); an edit no longer raises it for a formula that does not
+  read the cell but was still waiting to be worked out from before a sink
+  bound; and setting Calculation back to automatic works out what manual mode
+  left stale, with its events. Change, SelectionChange, Activate, NewSheet,
+  workbook and application sinks, EnableEvents and re-entry already matched.
+  28 native probes in `tests/fixtures/excel_vba_events.json`.
+- `Err.Description` and `Error(n)` give Excel's text for every error number
+  from 1 to 1000, measured: 21 numbers, 380 "Invalid property value" among
+  them, fell back to "Application-defined or object-defined error", and 430,
+  442 and 460 were worded differently. `tests/fixtures/vba_error_text.json`.
+- `Application.Union` merges areas as Excel does: one inside another, or two
+  sharing their rows or columns that touch or overlap, become one, the merged
+  area moving to the end (`Union(A1:A2, A3)` is `$A$1:$A$3`; it stayed two
+  areas). `Resize` past the sheet's last row or column is error 1004. The
+  other 23 navigation idioms swept with them (End across gaps, UsedRange,
+  Intersect, CurrentRegion, SpecialCells, Address forms, CountLarge) already
+  matched. 15 more probes in `tests/fixtures/excel_vba_idioms.json`.
+- `Err.Raise` keeps its HelpFile and HelpContext, VBA's own errors carry
+  HelpContext 1000000 and their number (`Err.Raise 9` leaves 1000009), and
+  `Err.Raise 0` or a number past 65535 is error 5; they were raised as given.
+  `Err.LastDllError` is 0. Error passing, Resume, handlers in loops and
+  class members already matched. 19 native probes in
+  `tests/fixtures/vba_error_handling.json`.
+- AND, OR and XOR read an argument left out as FALSE: `=AND(TRUE,)` and
+  `=OR(,)` are FALSE (they were TRUE and #VALUE!), in a cell and through
+  `Application.And(Empty, True)` alike. A Date or Currency handed to a
+  worksheet function from VBA reaches it as its text, as in Excel:
+  `IsText(#1/2/2024#)` is TRUE, AND passes it over, SUM reads the number
+  back. All 296 measured calls now match;
+  19 native probes in `tests/fixtures/vba_worksheet_function_args.json`.
+
+## [6.5.0] - 2026-10-04
+
+### Added
+
+- `check_file(path)` checks a disk snapshot independently of opening a host
+  object or saving it. Reports include structured error/warning codes,
+  locations, supported repair flags, checked part counts, and completeness.
+  Checks cover ZIP payload decompression and CRCs, local headers and data
+  descriptors, XML without DTDs, OPC content types and internal relationships,
+  CFB stream sizes and directory pointers, and supported VBA sources and forms.
+  Configurable byte limits bound input and decompressed parts. Access catalog
+  and VBA inspection is explicitly partial; ZIP64 local metadata and unknown
+  VBA formats are reported as incomplete rather than certified healthy.
+- `repair_file(path, output=...)` conservatively repairs stale ZIP local-header
+  CRC/size fields only after verifying the payload against the central
+  directory. All other bytes remain unchanged, including compressed content
+  and signature parts. Other damage or incomplete checks are refused with
+  `FileRepairError.report`. The original and existing output files are never
+  overwritten; the candidate is checked before writing. Healthy files can be
+  copied without changes. This does not recover corrupt content or rebuild
+  Access databases; Access retains its existing `compact_and_repair()` API.
+
+## [6.4.0] - 2026-10-04
+
+### Changed
+
+- **Faster VBA saves for ZIP-based Office files.** Unchanged package parts
+  now retain their compressed bytes instead of being decompressed and
+  recompressed. `save(full_rebuild=True)` selects the previous full rebuild
+  path, including for ZIP files without a VBA project. The default does not
+  check untouched parts for decompression errors or CRC mismatches and can
+  preserve existing corruption; a full rebuild detects damage but does not
+  repair it. Unsupported packages automatically use the full rebuild path.
+  Based on PR #55 by @swsammy, with local-header length validation added.
+- The Malware scan builds the wheel and sdist with the hash-locked build
+  tools, as a release builds them, and ClamAV and YARA-X scan them beside
+  the committed files.
+
+### Fixed
+
+- Pending mutations stay guarded after a refused or failed save. A second
+  form-only save could previously bypass the protected-project gate; a
+  source-edit retry after a failed write could do the same. Both continue
+  to require `allow_protected=True` until a write succeeds.
+- Repeated VBA saves and retries after a failed write no longer restore
+  stale package signature parts removed by an earlier edit. Signature
+  inspection on the open object also reflects that removal.
+- ZIP64 locator bytes inside package content no longer make a normal ZIP
+  look like ZIP64, avoiding unnecessary fallback during VBA saves and false
+  refusals by the shared Office package reader.
+
+## [6.3.5] - 2026-09-30
+
+### Fixed
+
+- An M text escape naming a code past Unicode, such as `#(ee2220)`, raised
+  `chr()`'s `ValueError`. It is now kept as written, as an escape M does
+  not know is.
+- A Power Query package cut short inside a part raised `struct.error`, and
+  a part name that is not UTF-8 raised `UnicodeDecodeError`; both now raise
+  `PowerQueryError`. A part no longer inflates past the size its header
+  states, so a small part cannot expand without limit.
+- An M formula nested past Python's recursion limit raised `RecursionError`;
+  it now raises `MSyntaxError`.
+- Power Query metadata whose XML is not UTF-8 raised `UnicodeDecodeError`;
+  it now raises `PowerQueryError`.
+- A compound file whose header claimed more DIFAT sectors than the file
+  holds, or whose DIFAT chain returned to a sector it had visited, could use
+  memory without limit; both now raise `CFBError`, as do a DIFAT sector past
+  the end of the file and a sector size other than the 512 or 4096 bytes
+  [MS-CFB] allows, which raised `struct.error`.
+- A version 4 compound file, with 4096-byte sectors, was read from the wrong
+  offsets and failed with `CFBError`. Its 512-byte header takes the whole
+  first sector, so sector n starts at (n + 1) x 4096, not 512 + n x 4096 as
+  for version 3. A sector size the file's version does not have, such as
+  4096 bytes in version 3, now raises `CFBError`. Office saves VBA projects
+  as version 3, so this reached only files other tools wrote.
+- `add_module` and `rename_module` refuse the 17 names the VBE will not
+  give a module, such as `Print`, `Date`, `Me` and `Array` (#40). Excel
+  compiles a project holding one, but code can never name that module.
+  The list is `VBE_REFUSED_MODULE_NAMES` in `pyopenvba.vba`.
+- A damaged Access database is refused with an `AccessError` that says
+  what is wrong, where Python's own error text used to reach the caller
+  (#45). A column an engine table lacks, a fixed-size value of the wrong
+  length, a date no date can hold, a name of odd length or one cut off in
+  a table definition, a usage-map block cut short, and a row slot past
+  the row table are each named.
+
+### Added
+
+- Templates and add-ins open read only (#39): `.xltm`, `.xlt` and `.xla`
+  in `ExcelFile`, `.dot` in `WordFile`, and `.ppsm` and `.ppam` in
+  `PowerPointFile`. Each is the container of a format already read, so
+  its modules read the same way. Saving one raises
+  `UnsupportedFormatError`, since no writer for them has been measured.
+  `.ppa` is a different container and is still refused.
+
+- Coverage-guided fuzzing with Atheris of the CFB, VBA and Power Query
+  parsers and the M formula parser, which found both fixes above.
+  `fuzz/fuzz_parsers.py` holds the targets and the Fuzz workflow runs them
+  daily and on every change to the parsers.
+
+## [6.3.4] - 2026-09-30
+
+No change to the package's code.
+
+### Added
+
+- Releases carry signed build provenance. The Publish workflow signs each
+  wheel and sdist with GitHub's artifact attestations before uploading to
+  PyPI, and attaches the signed bundle to the GitHub release as
+  `pyopenvba-<version>.sigstore.json`. `gh attestation verify <file> --owner
+  WilliamSmithEdward` names the commit and workflow run that built a file;
+  SECURITY.md has the steps. PyPI's own provenance is unchanged.
+- OpenSSF Scorecard rates the repository's security practices on every
+  change to main and weekly, and the README shows its badge.
+- Every release also carries a malware report,
+  `pyopenvba-<version>-malware-report.md`. ClamAV, with the signatures
+  freshclam fetches on each run, and YARA-X, with the full YARA Forge
+  collection of public rules, scan every file the repository holds on
+  every push to main, every pull request, every day and before each
+  release. A match that `.github/security/malware-accepted.toml` does not
+  name fails the scan and stops the release. Two YARA Forge rules match
+  and are accepted there with their reasons: one written from a single
+  TA505 spreadsheet matches the VBA reference paths any binary Office
+  file records, and one for PowerShell spelled in odd letter case matches
+  documentation. A weekly workflow proposes new YARA Forge and YARA-X
+  releases in a pull request that the scans check. Semgrep now runs from
+  its pinned image, and the workflows run on named runner images.
+
+## [6.3.3] - 2026-09-28
+
+### Fixed
+
+- Removed old test comments from the shipped `blank_database.accdb`
+  reference file. Its active p-code decoded only `Option Compare Database`,
+  but its module cache still held 999 copies of a deleted comment. The
+  module is now source-only at MODULEOFFSET 0, and the database was rebuilt
+  with Compact and Repair so unused pages do not retain the old bytes.
+  The module's source is preserved. The embedded Access template used by
+  `create_new()` was not affected and is unchanged.
+- Template regression checks now include every shipped reference and
+  embedded template, scanning raw file bytes, decompressed ZIP members,
+  and assembled Access VBA streams for the removed comments. Access engine
+  skeletons are checked for the absence of VBA; the cleaned blank reference
+  is checked for its exact source and zero module offset.
+
+## [6.3.2] - 2026-09-28
+
+### Added
+
+- `VBAForm.layout_dpi` selects the target designer DPI for newly generated
+  page geometry and CheckBox/OptionButton default heights. The default
+  remains the measured 96-DPI behavior; other DPIs use documented estimates.
+  Existing geometry and fonts are preserved. Resolves #32 with estimated
+  high-DPI support, not a claim of exact high-DPI Office measurements.
+
+### Fixed
+
+- Saving an edited VBA module discards its old compiled p-code and writes
+  its compressed source at MODULEOFFSET 0. Removed comments and string
+  literals no longer remain in that module's cache. Unedited module streams
+  retain their caches. Applies to the shared Excel, Word and PowerPoint save
+  path, including binary Excel/Word containers (#35).
+
+- The `.xlsm` template behind `ExcelFile.create_new()` held a comment in
+  Module1's p-code, `TESTING ONLY DO NOT INCLUDE THIS IN FINAL OUTPUT`,
+  and so did every workbook made from it. Module1's source had been
+  blanked when the template was first baked, in 1.1.0, and saves then kept
+  an edited module's p-code, so pcodedmp, olevba and
+  `VBAModule.disassemble()` still read the comment. Excel never showed or
+  ran it: the save invalidates the project's cache, and Excel compiles
+  Module1's empty source. `scripts/bake_excel_template.py` now writes
+  Module1 as a new module is written, its source alone at MODULEOFFSET 0.
+  The template, and the reference file in `_templates/blank_files/` that
+  ships in the wheel with it, differ from the old ones in that stream and
+  that record only. `tests/test_template_pcode.py` finds no p-code
+  instruction in any template or reference file.
+
+## [6.3.1] - 2026-09-28
+
+### Added
+
+- Every release carries a security report,
+  `pyopenvba-<version>-security-report.md`, with the SARIF it was made
+  from. CodeQL and Semgrep scan the package and the workflows that build
+  and publish it on every push to main, every pull request, every week
+  and before each release. A finding that
+  `.github/security/accepted.toml` does not account for fails the scan
+  and stops the release, and the report lists each accepted finding with
+  its reason. The workflows' actions are pinned to commits, and
+  Dependabot proposes their updates. SECURITY.md says how to report a
+  vulnerability privately.
+
+## [6.3.0] - 2026-09-27
+
+### Added
+
+- `AccessDatabase.add_vba_project()` gives a database that has never
+  held code the VBA project Access makes for a first module, and modules
+  are added to it as to any project. A database Access creates has no
+  project until its first module, form, report or macro: its storage
+  stops at an empty `VBA` folder, and creating a form, report or macro in
+  it now brings the project, as Access's first ones do. Access gave such
+  a database its first module over COM
+  (tests/live_access_test/_first_project.ps1), and the library's project
+  and module match what it wrote, catalog row and object id included.
+  The exceptions are what differs between any two projects Access makes
+  and the compiled caches, which VBA rebuilds on the next open. The
+  project is named after the database's file up to its first dot, as
+  Access names it. It gets an `ID` and a PROJECTCOOKIE of its own, and
+  `CMG`, `DPB` and `GC` encrypted against that ID. Access takes a project
+  whose records are keyed to another ID for a protected one. A live gate
+  has Access list and run the modules of a project made this way.
+- `AccessDatabase.design_theme()`: the Office theme a database's forms
+  and reports are drawn with, read from the `.thmx` it keeps in
+  `MSysResources`, or Office's 2023 theme for a database that has none
+  yet.
+- `AccessDatabase.has_vba_project()`, `dir_stream()`,
+  `project_streams()` and `module_streams()`, and
+  `Table.long_value_home()`: whether a database holds a VBA project, its
+  dir stream, each of the project's streams and each module's as the
+  storage holds them, and where a long value starts. `modules()` and
+  `AccessReader` read through them.
+
+### Fixed
+
+- A database with no VBA project answers as the other hosts' files do.
+  `modules()`, `module_names()`, `references()`, `pull_modules()` and
+  the new stream listings answer empty. A read or write that needs the
+  project raises `NoVBAProjectError`, naming the file and
+  `add_vba_project()`. They had raised `AccessError`, "MSysAccessStorage
+  has no 'dir' row", while `forms()`, `reports()` and `macros()`
+  answered empty. `NoVBAProjectError` is not an `AccessError`: code that
+  caught the old error there catches `NoVBAProjectError` now, or
+  `PyOpenVBAError` for both. An Access 2000 file, whose project lives in
+  `MSysAccessObjects`, is refused rather than answered as empty.
+- A module the library adds takes the storage folder and object id
+  Access gives it: the lowest free folder counting from `0`, and the
+  next id. The library had started `Modules` at folder `4` and stepped
+  ids by four. Those rules were measured through pyvbaharness, whose
+  three injected modules held the lowest folders and the next ids while
+  Access added the module it was asked for. Access driven over COM alone
+  gave the template's new modules folders `1`, `2` and `3` and
+  consecutive ids, and a module added after a middle one was deleted took
+  the freed folder and a new id (tests/live_access_test/modules_added.accdb).
+  The live gate's modules now sit in those folders, and Access lists and
+  runs them.
+- `AcessVBAData` counts the project's modules as Access keeps it,
+  through every add and delete, the code behind a form or report
+  included. The library never updated it.
+- Creating a module, form, report or macro writes what Access writes
+  when it makes one, and leaves the rest to Access's next open. The
+  library had also written the object's entry in its container's
+  `PropData` folder list and its navigation-pane group row. Access adds
+  both the next time it opens the database, even when it only opens and
+  closes it (tests/live_access_test/first_module_reopened.accdb). A
+  delete leaves the group row, as Access's does, and takes a container's
+  `\x03DirData` and `PropData` rows with its last object. A new form's or
+  report's own `PropData` is the 13 bytes Access writes when it makes one.
+  A project made with a form, report or macro has no `[Workspace]`
+  section in `PROJECT`, and the first module or form code opens one after
+  a blank line, as Access does.
+- An Access object's storage folder past `9` is named `10`, `11` and on,
+  as Access names it (#34). The library went on from `9` to `:`, so the
+  eleventh module, macro, form or report in a container raised
+  `ValueError`, and on the blank template the seventh module added did.
+  A folder's entry in `Modules/PropData` holds the name's size, so it
+  grows with a two-digit name, as Access's does. Access filled every
+  container of the template past folder 9, and the tests read its folder
+  names and entries (tests/live_access_test/folders_past_nine.accdb). A
+  live gate has Access list and run modules in folders 10 and 11, run an
+  eleventh macro, and open an eleventh form and report.
+- `AccessReader` reads the catalog and the compiled streams through the
+  storage engine too. Its own `MSysObjects` decoder skipped a row moved
+  to an overflow page, cut names short (`Macro10` read `Macro1`) and
+  dropped others, forms and macros among them. `identifiers()` found
+  nothing once `_VBA_PROJECT` was longer than one long-value row, as it
+  is in a project with forms or a dozen modules. Its page scans read a
+  deleted long-value row as live, so `iter_pcode_streams()` returned
+  copies of neighbouring rows: 72 rows for a project's 27 streams.
+  `find_interned_strings()` returned the literals of deleted code.
+  `MSYS_TYPE_REPORT` held the macro type, -32766; Access writes -32764
+  for a report.
+- `AccessReader` reads a module as `AccessDatabase` does, from the row
+  in `MSysAccessStorage` that the project's dir stream names, and decodes
+  it in the project's code page (#33). It had scanned the long-value
+  pages and decoded as latin-1. So cp1252 punctuation and every
+  double-byte code page read wrong, on files Access saved too. An edited
+  module could read as the old copy Access releases with its bytes left
+  in place. A module stored in 64 bytes or fewer, kept inside its row,
+  was missing. And `read_project_info` failed once the dir stream no
+  longer fitted one page, at about forty modules. `access-ls`,
+  `access-pull` and `pull_access` read through it, and `export_modules`
+  writes the project's code page.
+- Compressed module source and dir streams come out as Office writes
+  them. Office chooses its copy tokens as Windows' own LZNT1 compressor
+  does (`RtlCompressBuffer` in ntdll, standard engine). It remembers only
+  the position where a token starts, two to each of 4096 buckets hashed
+  from the next three bytes, and takes the longer of the two matches.
+  After a chunk whose last flag byte is full it writes one more, empty.
+  The library had searched every earlier position for the longest match.
+  Its bytes were Office's for 32 of the 148 streams Office wrote in the
+  fixtures, and for none of their dir streams. All 148 now come back
+  byte for byte, from Access, Excel, Word and PowerPoint, `.xls`, `.xlsb`
+  and `.doc` included. On Windows a test also checks the tokens against
+  ntdll's on generated input.
+- A container's `\x03DirData` and `PropData` list its objects in the
+  order Access writes them. Access keeps each list in an MSVC
+  `std::unordered_map`, keyed by object name and by folder name, with a
+  16-bit name hash read from `MSACCESS.EXE`, and writes it in the map's
+  order. A new object goes in front of the first entry of its hash
+  bucket, which is often not the end. Loading a list inserts its entries
+  again, so a delete moves entries it never named, and a rename moves
+  its own entry as well. The library had appended new entries and edited
+  others in place. Replaying the changes that built
+  `modules_added.accdb` and `folders_past_nine.accdb` now gives their
+  lists exactly. So do the deletes and renames of modules, forms and
+  reports that Access made in copies of the second. `forms()`,
+  `reports()` and `macros()` follow the list, so objects the library
+  makes now come back in that order too.
+- A form or report is drawn in its database's Office theme, as Access
+  draws it. The library's designs and control defaults were captured on
+  Office's 2007 theme and were written unchanged, so in a database on
+  another theme a new form came out in Calibri and the old palette. Now a
+  font follows its theme font, with the family byte the face takes, and
+  a colour is worked out from its theme slot, tint and shade. A database
+  with no theme gets the 2023 theme Access installs with its first form.
+  The first form in such a database matches Access's record for record.
+  So do the control defaults of every type the library writes in one on
+  the 2023 theme. A tab control's strip is still sized for Calibri, and a
+  colour of a theme not measured can differ by one where it falls on a
+  half.
+- A database's first VBA project adds `HasOfflineLists` and `ProjVer` to
+  MSysDb's properties and stamps the row, as Access does. MSysDb's
+  properties now match Access's byte for byte after a first module or
+  macro.
+- A macro, form or report the library makes is owned by the database's
+  creator, the owner on MSysDb, as Access gives it. They had taken the
+  owner of the first catalog row that had one, which is the engine's.
+
+## [6.2.0] - 2026-09-26
+
+### Added
+
+- `Range.TextToColumns`, as Excel splits a column of text and types what
+  it finds. Delimited, by tab, semicolon, comma, space and another
+  character, several at once, a run of them as one where asked, a field
+  in quotes or apostrophes kept whole; or at fixed widths. Every row of
+  the block is written across the widest line, a missing or empty field
+  clearing its cell, and a Destination moves the block on the source's
+  own sheet. A field is typed as typing types it, keeping a format the
+  cell has; one starting with `=` is a formula, `5-` is text unless
+  TrailingMinusNumbers is True, and a number past Excel's largest stays
+  text. FieldInfo gives the columns text, a skip or a date order, which
+  reads a field its own way before typing takes it: `1.5` is 1 May in a
+  DMY column and `5/2020` 20 May 2020 in an MDY one. Other decimal and
+  thousands separators read numbers written with them. 57 cases in live
+  Excel pin the rules (scripts/measure_text_to_columns.py); FieldInfo
+  whose pairs do not number the columns 1, 2, 3 in order does something
+  in Excel not worked out and reports itself unsupported.
+- Named cell styles: `Range.Style`, `Workbook.Styles` and the `Style`
+  object. A new workbook lists Excel's 47 built-in styles, in the order
+  Windows word sort puts their names, and a name finds its style in any
+  case. Giving a range a style replaces the parts of its cells' formats
+  the style includes and keeps the rest, and a range whose cells differ
+  answers Nothing. `Styles.Add` copies Normal, or the first cell of the
+  range it is based on. A style's properties read as Excel's do, its
+  `Borders` by `xlLeft` to `xlBottom`. A save writes the styles and
+  stylesheet entries Excel writes for the same edits: a built-in style
+  only while a cell uses it, in Excel's own order and the theme's fonts,
+  and every style a macro added. 11,147 reads in live Excel and 27
+  workbooks it saved pin the rules (scripts/measure_cell_styles.py).
+- Changing a cell style, `Style.Delete` and `Styles.Merge`. A property
+  set on a style changes it, and each format that did not set the part
+  itself follows while the style includes the part; including it again
+  brings the style's part back. Normal's font is the file's first, so a
+  change to it reaches cells of any style; its colours and strikethrough
+  change, while its size, face, bold, italic and underline, which the
+  sheets' geometry rests on, report themselves unsupported. A deleted
+  style's cells go to Normal, a built-in one staying in the file hidden;
+  a merged style named as one here takes its place and its cells. A
+  protected sheet makes either error 1004, and a style of a workbook
+  that is not the active one, which Excel changes in the active one,
+  reports itself unsupported. 6,459 reads in live Excel and 18 workbooks
+  it saved pin the rules (scripts/measure_style_changes.py).
+- `Font.ThemeFont` reads on a range: 1 for the theme's heading font, 2
+  for its body font, 0 for any other.
+- Hyperlinks: `Worksheet.Hyperlinks`, `Range.Hyperlinks`,
+  `Range.ClearHyperlinks` and the `Hyperlink` object. `Hyperlinks.Add`
+  puts a link on each area of its anchor, over the very cells of a link
+  taking its place; the cells take the Hyperlink style, made the first
+  time as Excel makes it, and the first cell the text to show or, when
+  empty, the address. An address is tidied as Excel tidies it -- an http
+  address's scheme and host in lower case, its path resolved, a `#`
+  splitting off the subaddress -- and saved as Excel saves it, a DOS path
+  relative to the workbook's folder. A link's name follows its address
+  until it is given a text to show; `SubAddress` takes the address away;
+  `EmailSubject` reads and writes a mailto address's subject. A range's
+  links are those inside one of its areas, and for one area the link it
+  lies in: `Clear`, `ClearContents`, an empty value, `ClearHyperlinks`
+  and a copy landing on them take them away, `Delete` with their formats,
+  and copies, pastes of everything, cuts, inserts, deletes, sorts and
+  copies of the sheet move them as Excel does. A formula whose first
+  function is HYPERLINK gives its cells the Hyperlink style. A save
+  writes each link, its display and its relationship as Excel writes
+  them. 26 sections of live Excel and the 21 workbooks it saved pin the
+  rules (scripts/measure_hyperlinks.py). A link on a shape, `EmailSubject`
+  on a link with no address, which leaves Excel refusing every change
+  after it, and `Follow` report themselves unsupported.
+
+### Fixed
+
+- A sheet's relationships are listed in the order Excel lists them,
+  where they came in the order they were added. Office reads a part's
+  relationships out of a table that splits as it grows, which puts
+  `rId3 rId2 rId1` first, and places each id by its characters read in
+  base 101 and put through one step of C's `rand()` generator;
+  `pyopenvba._relationships` does the same. Excel's orders for every
+  count to 160 and 17 larger ones up to 65,530, the most hyperlinks a
+  sheet holds, pin the rules (scripts/measure_relationship_order.py); a
+  part of more than 65,536 keeps the order it has.
+- A typed date may mix `/` and `-` and have spaces round them, as Excel
+  reads `1/2-2020` and `1 / 2 / 2020`, where a cell kept them as text.
+  A part of three digits makes it text, as in `001/2/2020`, which a cell
+  read as a date (scripts/measure_value_typing.py).
+- A month's name typed straight against its numbers makes a date, as
+  Excel reads `5May2020`, `May2020` and `May5`, where a cell kept them
+  as text; Sept is a month's name as well as Sep.
+- A date with a space before it is text, as in Excel, where a cell read
+  ` 1/2/2020` as a date; only a day and a month's name, ` 2-Jan`, stay a
+  date after a space. A month's name with a time, `May2020 12:30` or
+  `Jan 2, 2020 12:30`, and a time before its date, `12:30 1/2/2020`, are
+  dates and times, where a cell kept them as text. `Jan/2`, `2/Jan` and
+  `Jan - 2` are dates, and `Jan 45` is January 1945, as `1/45` is. A date
+  and a time with a fraction of a second takes `mm:ss.0`, and one past 23
+  hours is General, where a cell gave both `m/d/yyyy h:mm`. A space may
+  stand round a time's colon, and numbers after a date and a time are
+  read past, as Excel does. 911 strings measured in live Excel pin the
+  rules (scripts/measure_typed_dates.py), 287 of them made at random from
+  the parts. Two forms Excel misreads into numbers report themselves
+  unsupported: a space before a month's name and a time, as in
+  ` 2-Jan 12:30`, and digits after AM or PM and a point, as in `12 PM .5`.
+- Letting Nothing into a variable, as `v = Range("A1:A2").Style` does
+  where the cells' styles differ, is error 91, as in VBA, where the
+  variable took Nothing.
+- An edge two cells both draw, as cell styles leave them, reads as the
+  stronger line, and between two of one style as the darker colour,
+  where a cell read its own side first; 415 pairs of cells in live
+  Excel show the order (scripts/measure_shared_edges.py).
+- A save writes the stylesheet in the order Excel's tables hold it: the
+  file's own entries, then the built-in styles' parts, then what the
+  session made, in the order it made them, leaving out what nothing
+  uses. A red font, which Warning Text has, now comes where Excel puts
+  it, and cell xfs come in the order they were made, where a save wrote
+  them in the order it met them. A custom number format takes its id
+  when it is made. Opening a file numbers its custom formats from 164,
+  works each cell xf's apply flags out afresh and merges xfs that then
+  agree, as Excel does, where the model kept a file's entries as it read
+  them. A save that follows no change to a format leaves the stylesheet
+  as it was.
+
+## [6.1.3] - 2026-09-25
+
+### Fixed
+
+- A UserForm in a binary `.xls` or `.doc` is kept where Excel and Word
+  keep one, in the project's storage (`_VBA_PROJECT_CUR` or `Macros`)
+  beside `VBA/`. `add_form` put the form's storage at the root of the
+  file, next to the document's own streams, and Excel and Word refused
+  to open the file. `forms()` looked for forms at the root too, so it
+  listed none from a binary file, and `remove_reference("MSForms")` did
+  not see the forms that need it. Each application inserted a form into
+  a binary file it had saved, and scripts/measure_binary_forms.py
+  recorded where it went. The library's form now lands in the same
+  place, with the streams the editor writes, except for the caption
+  `add_form` sets. A live gate has Excel and Word open, show and compile
+  a form the library adds, and has the library read and edit a form
+  their editor adds.
+- `add_form` writes the line the VBA editor declares a form's package
+  with, `Package={AC9F2F90-E877-11CE-9F68-00AA00574A4F}`, once,
+  immediately before the `BaseClass=` line of a project's first form.
+  No file type got it before. Like the editor, the library never moves
+  or removes the line, even when the last form goes, and gives it to a
+  project that declares a form without it only with its next new form.
+  scripts/measure_project_package.py had Excel and Word add and remove
+  forms and modules through their editors, saving after each step, and
+  the tests replay every state.
+- Deleting a form's module takes the form's designer storage too, as
+  the editor does. Left behind, the storage still read as a form:
+  `forms()` listed it and a new form of its name was refused.
+- A save that rewrites the PROJECT stream keeps every line it does not
+  change byte for byte. A `[Workspace]` entry Excel ends with a space,
+  where a code window's state is empty, lost the space on any save that
+  added, renamed or deleted a module.
+- A compound file past about 7.1 MB can be saved: a large
+  `vbaProject.bin`, or a whole binary `.xls` or `.doc` (#31). The header
+  lists 109 FAT sectors, which map 7.1 MB, and the writer refused
+  anything that needed more, where [MS-CFB] lists the rest in DIFAT
+  sectors; its docstring put the limit at 27 MB. The writer now chains
+  DIFAT sectors. Windows' own compound-file API reads what it writes,
+  and a live gate has Excel and Word open a project past the limit that
+  the library saved, an Image with a 9.7 MB picture included.
+- A control's or form's `properties()` and `get()` report a string set
+  since the record was read, a new control's caption included (#31).
+  They listed a string only once the record had been written out, which
+  is when its length field is filled in, so
+  `add_control("Label", "Hello").get("Caption")` gave `None` until the
+  file was saved.
+- The `add_control` and `remove_control` docstrings and the
+  implementation guide describe form editing as it is (#31). They said
+  containers are refused and layout editing is out of scope, while both
+  methods handle Frames and MultiPages and the library writes a form's
+  whole design. The README had dropped that line already.
+- A control `add_control` adds takes the font of the form, Frame or page
+  it lands on, as the Excel and Word designers give it (#31): the face,
+  the charset, bold, italic, underline and strikethrough, and the size
+  in whole twips. It took Tahoma 8.25 pt, or a copy of the first
+  control already there, alignment included, so a ToggleButton added
+  beside a CheckBox lost its centred text. A new MultiPage's tabs show
+  the container's font too. scripts/measure_form_designer.py had each
+  designer fill forms of their own fonts, and the tests compare the
+  library's controls with the designer's, byte for byte.
+- A new Label is sited without TabStop, as the designers site one
+  (#31): a Label takes no focus, and they store its flags as 0x32 where
+  the library left the default, 0x33, which has TabStop set.
+- A new control takes its place in the tab order as the designers give
+  it (#31). They keep a container's Images last, in the order they were
+  added, so a control added after an Image goes before it, and the
+  Images move down one. The library numbered every control in the order
+  added.
+- A new Frame, MultiPage or page carries the defaults and counters the
+  designers give it (#31). A Frame is etched, SpecialEffect 3. No
+  container stores a NextAvailableID or a ShapeCookie until something is
+  added beneath it, where the library wrote NextAvailableID 1. The
+  ShapeCookie counts one for each control on the container and every
+  container above it, and two for each page on its MultiPage alone; the
+  library counted a MultiPage's tabs and pages against the form and
+  left a new container's count unwritten.
+- A control added without a size gets the one the designers give it
+  (#31): a ListBox 72 by 72 points where the library gave 72 by 54, a
+  ToggleButton 36 by 40, a SpinButton and a ScrollBar 12.75 points
+  wide, a Frame 216 by 144, and a MultiPage or a TabStrip 144 by 108,
+  which fell back to 72 by 24. A CheckBox or OptionButton is as tall
+  as its font makes it, never under 18 points:
+  scripts/measure_form_fonts.py measured 22 fonts in both applications.
+- A MultiPage's pages and tabs follow the MultiPage (#31). The library
+  gave every page 5080 by 3810 HIMETRIC at (53, 556), and the TabStrip
+  the same fixed size, whatever the MultiPage's size and font. The
+  designers make the TabStrip as large as the MultiPage and site the
+  page it shows two pixels inside it, under tabs as tall as the
+  MultiPage's font makes them, so a page is 106 HIMETRIC narrower than
+  its MultiPage. That font is the one set on the MultiPage, which its
+  TabStrip keeps, or else the one it shows from the form or Frame it
+  sits on. Every other page keeps the layout it was added with:
+  `Pages.Add` lays a page out as for a MultiPage of the default size,
+  whatever its size, and `add_page` does the same. VBA sizes a
+  MultiPage after `Designer.Controls.Add` makes it at the default size,
+  so its second page keeps the default size's layout; one the library
+  makes at another size is laid out the same way. The designers round
+  the TabStrip to whole pixels and scale the page's pixel edges back by
+  its own HIMETRIC per pixel, so the page's top moves a unit or two with
+  the size (scripts/measure_multipage_resize.py). A running form lays
+  out again each page it shows, and shows that second page whole.
+- A MultiPage's tabs are stored as the designers store them (#31): a
+  tab's empty tip, tag and accelerator as a count of zero, without the
+  compression flag the library set on them, and the pages' tabs named
+  from Tab3, where the library started a new MultiPage at Tab1.
+- A new TabStrip has the designers' two tabs, Tab1 and Tab2, with room
+  allocated for just those two (#31). The library's had no tabs.
+- A container holding a single control lists it the way the designers
+  do (#31): a plain SiteDepthsAndTypes entry, where the library wrote
+  the counted form the designers keep for a run of two or more. With
+  that, a form the library composes of the controls a designer added,
+  in the same order, is the designer's form byte for byte in both
+  applications, apart from the captions `add_control` gives and the
+  padding the designer leaves as whatever was in memory.
+- Setting a form's Caption changes the caption the form shows (#31). A
+  form keeps two: its record's, which `Designer.Caption` reads, and its
+  designer header's, which the running form shows and the editor's
+  property sheet edits. `set_property("Caption", ...)` wrote only the
+  record's, so the form went on showing the old caption. It now writes
+  both, as `add_form` does; clearing the caption clears the record's.
+- A CommandButton's TakeFocusOnClick is read and written (#31). The
+  designers store it as PropMask bit 9, set when it is False, with no
+  data; the property table did not name that bit, so `properties()`
+  did not report it and `set_property` could not set it.
+- docs/userforms.md says where the designers store the UserForm
+  properties VBA names otherwise, such as `TextAlign`, `Style` and
+  `TripleState`, and what setting one changes besides, as measured in
+  Excel and Word (#31). `set_property` writes the one field it names.
+  It also says what Excel and Word do with a TextBox given a border
+  alone, which keeps its sunken effect: they keep both and draw the
+  effect. And it says how the designers lay out a MultiPage's pages.
+- An edit made through a form is saved whatever happens to the other
+  forms first. `add_form` read every form again, so an unsaved edit to
+  a form that `forms()` or an earlier `add_form` had returned never
+  reached the file; saving a form's deletion dropped every form object
+  the same way, and an edit made through one afterwards was lost at the
+  next save. `add_form` now reads only the new form, and a deletion
+  drops only its own, in every host and in binary `.xls` and `.doc`
+  files alike.
+
+## [6.1.2] - 2026-09-23
+
+### Fixed
+
+- `add_form` gives a project that does not reference Microsoft Forms
+  the reference the editor adds with a first UserForm, so code naming
+  MSForms types compiles (#29). The form came without it, and Excel,
+  Word and PowerPoint stopped such code at "User-defined type not
+  defined": a form held As MSForms.UserForm, or a KeyPress handler's
+  KeyAscii As MSForms.ReturnInteger. The reference is the control
+  reference the three applications write, measured record for record
+  (scripts/measure_form_reference.py), except for its extended libid.
+  There they name a cache in the saving user's Temp folder, and the
+  library repeats the original libid instead. A live gate compiles such
+  code in all three.
+
+## [6.1.1] - 2026-09-23
+
+### Fixed
+
+- A workbook the library makes no longer names a folder on the machine
+  its template was made on. The .xlsm, .xlam and .xlsb templates behind
+  `ExcelFile.create_new`, from which the in-memory Excel also starts
+  every new workbook, .xlsx included, carried the folder Excel had saved
+  them in: an `x15ac:absPath` element in xl/workbook.xml, and in the
+  .xlsb a BrtAbsPath15 record between BrtACBegin and BrtACEnd in
+  xl/workbook.bin. The templates are baked again without it, and every
+  other part is as it was. A test decodes every template and finds no
+  user folder in any part, a VBA project's dir stream included.
+  scripts/fixture_workbook.py now takes the record out of a .xlsb too,
+  and scripts/bake_excel_template.py splices its section into the
+  templates module as the other bake scripts do, where it rewrote the
+  whole module and dropped the others.
+
+## [6.1.0] - 2026-09-23
+
+The in-memory Excel comes a long way toward Excel. Formulas are worked
+out by pyOfficeEditor's engine, 493 of Excel's functions, and dynamic
+arrays spill. Tables and structured references, AutoFilter, sorting,
+AutoFill, RemoveDuplicates, notes, data validation, protection, windows,
+events and Forms controls arrive too, each measured against live Excel
+and saved as Excel saves it. In the VBA file API, a file saved before
+its first macro opens and can be given a project, and a signed file
+whose code changes is saved without its stale signature.
+
+### Added
+
+- `add_vba_project()` on `ExcelFile`, `WordFile` and `PowerPointFile`
+  gives a `.xlsm`, `.docm` or `.pptm` with no VBA project the one its
+  application makes for a first macro. In Excel that is a document
+  module for the workbook and one for each sheet, named as Excel names
+  them, one count across worksheets and chart sheets, with the names
+  written on `workbookPr` and each sheet's `sheetPr`. In Word it is
+  `ThisDocument`, and in PowerPoint it is empty. A save writes the
+  project, its relationship and its content type as the applications
+  do, and writes no project the application would not: Excel writes only
+  the code names for one with no code, and PowerPoint nothing for one
+  with no module (scripts/measure_first_macro.py). Three things are left
+  to the applications. Office orders the new relationship its own way
+  and Word numbers them all again, Excel stamps `fileVersion` with a
+  `codeName` GUID fixed by its build, and Word writes `vbaData.xml`. A
+  live gate has each application open the result and run its module.
+
+- `has_vba_project()` on `ExcelFile`, `WordFile` and `PowerPointFile`,
+  which tells a file with no VBA project from one whose project is
+  empty, and `NoVBAProjectError`, a `VBAProjectError` raised by what
+  needs a project the file does not have.
+
+- `vba_signature()` on `ExcelFile`, `WordFile` and `PowerPointFile`: the
+  VBA project's digital signature wherever the file keeps it, the parts
+  beside `vbaProject.bin` included, with `SignatureInfo.parts` naming
+  them.
+
+- Notes, which VBA calls comments: `Range.AddComment`, `Comment`,
+  `NoteText`, `ClearComments` and `ClearNotes`, `Worksheet.Comments`,
+  and the `Comment` object's `Text`, `Author`, `Visible`, `Delete`,
+  `Next`, `Previous`, `Parent` and `Shape`. Each answers as Excel's
+  does, from AddComment's refusals, error 5 for a range of several
+  cells and 1004 for a cell with a note, to `Text "XY", 3` overwriting
+  from the third character where `Overwrite:=False` inserts. A note is a
+  shape too, "Comment 1", of Type 4, its box placed where Excel places
+  one, and it moves with its cell through inserts, deletes, Copy, Cut
+  and PasteSpecial of comments; Clear takes it, AutoFill leaves it
+  behind, and a merge keeps only the first cell's. `SpecialCells` finds
+  the cells with notes, and they count in UsedRange. A save writes the
+  comments part, each note's box in the sheet's VML part and a row for
+  each row with a note as Excel writes them, byte for byte but for the
+  random id Excel gives each note; a workbook Excel saved opens with its
+  notes and saves them back as they came. 89 probes and a saved
+  workbook of every kind of note, in live Excel, pin the rules
+  (scripts/measure_notes.py).
+
+- `Range.Range`, a reference read as though the range's first cell were
+  A1, as a macro recorded with relative references uses it:
+  `ActiveCell.Offset(1, 0).Range("A1")` is the cell below the active one,
+  and `Range("B2:D5").Range("B2:C3")` is C3:D4. A `$` makes no
+  difference, a name moves as its cells would, and a range of several
+  areas counts from its first. One Range alone, or a reference landing
+  off the sheet, is error 1004, as 29 probes in live Excel show.
+  `Range.Formula2Local` and `Formula2R1C1Local` read and write as
+  `Formula2` and `Formula2R1C1` do in an English Excel.
+
+- An `@` written through `Range.Formula`, `FormulaR1C1` or `Value`, and
+  a call of SINGLE, which Excel writes as `@`. An `@` standing where the
+  formula cuts to one value anyway is left out, `=@A1:A3` reading back
+  `=A1:A3`. One that is kept, `=@A1`, has `Formula` read back every `@`
+  that `Formula2` shows, `=@A1+A1:A3` as `=@A1+@A1:A3`, and an operation
+  inside it is cut too, `=@(A1:A3*2)` being `=@(@A1:A3*2)`. `SINGLE(x)`
+  is written `@x`, its argument as it stands, even where the `@` then
+  holds less than SINGLE did: `=SINGLE(A1:A3%)` reads `=@A1:A3%` and is
+  still 0.01. A file keeps each `@` as `_xlfn.SINGLE`, which the model
+  now writes and reads back. 274 writes in live Excel and a workbook it
+  saved pin the rules (scripts/measure_at_sign.py), the model's save
+  held to Excel's bytes cell by cell. The model raised an error for
+  such a formula written through `Formula` and read SINGLE back as
+  SINGLE.
+
+- Cells are typed as Excel types them. A string written through `Value`,
+  `Value2`, `Formula`, `FormulaR1C1` or an array brings the number format
+  typing it gives -- `"5%"` 0%, `"$1,000.50"` a dollar format, `"1e3"`
+  scientific, `"1 3/16"` a fraction, times with seconds, tenths and
+  AM/PM, dates month first on Excel's 1900 calendar, a run of spaces
+  between a date's or a time's parts read as one -- and a Date or
+  Currency a macro computes brings its own. A cell keeps a format of its
+  own unless it is General or a built-in one of another kind, reads
+  `"1/2"` as a half when its format is a number's, and keeps every string
+  as text when its format is Text, where a Date or Currency becomes the
+  text Excel shows. `Value` reads a number as a Date or Currency through
+  the cell's format, raising error 6 where one cannot hold it, and
+  `Value2` as a Double. A number typed with more than fifteen significant
+  digits keeps fifteen, the rest cut off rather than rounded. 3,947
+  writes in live Excel and a workbook it saved pin the rules.
+- `Range.PrefixCharacter`: a leading apostrophe keeps the rest as text
+  and sets the cell's prefix flag, which its format keeps until `Clear` or
+  `ClearFormats`, and which a save writes as Excel's `quotePrefix`.
+- `Range.HasFormula`.
+- `NumberFormat` keeps a code as Excel rewrites it -- a quoted `"$"` bare,
+  an escaped `\-` or `\(` bare, codes in their case, a lower-case exponent
+  refused with error 1004 -- and the file spells a code as Excel's does,
+  with the `$` quoted, literal dashes, brackets and spaces escaped, and
+  the currency and accounting built-ins (ids 5 to 8 and 41 to 44) written
+  out. A file's own spelling reads back as Excel reads it.
+- `Range.Text` under General shows what Excel's eleven characters show:
+  the number in full while it fits, else rounded or given an exponent,
+  whichever keeps more digits.
+- Excel's number-format engine behind `Range.Text`, the `TEXT` function
+  and the new `WorksheetFunction.Text`: sections and conditions, digit
+  placeholders, grouping and scaling commas, percent, exponents,
+  fractions, text sections, dates and times on Excel's 1900 calendar,
+  and elapsed times. 156 codes through 28 values in live Excel are
+  reproduced exactly. A time rounds to the second, or to the fraction of
+  one shown, as Excel rounds it: half a unit is added to the serial before
+  the hours, minutes and seconds are cut off it, which 152 times on the
+  half second in live Excel pin. A value its format cannot show fills
+  the cell with `#` as wide as the column, and makes `TEXT` an error. A
+  format with a `*` fill reports itself unsupported in `Range.Text`, since
+  what it pads the cell with depends on the width in pixels. Before, both went
+  through Access's `Format`, which spelled `$#,##0_)` as `$5_)`, fractions
+  as `2 ?/?` and `[h]:mm:ss` as `[1]:00:00`.
+- AutoFilter: `Range.AutoFilter`, `Worksheet.AutoFilter`, `AutoFilterMode`,
+  `FilterMode` and `ShowAllData`, and the AutoFilter, Filters and Filter
+  objects a macro reads them through. A criterion with `=` or none matches
+  the text a cell shows, ignoring case, with `*`, `?` and `~`, so `1`
+  finds 1 but not 1 shown as 1.00, and a wildcard finds text only; `<>`,
+  `>`, `>=`, `<` and `<=` compare numbers and dates by value and text as
+  Sort orders it. xlAnd and xlOr, lists with xlFilterValues, top and
+  bottom items and percentages, and above and below average work as
+  Excel's do, down to how each criterion reads back (`>1/15/2020` is
+  `>43845`, `>2.50` is `>2.5`) and the field a list returns. Filtering
+  shows and hides every row under the header; ShowAllData and turning
+  the filter off show them again. The file holds each filter as Excel
+  writes it, with the hidden `_FilterDatabase` name, and a filter in a
+  file reads back as Excel reads it: 113 layouts and 34 saved filters
+  in live Excel pin it, and Excel opens the filters this writes. Colour,
+  icon and date-group filters in a file are kept but not applied.
+- Edits on a filtered sheet hold back to what shows, as Excel's do.
+  Values, formulas, formats, borders, clearing, fills, Replace, Sort, row
+  heights and hiding reach only the visible cells, and a range with no
+  visible cell is edited whole. Copy takes the visible cells, closed up,
+  and pastes their formulas as the values they show; a copy of several
+  areas does the same anywhere. Deleting cells up deletes the visible
+  rows whole, inserting cells is error 1004, and inserting whole rows
+  inserts as many as the range shows. The filter follows the sheet: rows
+  and columns inserted and deleted move and stretch it, deleting a
+  filtered column filters again by the rest, and deleting or clearing
+  the header row turns it off. `AutoFilter.Range` runs on over rows
+  written below it, which filtering again takes in. 195 layouts in live
+  Excel pin it; a two-dimensional array written to several areas, which
+  Excel reads at another stride, reports itself unsupported.
+- SUBTOTAL, in cells and through `WorksheetFunction.Subtotal`. 1 to 11
+  pass over the rows a filter hid -- and while a sheet is in filter mode
+  Excel takes every hidden row there for one -- 101 to 111 over every
+  hidden row, and hidden columns count. A cell that holds SUBTOTAL or
+  AGGREGATE is passed over. The function number is cut to a whole one,
+  TRUE is 1, and anything outside 1 to 11 and 101 to 111 is `#VALUE!`; a
+  value where a range belongs is error 1004 when the formula is written,
+  as in Excel. A SUBTOTAL recalculates as rows are hidden, filtered or
+  shown. 31 layouts in live Excel pin it, including references that
+  OFFSET, INDIRECT, IF, INDEX, a name or a reference operator give.
+- SUMSQ and DEVSQ, in cells and through `WorksheetFunction`, each
+  Excel's double to the bit over 87 sets of numbers. DEVSQ of no numbers
+  is `#NUM!`.
+- `Application.Evaluate`, `[...]` and `Worksheet.Evaluate` work out an
+  expression as Excel's Evaluate does. What comes to cells is a Range: a
+  reference, a name for cells, INDEX, OFFSET, INDIRECT, CHOOSE, IF, IFS,
+  SWITCH or XLOOKUP landing on cells, an intersection or a union.
+  Anything else is worked out as an array formula, blocks whole:
+  `Evaluate("A1:A3*2")` is three numbers, in an array counted from 1
+  that is one-dimensional when it is one row. An error comes back as an
+  error value. An expression Excel cannot read, an empty one, or one
+  past 255 characters is Error 2015; ROW() and COLUMN() with no
+  argument are an array of one. 91 cases in live Excel pin it. Before,
+  text that was not a reference, a name or an array constant reported
+  itself unsupported.
+- Formulas work with references as Excel does. The range operator
+  joins any two references, so `SUM(A1:INDEX(A:A,5))`,
+  `SUM(INDEX(A1:A10,2):A5)` and `SUM(Block:A5)` add what they span.
+  An intersection, `SUM(A1:A5 A2:B3)`, reads the cells two blocks share
+  and is `#NULL!` when they share none. A union, `SUM((A1:A2,A4))`, is
+  read whole by SUM, COUNT, COUNTA, AVERAGE, MAX, MIN, LARGE and
+  SUBTOTAL, picked from by INDEX's fourth argument and counted by AREAS.
+  COUNTIF refuses it with `#VALUE!`, and a cell holding one is
+  `#VALUE!`. INDEX, OFFSET, INDIRECT, CHOOSE, IF, IFS, SWITCH and
+  XLOOKUP give cells wherever a reference is wanted, for ROWS, ROW,
+  OFFSET's start, a COUNTIF or a SUBTOTAL.
+  INDIRECT reads a defined name and an R1C1 reference counted from the
+  top left. 45 formulas in live Excel pin it. Before, each reported
+  itself unsupported. Another function given a union, and a relative
+  R1C1 reference in INDIRECT, still do.
+- Sheet protection: `Worksheet.Protect`, `Unprotect`,
+  `ProtectContents`, `ProtectDrawingObjects`, `ProtectScenarios`,
+  `ProtectionMode`, `EnableSelection` and the Protection object. A
+  protected sheet refuses a macro what Excel refuses it, with Excel's
+  own error text: writes to locked cells (the unlocked ones still take
+  the value), clears, formats unless allowed, inserting and deleting
+  rows and columns unless allowed, merging, filling, copying onto locked
+  cells, AutoFilter, RemoveDuplicates and sorting. UserInterfaceOnly
+  frees macros. A second Protect, the password rules and the Allow
+  options follow Excel's. 168 cases in live Excel pin it. A save writes
+  the protection as Excel does, the password as a salted SHA-512 hash
+  Excel opens, and a protected sheet in a file is protected when read,
+  its password checked against Excel's hash or the legacy 16-bit one.
+- `Scripting.Dictionary`, made by `CreateObject` or `New` without
+  starting the Scripting Runtime. Keys match as the real dictionary
+  matches them: 1, 1# and 1& are one key, a Date is its serial number,
+  True is -1, Empty and "" are one key, an object is itself, and text
+  goes case and all unless CompareMode is vbTextCompare. Reading a
+  missing key adds it. Keys and Items are zero-based arrays in insertion
+  order, For Each walks the keys, and the errors are the real one's. 47
+  probes in live Excel pin it.
+- `Range.CountLarge`, `Next`, `Previous`, `Calculate`, `AddressLocal`,
+  `FormulaLocal`, `FormulaR1C1Local` and `NumberFormatLocal`, and
+  `Worksheet.Next` and `Previous`. The Local spellings are the English
+  ones, as an English Excel has them; `Calculate` answers Null.
+- Array formulas: `Range.FormulaArray`, `HasArray` and `CurrentArray`.
+  An array formula is worked out once as an array over its block, and
+  each cell shows its item; every cell reports the formula, and what
+  reads one follows the array. FormulaArray takes A1 or R1C1 and at most
+  255 characters, rewrites a whole array from one of its cells, and is
+  error 1004 over part of one. Value and Formula over part of an array
+  change nothing and over all of it replace it; clearing part of one, or
+  inserting or deleting rows or columns through it, is error 1004, as in
+  Excel. A file keeps the formula in the block's first cell, read and
+  saved as Excel does; before, the model read such a formula as an
+  ordinary one, and a save of the sheet lost the array. 78 cases and 4
+  workbooks in live Excel pin it. Copying part of an array, and filling,
+  sorting, replacing or removing duplicates in one, report themselves.
+- `CallByName`, a member named at run time: VbGet reads a property and
+  passes its arguments, VbLet sets one, VbMethod calls a method, and
+  VbMethod on a host object's property, VbSet with a value, or a call
+  type with none of the four is error 438, as 24 probes in live Excel
+  show. `Collection.Item` is a method, as VBA's own Collection has it.
+- Windows: `Application.ActiveWindow`, `Application.Windows`,
+  `Workbook.Windows`, `Application.Goto` and the Window object -- zoom,
+  view, gridlines, headings, zeros and formulas, scrolling, frozen panes
+  and the macro recorder's Freeze Top Row, SplitRow and SplitColumn,
+  caption, tabs, tab ratio and scroll bars. Each sheet keeps its own view
+  and selection, a copy of the sheet takes them along, and a save writes
+  them as Excel does. Windows lists windows front to back as Excel does.
+  113 workbooks in live Excel pin it. A split that is not frozen, which
+  Excel keeps in twips of what the window shows, is answered for and not
+  saved; freezing with the active cell out of view reports itself.
+- Data validation: `Range.Validation` and the Validation object --
+  `Add`, `Modify`, `Delete`, every setting and message, and `Value`,
+  which checks the cell's value against its rule as Excel does. Rules
+  move with inserted and deleted rows and columns, split round a Delete
+  or a Clear, travel with a copy, and a rule like one the sheet has joins
+  it; a save writes the dataValidations element as Excel writes it. 39
+  workbooks in live Excel pin it. A list read from another sheet, which
+  Excel keeps in the worksheet's x14 extension, is read and not made.
+- Excel tables: `Worksheet.ListObjects`, `ListObjects.Add`, and the
+  ListObject, ListColumns, ListColumn, ListRows and ListRow objects,
+  with `Range.ListObject`. A file's tables are read, and Add makes one
+  over a range as Excel does: headers from the first row turned to text,
+  generated names for blank and repeated ones, a header row put in when
+  the range has none, the first free TableN, TableStyleMedium2, and
+  error 1004 over another table. A table's name, style and style options
+  can be set. A save writes each new table in the parts Excel writes for
+  it; a table read from a file keeps its part until it changes. 8
+  workbooks and 15 questions in live Excel pin it. Editing a table's rows
+  and columns comes later.
+- A table's totals row: `ListObject.ShowTotals` and
+  `ListColumn.TotalsCalculation`. Showing the row puts cells in under the
+  table, those below moving down; the first time, the first column says
+  Total and the last adds up, or counts where its values are not all
+  numbers. Each function writes its SUBTOTAL, `SUBTOTAL(109,[Price])`;
+  hiding the row deletes its cells and keeps what each column totals for
+  the next time. A label, a SUBTOTAL or another formula written into the
+  row is what the column totals from then on, and a number written there
+  becomes its text. The table part keeps each label, function and custom
+  formula as Excel does. 20 workbooks in live Excel pin it.
+- Editing a table's rows and columns: `ListRows.Add`, `ListRow.Delete`,
+  `ListColumns.Add`, `ListColumn.Delete`, `ListObject.Resize` and
+  `ListObject.Delete`, each moving the cells around the table and the
+  references to them as Excel does, a structured reference to a column
+  that goes becoming #REF!. A formula written into an empty table column
+  fills it and makes it calculated, and a row the table gains takes the
+  formula. A value or formula a macro writes in the row under a table or
+  the column right of it takes the table over it, and a value written
+  under it stretches `SUM(C2:C4)` over the new row as Excel does. 28
+  workbooks and 21 writes in live Excel pin it. `ListObject.Unlist`, and a
+  copy or fill next to a table, report themselves.
+- Structured references. A formula can name part of a table,
+  `Table1[Qty]`, `Table1[#All]`, `Table1[[#Headers],[Qty]:[Price]]`,
+  `Table1[@Qty]`, and the model spells it back, saves it, reads it from a
+  file and works it out as Excel does: this row as `@` on screen and
+  `[#This Row]` in the file, the whole table as its bare name and
+  `Table1[]`, column names escaped and bracketed as Excel escapes them, a
+  column read as this row's cell where one value is wanted, and the
+  table's name left out of `[Qty]` and `[@Qty]` inside the table.
+  `Range("Table1[Qty]")` and Evaluate read them. Renaming a table,
+  setting `ListColumn.Name` or writing over a header renames every
+  formula with it, and a header names its column with the text it shows.
+  AutoFill across moves a reference to one column along the table. 80
+  formulas, a sweep of 50 column names, copies, fills and renames in live
+  Excel pin it.
+- Events, and a sheet's own code. A sheet's module and ThisWorkbook
+  are their objects' code: a code name reaches its sheet or workbook, as
+  `Sheet1.Range("A1")`; inside the module `Me` is the object and its
+  members are the module's by name, so Range there is that sheet's; and
+  outside code reaches the module's Public members through the object,
+  `Sheet2.MyMacro` or `Application.Run "Sheet2.MyMacro"`.
+  `add_module(..., kind="document")` binds a module, and an xlsm's own
+  modules are bound as it is read. `Worksheet.CodeName` and
+  `Workbook.CodeName` come from the file. The modules hear Change,
+  Calculate, SelectionChange, Activate, Deactivate and NewSheet, sheet
+  first and workbook second, with Excel's Target and order, suppressed by
+  EnableEvents, and nested when a handler edits a sheet. 35 actions and 7
+  reach cases in live Excel pin it. Before, a `Worksheet_Change` handler
+  never ran and `Sheet1` was not defined.
+- Workbook protection: `Workbook.Protect`, `Unprotect`,
+  `ProtectStructure` and `ProtectWindows`. A protected structure refuses
+  adding, deleting, renaming, moving, copying and hiding sheets with
+  Excel's own errors. A second Protect needs the password, and one with
+  no Structure turns the protection off, as in Excel; Windows does
+  nothing, as in Excel today. It is saved and read as Excel saves and
+  reads it, the password as a salted SHA-512 hash Excel opens. 41 cases
+  and 5 files in live Excel pin it.
+- The constants of VBA's own type library that the reference dumps left
+  out: the colours (`vbRed`), the key codes (`vbKeyReturn`), the system
+  colours (`vbButtonFace`), `vbModeless` and the QueryClose modes.
+  `scripts/dump_vba_typelib_constants.py` reads them from VBE7.DLL.
+- Defined names are written in Excel's order: by name as the Name Manager
+  shows it, ignoring case, a sheet's own before the workbook's.
+- `Range.RemoveDuplicates`. A row goes when the columns asked for hold
+  what an earlier row's hold, and the rows left close up from the top of
+  the range, formats and all, formulas shifting as a copy's would, while
+  nothing outside the range moves. Cells match when both are blank, the
+  same error, text the same but for case, or numbers of equal value that
+  show the same: 1 and 1.00 differ, and so do 0.3 and 0.1 + 0.2. TRUE is
+  a number 1 that shows TRUE; text never matches a number. Header is xlNo
+  when left out and xlGuess guesses as Sort does; a single cell works on
+  its current region. Columns left out or 0 does nothing, one outside the
+  range is error 1004, an array of them error 5 if any is outside. 98
+  layouts in live Excel pin it; text beyond ASCII, which Windows compares
+  with æ matching ae, reports itself unsupported.
+- `Range.AutoFill`, with every fill type but Flash Fill. The source
+  repeats down, up or across the destination one column or row at a
+  time; runs of numbers, dates, times, text with a number in it, and day
+  and month names carry on as series, and the rest repeats, formulas
+  moved as a copy moves them. Numbers step by 1 alone and by their
+  difference in pairs, each value the first plus the step times how far
+  along, that product rounded to 15 digits and then the sum, as Excel
+  does (1/3, 2/3 goes on 1, 1.33333333333333, 1.66666666666666). A number
+  that is the whole source repeats, and so does a lone cell in a row
+  filled down beside others of its kind. Dates step by days, by months
+  under `mmm-yy` or where they share a day of the month or all end one,
+  and by weekdays, months or years when asked; times by an hour. Text
+  keeps what surrounds its number and the zeros in front of it, 1st goes
+  to 2nd, Q4 and 4th Qtr wrap to the first quarter, and Mon and JANUARY
+  keep their case. Numbers run together while their formats agree.
+  `xlFillCopy`, `xlFillFormats` and `xlFillValues` repeat everything, the
+  formats alone and the values alone. 208 layouts and 520 columns in live
+  Excel pin it. What the model cannot match reports itself: a trend
+  through three or more numbers that do not step evenly, which Excel
+  takes from its LINEST arithmetic, a growth trend, dates whose times
+  differ, and a destination that runs on two ways at once.
+- Worksheet functions from VBA go through the formula engine:
+  `WorksheetFunction.X` raises error 1004 on an error and `Application.X`,
+  the late-bound form, hands it back as an error value, for every one of
+  the 72 WorksheetFunction members the engine has, `Match`, `Index`,
+  `Transpose`, `CountIf`, `SumIfs`, `XLookup` and `Round` among them. A
+  range argument is its cells, a VBA array a row or rows, Empty an
+  argument left out; an array answer is a VBA array from 1, one row
+  one-dimensional unless INDEX, CHOOSE or XLOOKUP answered with part of a
+  range. The hand-written `Sum`, `Average`, `Max`, `Min`, `Count`,
+  `CountA`, `Trim`, `Text`, `Proper` and `VLookup` are gone; `VLookup`'s
+  approximate match now works. 150 calls made both ways in live Excel pin
+  it; a range or array given where one value is wanted is not yet run
+  item by item.
+- `Range.Sort`, and `Worksheet.Sort` with its `SortFields`, `SetRange`,
+  `Header`, `MatchCase`, `Orientation` and `Apply` as a recorded macro
+  uses them. Numbers sort before text, text before FALSE and TRUE, those
+  before errors, and blanks go last either way; the sort is stable. Text
+  sorts as Excel sorts it -- marks before digits before letters, case
+  ignored unless asked for, hyphens and apostrophes passed over but for
+  ties -- for ASCII, checked on 400 random strings; text beyond ASCII
+  reports itself unsupported. Rows move whole, formulas shifting with
+  them. Up to three keys, orders, orientation and text sorted as numbers
+  work; a single cell sorts its current region; an omitted Header is
+  xlNo, and xlGuess takes the first row for a header as Excel does. 58
+  layouts and four orderings of 583 values in live Excel pin it.
+- The clipboard, as recorded macros use it. `Range.Copy` and the new
+  `Range.Cut` with no destination put the range on it, and
+  `CutCopyMode` reads 1 or 2. The new `Worksheet.Paste` pastes it at a
+  destination or the selection, and the new `Range.PasteSpecial` pastes
+  everything, values, formulas, formats, number formats with values or
+  formulas, all but borders, or column widths, with Excel's operations,
+  skipped blanks and transposing. What is pasted is what the cells hold
+  then, a copy lasts through any number of pastes, and a paste fills the
+  destination with copies when it is a whole number of the source's
+  size. `Cut` moves cells, and every reference in the workbook wholly
+  inside them follows, names included, while one wholly inside the cells
+  they land on becomes `#REF!`. 49 layouts in live Excel pin it.
+- `Range.Replace`, as Excel's does it. It edits the text the formula bar
+  shows -- 1234 in `#,##0` is `1234`, a date `1/2/2020`, 50% `50%` -- and
+  types what is left again, so the number 123 with `2` replaced by `5` is
+  the number 153, and even a Text cell takes a number or a formula. The
+  wildcards are Find's, a `*` as short as will match except at the end.
+  A formula it cannot enter stops it there. It works on several areas
+  and whole sheets, always answers True, and leaves its settings for the
+  next `Find`. 80 layouts in live Excel and the formula-bar text of 20
+  numbers in 26 formats pin it.
+- `Range.SpecialCells` for constants and formulas of each kind, blanks,
+  the last cell and visible cells, with Excel's own quirks: a one-cell
+  range searches from A1 to the last cell, a merged area comes whole, and
+  what is found is split into the very areas Excel returns -- taken from
+  the last cell back, each joining the one-column area below it or the
+  one-row area to its right. 18 layouts of live Excel, eight of them
+  random grids, pin it. Comments, validation and conditional formats
+  report themselves unsupported.
+- `Range.FillDown`, `FillUp`, `FillRight` and `FillLeft`: each area's
+  first row or column, in the direction of the fill, copied over the rest
+  as `Copy` copies it, blanks included; a one-row or one-column area fills
+  from its neighbour, and one at the edge of the sheet is error 1004
+  before anything changes. 16 layouts of live Excel pin them.
+- `Range.CurrentRegion`, as Excel answers it: from the first area's
+  top-left cell, grown while the ring around it holds a value or a
+  formula, corners included, taking in merged areas whole. 34 layouts of
+  live Excel pin it, eight of them random grids read from every other
+  cell.
+- Rows grow with their borders as Excel's do. A medium line along a row's
+  bottom edge draws it a pixel taller; a thick or double line draws the
+  row below a pixel taller too; and a save writes the `thickBot` and
+  `thickTop` flags, the height and the deeper descent Excel writes, on
+  the rows and on the sheet's standard row when column formats carry the
+  lines. Where lines of both weights meet along one edge, the first cell
+  along the row with one decides, as in Excel. 39 cases of live Excel pin
+  the answers, one of them Excel's answer for a border along a hidden
+  row, which the model reports it cannot tell.
+- Row, column and sheet-wide formats as Excel keeps them. Formatting a
+  range that spans every column formats its rows, one that spans every
+  row its columns, and the whole sheet every column. Each row and column
+  keeps a format of its own (a row's `s` with `customFormat`, a column's
+  `style`), read from and saved to the file, and a position with no cell
+  shows its row's format, else its column's. A formatted row and a
+  formatted column crossing get a cell of their own, a new cell starts in
+  its row's or column's format, and an empty cell goes once its format is
+  the one it would inherit. `ClearFormats` and `Clear` put positions back
+  to the default, inserted rows and columns take the formats beside them,
+  and copies carry what each position showed. Borders on whole rows,
+  columns and the sheet follow Excel's own rules for each edge. Reads over
+  whole rows and columns answer Null exactly where Excel's do, without
+  visiting every position. A row's height counts the font at every
+  position, from a second table measured for each font on a row to itself,
+  so a row or column format makes rows shorter or taller and moves
+  `StandardHeight`. 149 probes of live Excel pin the answers; Excel's own
+  saved workbook reads back; 16 files written the way another program
+  might write them read and save as Excel's do; the model's saved rows,
+  columns and cells are Excel's XML; and a live gate opens them in Excel.
+- Rows grow with their fonts as Excel's do. A row that keeps no height of
+  its own is as tall as its tallest font, read from a table measured in
+  live Excel: every pixel size up to 409.5pt of Aptos, Calibri, Arial,
+  Cambria, Consolas, Courier New, Georgia, Segoe UI, Tahoma, Times New
+  Roman and Verdana, in all four styles, 25,662 rows in all. `AutoFit`
+  sizes a row to it, merged cells over several rows and empty turned
+  cells leave rows alone, and a save writes the height and descent Excel
+  does. A row whose height rests on something not measured -- another
+  font, fonts from two tables, super- or subscript, wrapped or turned
+  text -- keeps the height its file recorded until it changes, and then
+  reports itself unsupported rather than guess.
+- Row heights, column widths and hidden rows and columns as Excel keeps
+  them on a 96-DPI display. `Range` gains `Hidden`, `UseStandardHeight`,
+  `UseStandardWidth`, `Height`, `Width`, `Left` and `Top`, and a sheet
+  `StandardHeight` and `StandardWidth`; `RowHeight`, `ColumnWidth` and row
+  `AutoFit` follow Excel, and all of it is read from and saved to the
+  file. A height is rounded to twips and then to quarter pixels, a width
+  to whole pixels, a zero size hides and keeps what it hid, and every row
+  or column sized or hidden at once becomes the sheet's default. A read
+  across several rows or columns answers Null exactly where Excel's does,
+  which depends on where the sheet's cells are (459 live reads fit). 152
+  probes of live Excel pin the answers, an Excel-sized workbook and one
+  another program sized read back value for value, the model's saved
+  rows, columns and sheet defaults are Excel's XML, and a live gate opens
+  them in Excel. Heights and tints are spelled with Excel's rule for a
+  measurement: 15 digits when the double is within 5/16 of an epsilon of
+  them, relative to its size, and 17 otherwise.
+- Cell formats as Excel keeps them. A workbook's stylesheet is read into
+  one format per cell: font, fill, borders, alignment, protection and
+  number format. `Font` gains `Underline`, `Strikethrough`,
+  `Superscript`, `Subscript`, `FontStyle`, `ColorIndex`, `ThemeColor`
+  and `TintAndShade`; `Interior` gains `Pattern`, the pattern colours,
+  `ThemeColor` and `TintAndShade`; `Range` gains `Borders`,
+  `BorderAround`, `ClearFormats`, `VerticalAlignment`, `WrapText`,
+  `IndentLevel`, `Orientation`, `ShrinkToFit`, `AddIndent`,
+  `ReadingOrder`, `Locked` and `FormulaHidden`. 161 probes of live Excel
+  pin the answers, including Null for a mixed range, the palette and
+  tint arithmetic, and where a border between two cells is stored. An
+  Excel-formatted workbook reads back value for value, a live gate opens
+  the model's own formatted workbook in Excel, and for the same edits the
+  saved stylesheet is Excel's byte for byte except for the position of a
+  red font.
+- `docs/excel_checklist.csv`: a status for every member of every Excel
+  class the model implements, with its signature from the type library,
+  the fixtures that are its evidence and the gaps a registration visibly
+  has. `scripts/build_excel_checklist.py` regenerates it, and
+  `tests/test_excel_checklist.py` keeps it in step with the registry.
+- VBA `Worksheet.Move Before:=...` / `After:=...`, with same-book reordering,
+  cross-book transfer, and new-workbook moves; Python `SheetView.move` delegates
+  to the same model implementation. Cross-book moves invalidate held VBA objects
+  with error 424, matching native Excel; reacquire them from the destination.
+  Same-book reordering preserves objects. External-link and unsupported content transfers
+  fail before mutation; reserved local-name indices follow same-book reordering.
+- Cross-workbook range copies import referenced global/local names and aliases.
+  Python callers can choose `name_conflict="reuse"`, `"rename"`, or `"error"`;
+  the default matches unattended Excel. Renaming preserves existing names and
+  rewrites incoming formulas/dependencies, with eight native behavior probes
+  and native save/reopen checks for global and local aliases.
+- Multi-workbook Python APIs (`open_workbook`, `workbooks`, `activate_workbook`,
+  explicit workbook selection for `sheet`/`save`) and `SheetView.copy`/
+  `copy_range`. VBA `Worksheet.Copy` supports Before/After in the same or another
+  workbook and creating a new workbook, including unique tab names, cells,
+  merges and relevant scoped/global names. Seven native copy comparisons and
+  two native persistence gates cover modeled copies; external-link copies and
+  advanced worksheet content remain explicitly unsupported.
+  Workbook numbering no longer reuses names after Close; named Filename and
+  SaveChanges arguments work. Newly added/copied tabs are registered when saving
+  existing packages, preserving tab order and part identities across repeated saves.
+- Named-range CRUD across workbook and worksheet scopes: named-argument
+  `Names.Add`, scoped lookup/enumeration, replacement, rename, RefersTo/Value
+  retargeting, absolute R1C1 forms, Visible, Comment, Range.Name and Delete.
+  Renames update dependent formulas, aliases and control bindings; changes
+  invalidate calculation dependencies. Nineteen native cases and three native
+  persistence gates cover creation, update and deletion. Shared Python APIs
+  provide detached `NamedRange` snapshots and add/update/remove operations on
+  `ExcelApplication` and `SheetView`.
+  Local names now retain qualified identities after reopen; Power Query's
+  ExternalData-name handling follows that identity. Formulas without cached
+  results calculate on first read after reopening.
+- Whole-row/column insertion and deletion now update A1 formulas throughout
+  the workbook and defined names, including absolute references, expanding or
+  shrinking ranges, and deleted targets becoming `#REF!`. Twelve native cases
+  and four native save/reopen checks cover both axes. Qualified errors such as
+  `Sheet1!#REF!` now calculate correctly. Inserts that would discard occupied
+  edge cells fail before mutation. Merges/shapes, partial-cell reference
+  rewriting and full formatting/metadata movement remain incomplete.
+  Fresh workbooks now register additional worksheet parts in the workbook
+  sheet list and relationships, preserving cross-sheet formulas on reopen.
+- Corrected explicit-destination `Range.Copy`: snapshots protect overlapping
+  copies, trailing blank source cells clear destination cells, exact destination
+  multiples repeat the source block, and copied formulas shift per block.
+  Seventeen native cases and five native save/reopen checks cover geometry,
+  cross-sheet copying, formulas and formatting. Merged-cell/multi-area copies
+  and destinations larger than 1,048,576 cells remain explicitly unsupported.
+  Bold font state now loads and saves, including copied/blank cells and
+  bold-only edits; other font and formatting persistence remains incomplete.
+- A1 `Range.Formula` array assignment shares the R1C1 array writer, with
+  native A1 reference shifting during singleton-axis expansion. Fifteen native
+  comparison cases and four native save/reopen checks cover formulas, mixed
+  values, errors, bounds, merged cells and multiple areas. Both formula getters
+  now share array reads that retain requested trailing blank cells.
+- Headless Excel `Range.FormulaR1C1` scalar/block assignment and scalar/array
+  reads, including relative, absolute and mixed references, whole rows/columns,
+  quoted text and worksheet-edge wrapping. Twelve native comparison cases,
+  headless persistence and a native Excel save/reopen gate cover conversion.
+  Array assignment additionally passes 15 native cases and four native
+  save/reopen checks, covering custom lower bounds, singleton-axis expansion,
+  errors, empty arrays, merged cells and multiple areas. Uncovered matrix cells
+  receive `#N/A`, and higher-dimensional arrays raise error 13.
+  Workbook loading now preserves numeric cells as Doubles instead of narrowing
+  whole numbers to VBA Integer/Long; formula reads use Excel's boolean/error text.
+- Headless Excel `Merge`, `UnMerge`, `MergeCells` and `MergeArea`, including
+  ordinary overlap expansion, across-row merges, first-nonempty value/formula
+  retention and merged-region persistence. Twenty-one native cases and four
+  live save/reopen checks cover values, flags, partial-clear errors and unmerge.
+  Range enumeration now includes explicitly requested blank cells outside the
+  used range. Multi-area merges and across merges over existing multi-row
+  merged regions remain unsupported.
+- Headless Excel `Range.Find`, `FindNext` and `FindPrevious` for single-area
+  ranges: values/formulas, whole/partial matching, wildcards and escapes,
+  case sensitivity, row/column traversal, wraparound, blank cells and saved
+  application search settings. Forty-eight native cases pin behavior;
+  save/reopen and sparse whole-sheet checks cover persistence and scale.
+  Multi-area, comments, format searches and MatchByte=True remain explicit
+  unsupported operations.
+- Absolute R1C1 addresses in `INDIRECT`-backed Excel control names, with
+  eight native behavior cases and a save/reopen gate for cell-driven
+  source and linked-cell addresses. A relative one counts from A1.
+- Shared `references()`, `add_reference()` and `remove_reference()` APIs
+  across Excel, Word, PowerPoint and Access, with Office presets and custom
+  registered libraries. GUID-based adds are idempotent; removing an absent
+  reference returns false. Access's strict `drop_reference()` remains.
+  Whole control/project reference groups are preserved or removed intact;
+  MSForms removal is refused while UserForms exist. Reference-only edits
+  honor save protection/signature rules and invalidate compiled caches.
+  Native Excel, Word and PowerPoint gates check references before VBA
+  injection, compile early-bound declarations, and verify removal.
+- Conditional Forms control names using `CHOOSE` and `IF`, with lazy
+  branch selection, cell-driven targets and empty sources for selected
+  scalar values/errors. Sixteen native Excel cases and two live
+  save/reopen gates cover lists and linked-cell writes.
+- Single-area `INDEX` names for Forms control sources and links, including
+  whole rows/columns, aliases, nested reference formulas and cell-driven
+  targets. Fifteen native Excel cases verify indices, selected items and
+  linked destinations; a live gate verifies dynamic bindings after saving.
+- Forms control names backed by `OFFSET` and A1 `INDIRECT`, including
+  nested offsets, aliases, cell-driven addresses and calculated list
+  sizes. Twelve native Excel cases cover dynamic selection and invalid
+  ranges; save/reopen gates verify dynamic sources and linked targets.
+- Named Forms control links and list sources, including workbook/local
+  names, aliases, missing names and changes to their targets. Twenty-four
+  native Excel cases cover resolution and selection behavior; live
+  save/reopen gates verify workbook and worksheet-local bindings.
+  Newly created local names serialize with Excel's worksheet scope.
+- `Range.Formula2` and `Formula2R1C1`. A formula written through
+  `Range.Formula` reads back with an @ wherever it cuts cells to one
+  value, as Excel's does: `=@A1:A3`, `=SUM(@A1:A3*2)`, `=@INDEX(A1:A3,0)`,
+  and none on `=SUM(A1:A3)`. The rule was measured in live Excel for each
+  of its functions with each argument a cell, a range and an operation on
+  a range, and on 150 formulas more, 2100 in all. A formula written
+  through Formula2 that Formula would write the same, the @ aside, is
+  written so, and any other is a dynamic-array formula.
+- Dynamic arrays that spill. A formula `Formula2` writes that answers
+  with an array shows its first item in its own cell and spills the rest
+  below and beside it, into cells with no formula of their own, growing
+  and shrinking as the answer does; one of one item spills nowhere. A
+  cell in the way, a merged block or the sheet's edge makes it #SPILL!
+  until the way is clear; clearing a cell it spilled into, or writing an
+  empty string there, changes nothing, and writing anything else there
+  blocks it. `Range.HasSpill`, `SpillParent` and `SpillingToRange` answer
+  for a spill, `A1#` and `Range("A1#")` read what spilled from A1, in a
+  legacy formula too, and `UsedRange`, `End`, `CountA` and `SpecialCells`
+  see the spilled cells as Excel does. A file keeps a spill as Excel
+  does, an array formula with `cm="1"` and `xl/metadata.xml`, a #SPILL!
+  or an empty array's #CALC! as a rich value under `xl/richData`, and
+  `A1#` as `_xlfn.ANCHORARRAY(A1)`; a workbook Excel saved opens with its
+  spills. 42 cases of cells, 18 expressions and two saved workbooks
+  measured in live Excel (scripts/measure_dynamic_arrays.py).
+- A Forms control's link or list can be any formula that lands on cells,
+  worked out by the cell engine as Excel works a name's formula out: the
+  range operator, an intersection, brackets, LET, XLOOKUP, IFS, SWITCH.
+  22 more cases measured in live Excel: a formula that comes to a value,
+  an error, two areas, or a reference with a sign before it gives an
+  empty list, and a relative R1C1 address in INDIRECT counts from A1
+  whichever cell is active and wherever the control is.
+- Late overlapping-box additions, including nested-group link retention
+  and identical-box link transfer to an unlinked sheet group. Eighty new
+  native Excel cases cover link combinations and selection states.
+- Radio ownership in existing partial, nested and identical overlapping
+  boxes, plus group-box deletion and link transfer. Thirty-two native
+  behavior cases cover creation order, deletion and late additions.
+- Non-overlapping, interleaved radio groups and multi-box regrouping,
+  replaying 44 native Excel cases. Membership is retained during movement
+  and reconstructed on open, verified with an Excel-authored moved-radio
+  fixture and two live save/reopen gates.
+- Single-box radio regrouping: adding a box around a contiguous prefix,
+  suffix or whole group, and deleting it to merge the groups. Thirty-six
+  native Excel cases cover selection and linked-cell effects, with live
+  save/reopen checks for both operations.
+- Radio-group values, shared linked cells, persisted group boundaries and
+  deletion behavior, supported by 70 native Excel behavior cases and an
+  Excel save/reopen gate.
+- `SheetView.add_form_control` creates all nine supported Forms control
+  types with validation before mutation and detached return snapshots.
+- Multi/extended list source and linked-cell rebinding, plus selection
+  preservation when switching between those modes, replaying 28 native
+  Excel measurements and verified by an Excel persistence gate.
+- Spinner/scroll-bar values, linked cells, bounds and increments, replaying
+  52 native Excel cases. Scroll bars support `LargeChange`; spinners
+  reproduce Excel's error 438 for that member.
+- Issue #25 regressions using Excel-authored control fixtures: radio state
+  reading, Radio/Spin/Scroll/GBox type preservation, and numeric defaults
+  and bounds. Unchecked controls omit the `checked` attribute as Excel does.
+- A public Python worksheet shape API through `ExcelApplication.sheet()`:
+  `shapes`, `shape`, `add_shape`, `add_textbox`, `add_button`,
+  `update_shape` and `remove_shape`. Reads return detached snapshots
+  with control details; edits share the VBA model's state. Names and
+  geometry are validated before mutation.
+- `SheetView.update_control` edits or clears saved linked-cell and list-range
+  bindings, updating control properties and VML together. It validates A1
+  references before mutation and leaves existing cell values untouched.
+- Checkbox values through `SheetView.set_control_value` and VBA's
+  `Shape.ControlFormat.Value`, plus the checkbox `ControlFormat.LinkedCell`
+  property. Direct cell writes and formula calculations synchronize linked
+  checkboxes across sheets. Thirty live Excel probes cover defaults,
+  invalid values, unchanged assignments, text/errors, formulas and rebinding.
+- Single-selection dropdown/list-box values through the same Python/VBA
+  API, with A1 range sources, numeric linked-cell synchronization, and
+  VBA `ListFillRange` and `ListCount`. Fifty live Excel probes cover
+  bounds, errors, coercions, formulas and source removal/restoration.
+- Inline list read/add/insert/update/remove/clear APIs in Python and VBA,
+  plus multi/extended list-box selection, `ControlFormat.MultiSelect`,
+  and `DrawingObject.Selected(index)`. Fifty-four live Excel probes cover
+  item edits, selection shifts, mode transitions, native constants and
+  source conversion. Inline items and selected indexes persist through
+  the properties and VML parts, with live save/reopen gates for all modes.
+- Whole-list VBA reads and assignments, plus Python `set_control_items`.
+  Ninety-two live cases cover detached one-based arrays, Null/empty lists,
+  one- and two-dimensional assignments, array bounds, partial failures,
+  and range-backed edits. Item additions/replacements disconnect an A1
+  source and start an inline list without changing source cells; individual
+  removal from a range source raises Excel error 1004.
+
+### Changed
+
+- Modules added in one save are declared in the order they were added,
+  as Excel declares them, where they were sorted by name.
+- A file saved before its first macro opens, as the ordinary file it is
+  (#26). `ExcelFile`, `WordFile` and `PowerPointFile` opening a
+  `.xlsm`, `.docm` or `.pptm` with no `vbaProject.bin` used to raise
+  `VBAProjectError`, with advice to save it as the format it already
+  was. A `.xls`, `.doc` or `.ppt` with no macros opened but called
+  itself "not a valid VBA project" on the first read. Now listing reads
+  answer empty, and a read or write that needs the project raises
+  `NoVBAProjectError`, naming the file and the application its first
+  macro has to be written in. A project that is there but broken is
+  still an error of its own. Files Excel, Word and PowerPoint saved with
+  no macros are the fixtures (scripts/measure_no_vba.py).
+- Cells are worked out by pyOfficeEditor's formula engine, which the
+  library took in: 493 of Excel's 525 functions where the model had 122,
+  Excel's coercion and comparisons, and arithmetic as the x87 does it.
+  Over the model's workbook it comes to what Excel cached for all 10,958
+  formulas of pyOfficeEditor's corpus, where the model's own engine
+  matched 6,718, and it answers every live measurement the model had:
+  legacy formulas take the first item of an array where INDEX, the
+  lookups, IFERROR and IFNA want one value, IF and its kind work their
+  arguments out as a cell does inside SUMPRODUCT, lookups compare
+  numbers to the bit, and a defined name's formula is an array formula.
+  It also matches Excel's VAR and STDEV on the data under a thousandth
+  the model missed. RIGHT past the text's length, MATCH over a single
+  value, CHOOSE with an array of positions, R1C1 ranges in INDIRECT and
+  a number turned to text in twenty characters follow Excel too.
+- `WorksheetFunction.X`, `Application.X` and `Evaluate` go through the
+  same engine: 388 WorksheetFunction members where the model had 75. A
+  range is handed over as its cells, so COUNTIF, SUBTOTAL and INDEX read
+  cells from VBA as in a cell, and a range of several areas is taken.
+- A data validation's formula, a Forms control's link and list, and the
+  number format a formula brings go through the same engine, and the
+  model's own engine is gone.
+- Writing a formula refuses any function that answers with a value where
+  cells are wanted, as `COUNTIF(SUM(A1:A3),1)` is refused, for every
+  function the engine has. Excel was measured with each of the 493 in
+  COUNTIF's range and takes 15 of them there, DROP, TAKE, LET and
+  TRIMRANGE among them. The model let through any function its old
+  engine did not have.
+- A cell holds every number as a Double, a date included; its format
+  decides what `Value` reads. A query's refreshed rows keep their text as
+  text rather than typing it.
+- The in-memory Excel is Excel on a 96-DPI display (Windows at 100%): a
+  standard row is 15pt where the model used 14.5pt, the height Excel gives
+  it on a 144-DPI display. A shape's cell anchor is read and written
+  against the same rows and columns, so a shape nobody moved stays where
+  it was when its drawing is saved again.
+- A sheet the model adds is written as Excel writes a new sheet, with its
+  view, row defaults and page margins, and a rewritten sheet's row
+  defaults are this display's.
+- Setting any part of a format marks that part as applied, as Excel does,
+  even when the value does not change. An xf's apply flags now say what a
+  macro set rather than what differs from the cell style, so
+  `Font.Bold = False` on an untouched cell leaves a formatted empty cell
+  in the used range and in the file, as in Excel. A file's apply flags
+  are not read, since Excel takes a format that differs only in them for
+  the same one.
+- A loaded sheet that Excel tidies on opening is written again on save as
+  Excel writes it, instead of keeping its bytes. That covers an empty cell
+  in the format its row or column gives it, a row format every column
+  shows, a column with no width, and a stale dimension.
+
+### Fixed
+
+- `PowerPointFile.create_new` makes a presentation whose VBA project
+  references what PowerPoint's own does, OLE Automation and Office. The
+  template's project referenced Microsoft Forms through a cache file in
+  the Temp folder of the machine that made it, so every new presentation
+  carried that folder's path, and it held a form's streams at its root.
+  The template is made again from a presentation PowerPoint saved with
+  one title slide and an empty Module1.
+- A signed `.xlsm`, `.docm` or `.pptm` whose code changes is saved
+  without its signature, as Excel, Word and PowerPoint save it (#27).
+  They keep the signature in parts beside `vbaProject.bin`, where the
+  save gate did not look, so the edited file kept the old signature and
+  Excel read `VBASigned` as True for code it did not cover. The parts,
+  their relationships and their Overrides in `[Content_Types].xml` now
+  go, and Word's remaining relationship for `vbaData.xml` is numbered
+  from `rId1` again, byte for byte as each application writes them
+  (scripts/measure_signature_parts.py). A live gate has each application
+  open the result unsigned. A signature in a binary `.xls`, `.doc` or
+  `.ppt` file is still not looked for: no signed binary file has been
+  measured.
+- A formula that names a sheet, `=Other!A1*2` or even `=Data!A1*2` on
+  Data itself, written to several cells at once is saved as a formula in
+  each cell, as Excel saves it. The model saved one shared formula, and
+  Excel will not open a file with a shared formula that names a sheet. A
+  cut that sends the cells a shared formula reads to another sheet
+  leaves every cell of that group with a formula of its own too, the
+  ones still reading their own sheet included (scripts/
+  measure_shared_sheets.py). The workbook the filtered-edits live gate
+  makes, which cuts such cells, opens in Excel again.
+- A form control on a sheet other than the first to draw one is numbered
+  from that sheet's own block of 1024 VML ids, 3073 on for the third, as
+  Excel numbers them; the model numbered every sheet's from 1025. A
+  sheet's `<drawing>` goes before its `<legacyDrawing>` and
+  `<tableParts>`, where the schema has it, rather than at the end.
+- A row's spans are Excel's: a span for each run of 1024-column groups
+  holding a cell, `1:20 16384:16384` for a row block reaching A, T and
+  XFD, where the model wrote `1:16384`. A sheet used in every column
+  writes its dimension as cells, `A1:XFD1048576`, not `1:1048576`.
+- `Range("A1:B2 B2:C3")`, two references with a space between them, is
+  where they meet, B2, as in Excel. A comma binds looser,
+  `Range("A1:C3 B2:D4,E5")` being B2:C3 and E5, and references that do
+  not meet are error 1004. The model refused every such range with error
+  1004.
+- A formula `Formula2` writes with an `@` is saved as Excel saves it: as
+  a legacy formula wherever `Formula` would write it and read back the
+  same, `=@A1`, `=SUM(@A1:A3)` and `=LET(x,A1:A3,@x)` among them, and as
+  a dynamic array only where the `@` changes its answer, `=@A1+A1:A3`
+  spilling. The model made every such formula a dynamic array.
+  `Formula2` puts an `@` on a name the workbook does not define,
+  `=@nosuch`, which makes `Formula2 = "=nosuch+1"` a dynamic array, and
+  in front of the spaces before what it cuts, `=@ A1:A3`.
+- `Range.End` from an empty cell lands on the next filled cell, as
+  Ctrl and an arrow key do: `Range("E4").End(xlUp)` below E1:E3 is E3.
+  The model looked only at the neighbour and walked on to E1.
+- The names a LET or a LAMBDA binds are read as Excel reads them. A name
+  that looks like a cell, `=LET(x1,5,x1)`, is the name, 5, not the cell:
+  A1 cannot read it, and Excel reads the formula as R1C1, where every
+  other cell written as A1 is a name too, `=LET(x1,5,SUM(x1,'A1'))` being
+  #NAME?. The model read the cells, and `x1` as `X1`. A bound name is
+  spelled everywhere as the formula binds it, `=LET(a1,5,A1)` reading
+  back as `=LET(a1,5,a1)`. LAMBDA's `[y]` is a parameter a call may leave
+  out, blank then and ISOMITTED, and a call leaving out any other is
+  #VALUE!; the model refused `[y]` and let a call leave out any
+  parameter. A file writes a bound name `_xlpm.x1`, an optional one
+  `_xlop.y` and a name that looks like a cell `_xlnm.A1`, as 24 formulas
+  saved in live Excel show (scripts/measure_bound_names.py), and the
+  model reads them back so. `=LET($A$1,5,1)` is refused.
+- A formula written in the other notation is read as Excel reads it.
+  `Range.Formula`, `Formula2`, `Value` and `FormulaArray` read A1, and
+  where A1 cannot, R1C1: `=R[-1]C+1` written to C8 is `=C7+1`, `=R1C1`
+  is `=$A$1` and `=R` the formula's row, where the model refused the
+  first with error 1004 and read `R1C1` as a name. A name that reads, or
+  starts, as an R1C1 reference is one A1 cannot read, `R1Foo` refused
+  in both; `R0C1`, `R_1` and a LET's `r` are names. `FormulaR1C1` reads
+  what looks like a cell in A1 as a name, spelled in quotes in A1,
+  `='A1'+1`, where the model read the cell, and refuses `$A$1`; what
+  only looks like one, `XFE1` or `A1048577`, is a name in both. 79
+  formulas measured in live Excel (scripts/measure_formula_notation.py).
+- `Range.Formula` and its kin refuse, with error 1004, what Excel refuses
+  past a formula's syntax, all of which the model took: a function given
+  too few or too many arguments, as each of Excel's 525 functions written
+  with 0 to 16 and 249 to 256 shows, one newer than Excel 2007 taking at
+  most 254 and SUMIFS and its kin only whole pairs; an operation where
+  MAXIFS, MINIFS, RANK, CELL, AGGREGATE past its fourth argument, a
+  database function, FORMULATEXT, ISFORMULA or PHONETIC reads cells; a
+  LET or a LAMBDA with a name that is none, TRUE or `x.y`, or with one
+  twice; a text of more than 4095 characters; more than 256 brackets open
+  in one argument, a call's own among them; calls more than 65 deep; and
+  more than 1024 signs and operators waiting on their operands. CALL,
+  REGISTER.ID and PY are refused however they are called. A formula
+  longer than 8192 characters is error 7, and one longer than 255 given
+  to `FormulaArray` error 1004, as 14,377 formulas measured in live Excel
+  show (scripts/measure_formula_refusals.py). TEXTJOIN takes 254 arguments,
+  not 252, and BYROW and BYCOL given no function are #CALC!, as there.
+- A long chain of cells comes to what Excel shows. A running total 300 rows
+  down, `=A1+1` filled from A2, read 140 at the bottom: past about 140
+  cells one inside another, Python ran out of stack, and the model took
+  the cell for one that fed itself and left 0 in it. A cell more than 24
+  cells down is now put off, worked out on its own and the cell wanting
+  it tried again, so a chain of any length comes out right: 3000 rows,
+  running up or down, summed, read from above or across two columns, as
+  8 chains measured in live Excel show
+  (scripts/measure_long_chains.py). A change at the top of a chain
+  finds what reads it through an index rather than by going through
+  every formula once per cell down, so changing the top of a 5000-row
+  chain takes a fraction of a second, not ten.
+- The deepest formulas Excel takes work: 4096 terms added one to the
+  next, 256 brackets one inside another, 65 functions, a thousand signs
+  before a number or 8190 percent signs after one, 8192 characters in
+  all. Writing one raised error 28, out of stack space, where the model
+  went down the formula's tree one call inside another; such work is
+  now done again on a thread with room enough
+  (`pyopenvba.formula._deep`), and each formula comes to what Excel
+  shows and reads back as long, written, filled, copied, saved and
+  opened again, as 22 formulas measured in live Excel show
+  (scripts/measure_long_chains.py). `FormulaR1C1` reads the first 8192
+  characters of a formula R1C1 spells longer, as Excel does. Excel keeps
+  a formula only while its compiled form fits 16384 bytes, which the
+  model, having no compiled form, does not check: four of the 22 go past
+  it.
+- A saved formula spells a function newer than Excel 2007 as Excel does,
+  `_xlfn.XLOOKUP`, FILTER and SORT as `_xlfn._xlws.FILTER`, and each name a
+  LET or a LAMBDA binds as `_xlpm.x`. The model wrote them bare, and Excel
+  would not open a workbook the model saved with FILTER or SORT in it
+  (`Workbooks.Open` failed with error 1004 in live Excel); a bare XLOOKUP,
+  CONCAT or LET opened, but not as Excel writes it. Which functions take
+  `_xlfn.` is Excel's own list, measured in live Excel for 517 of its 525
+  functions: NETWORKDAYS.INTL, newer than 2007, takes none. Reading a file
+  drops the prefixes again, for cells, defined names and a table's
+  formulas.
+- A saved formula Excel works out whenever anything changes carries
+  `ca="1"`: one calling NOW, OFFSET, INDIRECT, CELL, INFO and ten more, or a
+  function neither Excel nor the workbook's macros and names have. An
+  array formula like that is `aca="1"` too, unless it covers several cells
+  and calls RAND, and each of its other cells carries `<f ca="1"/>`, as
+  shared and array formulas saved in live Excel show.
+- `Range.Formula` takes a LAMBDA called where it is written,
+  `=LAMBDA(x,x*2)(5)`, and works it out, as Excel does; the model refused
+  it with error 1004.
+- A function a sheet has is spelled in capitals whatever case it is
+  written in, SIN, ADDRESS and NORM.DIST as much as SUM, as 11 formulas
+  measured in live Excel show. The model kept `=sin(1)` and
+  `=norm.dist(1,0,1,true)` as written: it asked VBA's WorksheetFunction,
+  which has no SIN and spells NORM.DIST with an underscore, where it now
+  asks the formula engine's list of Excel's 525 functions.
+  `WorksheetFunction.If` and `WorksheetFunction.Sin` are error 438, as in
+  Excel, rather than reported unsupported.
+- RATE and IRR stop where Excel's own iterations stop, to the bit, and FV
+  and PV round as Excel does where the payment and the balance cancel:
+  `RATE(10,-100,1000)` is -1.96E-10, not 0. This is pyOfficeEditor's
+  ed27bf2, taken into the engine.
+- XIRR finds its root as Excel does, by halving a bracket from the guess
+  rather than by Newton's method, and stops where Excel stops, to the bit:
+  `XIRR({-1,2},{1,2})` is Excel's rate, where the engine went on to
+  7.5E+109. This is pyOfficeEditor's 94ea041, held there to 2,183 probes.
+- PRICE, DURATION and MDURATION give Excel's bits on every bond probed.
+  PRICE adds the coupons, then the redemption, then takes off the accrued
+  interest, formed from the rate while coupons are still to come;
+  DURATION times each coupon at its index plus DSC/E and the redemption
+  at DSC/E + N - 1; MDURATION divides by 1 + y/f. All three count the
+  days to the next coupon as what is left of the period, E - A, on every
+  basis but actual/actual. This is pyOfficeEditor's 81481d2, held there
+  to 1,500 PRICE probes and 1,800 each for DURATION and MDURATION.
+- `INDEX(A1:B2,2)`, one index into cells in rows and columns, is #REF! as
+  in Excel; the engine gave row 2. `INDEX(A1:B2,2,)` is still row 2.
+- A `+` before a reference reads its cells as values, as Excel does:
+  `ISREF(+A1)` is FALSE, `=+A1:A3` is the cell in the formula's row, and
+  `COUNTIF(+A1:A3,1)` is refused.
+- BINOM.DIST, BINOMDIST and BINOM.DIST.RANGE with a chance of 1 or 0 work
+  out; the engine failed on 0 to the power 0. BINOM.INV and CRITBINOM with
+  a chance or an alpha of 0 or 1 are #NUM!, as in Excel.
+- The database functions over labels alone, a database or criteria of one
+  row, are #VALUE! as in Excel; they answered 0. ACCRINTM settled the day
+  it is issued is 0, CELL with an info type that is not one of its words,
+  `CELL(1)`, is #VALUE! rather than unsupported, and XIRR of one payment
+  is #N/A. 38 formulas measured in live Excel pin these.
+- A cell holding #CALC!, #SPILL!, #FIELD!, #GETTING_DATA, #CONNECT!,
+  #BLOCKED! or #UNKNOWN! reads in VBA as its own error, `Error 2050` for
+  #CALC!, where the model answered `Error 2015`. `CVErr` of those numbers
+  writes that error, and `CVErr` of a number no cell error has, 2044 or
+  2051, is error 1004 as in Excel; the model wrote #VALUE!.
+- `Range.Formula` refuses `ANCHORARRAY(A1)`, the file's spelling of `A1#`,
+  with error 1004, as Excel does.
+- A Forms control linked to more than one cell, `$H$1:$I$1`, writes its
+  top left cell, as Excel does; the model refused the link. A control
+  name that comes back to itself gives an empty list, as in Excel, where
+  the model reported it unsupported.
+- AND, OR and XOR pass over a text argument that says neither TRUE nor
+  FALSE, as Excel does: `AND(TRUE,"x")` is TRUE, and only with nothing
+  logical left is the answer #VALUE!. 12 formulas in live Excel pin it.
+- `WorksheetFunction.Choose(1, Empty)` is 0, as in Excel: an argument
+  left out that a function hands back reads as 0 in VBA, where a blank
+  cell reads as Empty. The model answered Empty.
+- A formula whose answer is empty text, which Excel saves as `<v/>`,
+  reads back as "" rather than as an empty cell.
+- An `e` in a number format with no sign after it shows the year, as
+  Excel's era year does in this locale: `TEXT(0,"0;-0;zero")` is
+  `z1900ro`, and `Range.Text` shows a cell the same way.
+- A workbook holding a formula the parser cannot read works out every
+  other formula as before; that cell keeps the value its file gave it.
+  The model stopped at the first such formula, so writing any cell of the
+  workbook failed.
+- `Range.Select` and `Range.Activate` on a sheet that is not the active
+  one are error 1004, as in Excel; the model made the sheet active.
+  `Activate` on a cell inside the selection moves the active cell and
+  keeps the selection; the model selected the cell alone.
+- A workbook opens on the sheet its file had active, with that sheet's
+  selection, and a save moves the selected tab to the active sheet. The
+  model opened every workbook on its first sheet, and a save left the
+  tab where the file had it.
+- Closing the active workbook activates the window behind it, as Excel
+  does; the model activated the workbook opened last.
+- A save works out every formula nothing has read since it was written,
+  and saves it with its value, as Excel's cells are always up to date
+  under automatic calculation. The model saved such a formula with no
+  value. One the model cannot work out is still saved without one, and
+  under manual calculation a cell keeps the value it last had.
+- `Err` clears where VBA clears it: when a procedure of the macro starts,
+  on every `On Error` statement, and on leaving a procedure from its
+  error handler. It keeps what a procedure left in it after the procedure
+  returns, and a built-in function or an object's member leaves it
+  alone. The model never cleared it on a call or an `On Error`
+  statement, so an error handled in one function was still in `Err` in
+  the next one. 23 programs in live Excel pin it.
+- A table part names a column holding a tab or a line break with Excel's
+  `_x0009_` escapes; the model wrote the characters themselves, which a
+  reader of the file takes for spaces.
+- CHOOSE with an array of indexes chooses for each item, as Excel does
+  in a cell: `CHOOSE({1,2},A1:A3,B1:B3)` is the two columns side by
+  side, so `VLOOKUP(x,CHOOSE({1,2},B:B,A:A),2,FALSE)` looks to the left.
+  The model chose once, by the first index. 7 formulas in live Excel pin
+  it.
+- `Me` in a class module is the instance the code runs for. The model
+  reported it as an undefined variable.
+- Arguments given to a property that takes none apply to what it
+  answers, as in VBA: `Range("C1:C3").Formula(2, 1)` is the second
+  formula of the array Formula answers. The model raised error 450.
+- A workbook Excel saved with a formula filled down, copied or written
+  to a block reads with every cell's formula. Excel stores such a block
+  as one shared formula whose other cells only point at the first; the
+  model read those cells as the values they last showed, so they never
+  changed again. A save now writes shared formulas as Excel does: over
+  the block a macro writes, fills or copies a formula to, kept through
+  edits, inserts and deletes as Excel keeps them, and numbered as Excel
+  numbers them. A formula's text and value keep a quote as it is, as
+  Excel writes them. 11 workbooks saved by Excel pin it.
+- A formula written to a General cell takes the number format Excel
+  gives it, as it is written: `=A1+30` on a date is a date, so its Value
+  reads back as a Date rather than a Double. A reference brings its
+  top-left cell's format, `+` and `-` the first side's but nothing for
+  two dates, `*`, `/` and `&` nothing, and SUM, MAX, MIN, INT, ROUND,
+  ROUNDDOWN, ROUNDUP, TRUNC and MOD their first formatted argument's.
+  TIME brings h:mm AM/PM. A range written at once takes its first cell's
+  format. The model formatted only a formula that was itself DATE, TODAY
+  or NOW, and only when it was first worked out. 111 cases in live Excel
+  pin it.
+- A range or an array where a formula wants one value is handled as
+  Excel handles it in a cell. Cells given to a function that wants one
+  value, beside an operator, or as the whole formula are cut to the one
+  on the formula's own row or column, as Excel's `@` does: `=LEN(A1:A3)`
+  in row 2 is `LEN(A2)` and in row 5 `#VALUE!`, and `SUM(A1:A3*2)` in
+  row 2 is 4. An array given there is run through item by item, so
+  `SUM(LEN({"a","bb"}))` is 3, except by INDEX, VLOOKUP, HLOOKUP,
+  XLOOKUP, IFERROR and IFNA, which take its first item. IF takes a
+  branch for each item of an array of conditions. SUMPRODUCT's
+  arguments, INDEX's first and those of ROWS and COLUMNS are worked out
+  as arrays even in a cell, except inside an IF, CHOOSE, IFERROR, IFNA,
+  IFS or SWITCH, and a defined name's formula as an array formula. ROW
+  and COLUMN give every row or column only in an array. The model read
+  the first cell of a block in a cell and an operator's whole block
+  everywhere, so a formula written before dynamic arrays could come out
+  wrong without saying so. 232 formulas in live Excel pin it.
+- A value where the -IF and -IFS functions, COUNTBLANK, OFFSET, ROW,
+  COLUMN or AREAS read cells is error 1004 when the formula is written,
+  as it already was for SUBTOTAL, and a function that answers with a
+  value counts as one: `SUMIF(LEN(A1:A3),1)` is refused, as is
+  `SUBTOTAL(9,LEN(A1))`, which the model took. A name there that comes
+  to a value is `#VALUE!`.
+- An argument that comes to an error reaches its function as a value:
+  `COUNT(A1:A3*2)` in row 5 is 0 and `COUNTA` of it 1, as in Excel. The
+  model answered the error.
+- DAY, MONTH and YEAR read a serial number before March 1900 on Excel's
+  calendar, which has a 29 February 1900: `DAY(1)` is 1 and `YEAR(1)`
+  1900. The model read such a date a day early.
+- A defined name whose formula comes to a value rather than cells, such
+  as `=IF($A$1:$A$3>1,1,0)`, is worked out where it is used. The model
+  answered `#NAME?`.
+- `MATCH(3,3,0)` is `#N/A`: MATCH looks only in a range or an array.
+- ISREF, which reported itself unsupported.
+- `Rows.Count` is 1048576 and `Columns.Count` 16384: Count counts the
+  rows of whole rows and the columns of whole columns, as Excel does,
+  `EntireRow` and `EntireColumn` included. The model counted their cells,
+  so `Cells(Rows.Count, 1).End(xlUp)` failed. `Cells.Count` is error 6,
+  as in Excel.
+- `Range.Address` writes R1C1 style when asked, a relative part counted
+  from RelativeTo, or from A1 without it. The model ignored
+  ReferenceStyle and wrote A1 style.
+- A constant is a Long, as VBA holds an enum's member however small:
+  `TypeName(xlUp)` and `TypeName(vbOK)` are `Long`. Only the key codes
+  are declared Integer. The model made every constant that fits an
+  Integer one, so `vbYes * 10000` overflowed.
+- Arithmetic that passes the largest double, as `=1E+300*1E+300` does,
+  is `#NUM!`, as in Excel. The model answered infinity.
+- A formula that ends on a `+` or `-` whose answer all but cancels is 0,
+  as in Excel: `=0.5-0.4-0.1` is 0, not -2.8E-17. Excel sets the answer
+  to 0 when its binary exponent is 50 or more below the left operand's,
+  about seven steps of the last bit. Brackets around the whole formula,
+  or a function around the difference, keep the bits. SUM and AVERAGE
+  do the same to their last addition, and a defined name to its
+  formula. 1,788 pairs of doubles measured in live Excel pin it.
+- Comparisons round each number to fifteen significant digits, an exact
+  tie going away from zero, as Excel does. The model found the digits
+  with a logarithm, which misses by one beside a power of ten:
+  999999999999999.375 equalled 1E+15.
+- MATCH, VLOOKUP, HLOOKUP and XLOOKUP compare numbers bit for bit,
+  exact and approximate, as Excel's lookups do. The model matched them
+  to fifteen digits like `=`. COUNTIF, COUNTIFS, SUMIF and SWITCH still
+  match to fifteen digits, as in Excel.
+- A number turned to text in a formula rounds an exact tie at the
+  sixteenth digit toward zero: 4503599627370495 reads
+  `4503599627370490`. The model rounded half to even.
+- A defined name that stands for a formula, such as
+  `=Sheet1!$A$1-Sheet1!$B$1`, is worked out where the name is used. The
+  model read that one as $B$1 on a sheet called `Sheet1!$A$1-Sheet1`,
+  and answered `#NAME?` for other formulas. One with a relative
+  reference reports itself unsupported.
+- SUM, AVERAGE and AVERAGEIF add one number after another, each sum
+  rounded to a double, as Excel adds. The model added exactly, and SUM
+  came out a bit away from Excel's on 23 of 87 measured sets.
+- STDEV, STDEVP, VAR and VARP are Excel's doubles. Excel takes the
+  one-pass sum of squares, and the squares about the mean when that
+  cancels; the model worked the exact variance. STDEV of 1, 6, 7 and 8
+  is 3.1091263510296048, as in Excel. 340 of 348 answers over 87 sets
+  match to the bit. The other 8 are on data under a thousandth and stay
+  known misses.
+- `CStr` and the text of a number round an exact tie at the last digit
+  shown away from zero, as VBA does, for a Single as for a Double.
+  `CStr(CSng(2 ^ -11))` is `4.882813E-04`; the model rounded it to even.
+- `Range.Cut` moves a reference that loses a whole edge to the cells it
+  moves, as Excel does. Across sheets the reference keeps the rest:
+  `SUM(B2:B7)` reads `SUM(B5:B7)` once B2:B4 is cut away. On its own
+  sheet the edge goes where the block goes when the block moves straight
+  along the range: B7 cut to B9 leaves `SUM(B2:B9)`. The model left
+  both as they were. 24 layouts in live Excel pin it.
+- `Range.Delete` and `Range.Insert` with a `Shift` rewrite the references
+  to the cells they move, as Excel does. A reference whose columns lie in
+  the band that shifts moves and stretches as it would for whole rows,
+  `#REF!` once everything it reads is deleted, and so do names, formulas
+  on other sheets and the AutoFilter's range; one reaching outside the
+  band stays, unless a delete takes a whole edge of it: `SUM(B2:C6)` reads
+  `SUM(C2:C6)` once B2:B6 is deleted up. Inserted cells take the formats
+  above them or to their left. With no `Shift`, a range taller than it is
+  wide shifts across, as Excel decides; the model always shifted up or
+  down, and never touched a reference. 47 layouts in live Excel pin it.
+- A value assigned to a member that answers an object goes to that
+  object's default member, as VBA sends it: `Range("A1") = 5`,
+  `Cells(2, 2) = 7`, `ws.Range("A1:B2") = 0` and `r(2) = 3` all fill
+  cells. The model raised error 438 for each.
+- A formula cut to another sheet keeps pointing where it did. A reference
+  into the cells that move with it stays as it was written, and one to a
+  cell left behind names its old sheet: `=D1+B2` cut from CutAway1 reads
+  `=CutAway1!D1+CutAway1!B2`. The model named the new sheet in the first
+  and nothing in the second.
+- `Range.Value` read a number under an elapsed-minutes format, `[m]` or
+  `[mm]`, as a Date, taking the `m` for a month; Excel reads a Double.
+- `NumberFormat` kept every escaped character as written. Excel drops the
+  backslash wherever the bare character would mean nothing, so
+  `\T\R\U\E` reads back `T\RU\E`: digits but 0, most marks and the
+  letters that are no date, time or era code lose it, and a dot keeps it
+  only in a section with digits, a comma only straight after one. Every
+  printable character, measured four ways, pins it.
+- `Range.Formula` read a stored number as VBA's `CStr` spells it; it now
+  spells it as Excel does, written out up to 21 characters. `=A1&""`
+  writes numbers out up to 20 characters as Excel does, where it switched
+  to an exponent from 1E+11 and below 1E-4.
+- `End` stopped at a cell with only a format; Excel walks over one as
+  over an empty cell.
+- A formula a macro writes is spelled as Excel spells it back, through
+  `Formula`, `FormulaR1C1`, `Value`, an array or `Replace`: references in
+  capitals and ranges from their top-left corner (`SUM(B2:A1)` is
+  `SUM(A1:B2)`), sheets as they are named, Excel's functions, TRUE,
+  FALSE and errors in capitals, defined names as they were defined, any
+  other name as the workbook first saw it, and numbers written out again
+  from their first fifteen digits (`=1.50` is `=1.5`, `=+1` is `=1`).
+  Spaces stay, except before a comma, at the end and in an array
+  constant. A formula Excel refuses to read raises error 1004 where the
+  model kept it, and `=` alone is text. The model kept the text as
+  written. 120 formulas in live Excel pin the rules.
+- Formulas read ranges between two sheet-qualified references
+  (`Data!A1:Data!B2`), intersections (`A1:B2 B1:C3`) and unions in
+  brackets; working one out reports itself unsupported, where the text
+  could not be read at all. A function's bracket has to follow its name,
+  as in Excel, and an error typed in lower case is read.
+- `FormulaR1C1` spelt a whole row or column in its own row or column
+  twice, `C:C` for `A:A`; Excel writes `C`.
+- Formula functions that differed from Excel's: `COUNT` of values given
+  as arguments counts TRUE, FALSE, text that reads as a number and an
+  argument left out; `COUNTA` counts one left out; `POWER(0,0)` is
+  `#NUM!`; `DAYS` reads text dates; `CEILING.MATH` takes the magnitude of
+  its significance and a mode; `INDEX` of one row with one index counts
+  along it; `TRANSPOSE` of a single value is the value.
+- `Find` among formulas read a constant as the cell shows it, so 1234 in
+  `#,##0` was found by `1,234` and not by `1234`; it reads it as the
+  formula bar shows it, as Excel does.
+- The whole sheet's address was spelt `$A$1:$XFD$1048576`; Excel spells it
+  `$1:$1048576`.
+- `CLng`, `CInt`, `CByte`, `CSng`, `CDbl` and `CCur` of an Error value
+  give its number, as VBA's do, and `Val` of one raises error 13.
+- `CDbl("1E-25")` and any other number string with an upper-case
+  exponent raised a Python error.
+- `CStr` of a Date chose what to print from the serial rather than the
+  moment rounded to the second: `CDate(0)` printed `12/30/1899` where VBA
+  prints `12:00:00 AM`, and a time a hair short of midnight printed the
+  time where VBA prints the next day's date.
+- `CStr`, `Format`, `Hour`, `Minute` and `Second` of a Date that rounds
+  past the last second of 9999 raised a Python error; VBA stays on that
+  second.
+- Built-in number formats 5 to 8, 12, 13, 37 to 44 and 48 were missing
+  from the model's table, so a save gave them custom ids, and 47 was
+  spelt `mmss.0` where Excel reads `mm:ss.0`.
+- Saving a sheet took time proportional to the square of the cells in a
+  row, since each cell was spliced into its row's XML one by one; a row
+  of thousands of cells took minutes.
+- A column a file gives no width reads as Excel reads it: hidden, and 0
+  wide.
+- `ClearContents` and `Clear` drop a cell they leave empty and in its
+  inherited format, and no longer visit every position of a large range.
+- `ColumnWidth` and `RowHeight` were kept only in memory: a file's widths
+  and heights were never read, and a macro's were never saved.
+- `UsedRange` and a saved sheet's dimension count rows that have a height
+  or are hidden, as Excel's do.
+- A new workbook's cells read Excel's defaults: `Font.Name` is the
+  workbook's own font (Aptos Narrow in a current Excel, where Calibri was
+  assumed), `HorizontalAlignment` is `xlGeneral` rather than `xlLeft`, and
+  `Font.Color` answers a Double. `NumberFormat` over cells that differ
+  answers Null.
+- Excel classes whose members the type library keeps on an interface,
+  Range on IRange and Font on IFont among them, are found there. A member
+  Excel lacks raises error 438 and one it has reports itself unsupported;
+  before, a typo on Range read as unimplemented, and Font was checked
+  against Word's Font.
+- Writing to or formatting more than 1,048,576 cells at once reports
+  itself unsupported instead of raising error 1004, since Excel does it.
+- Multi-selection controls now read Excel's lowercase `seltype` attribute
+  and `multiSel` indexes; scalar `Value` reads raise error 1004 in VBA.
+
+- Dropdown/list selections now read and persist the `sel` property and
+  VML `Sel`, preserving the separate `val` field. Excel opens new and
+  subsequently edited controls with the expected type and selection.
+
+- Checkbox snapshots now report Excel's unchecked (`-4146`), checked (`1`)
+  and mixed (`2`) values, replayed from live Excel measurements.
+- Checkbox state persists in both control properties and VML; newly created
+  checkboxes use the correct properties-part control type.
+- Literal error cells read back as VBA error values, and assigned VBA error
+  values save as error cells. Text TRUE/FALSE assignments become booleans,
+  matching the measured linked-cell cases.
+
+- Deleting a form control now removes its worksheet record, properties
+  part, relationship and VML shape as well as its drawing. Shared parts
+  and other VML shapes survive; the final control can be deleted and a
+  new one added on a later save.
+- Renaming, moving, resizing and changing a control's caption now reach
+  both its worksheet/VML records and its drawing. Live Excel exposed
+  that an existing control can have a second caption in DrawingML which
+  takes precedence over the VML caption.
+- Shape names containing a backslash are written literally, and a macro
+  can be assigned to a shape whose drawing omitted the macro attribute.
+
+### Internal
+
+- pyOfficeEditor's formula engine, copied into `pyopenvba.formula._calc`
+  from its commit ed27bf2: a parser, an evaluator and 493 of Excel's
+  functions, with arithmetic as the x87 does it. Over the model's own
+  workbook, through `_engine_book`, it works out all 10,958 formulas of
+  pyOfficeEditor's corpus as Excel cached them, to the bit or within the
+  units pyOfficeEditor allows. `scripts/copy_formula_engine.py` shows how
+  the copy differs from pyOfficeEditor, and makes it again.
+- `scripts/measure_cells_functions.py` writes each of the engine's
+  functions on its own and into COUNTIF's range in live Excel, and
+  `tests/test_formula.py` replays all 493. AMORDEGRC and a LAMBDA called
+  where it is written, the two whose answers still differ from Excel's,
+  are strict expected failures with their reasons.
+- Fixture workbooks no longer carry the folder Excel saved them in, which
+  Excel writes into xl/workbook.xml as `x15ac:absPath`.
+  `scripts/strip_fixture_save_paths.py` took it out of the 246 committed
+  workbooks that had one and left every other byte of each package as it
+  was. The measurement scripts take it out as they save or copy a
+  workbook into tests/fixtures, through `scripts/fixture_workbook.py`.
+
+### Removed
+
+- `pyopenvba.formula.Context`, `Grid` and `evaluate`, the model's own
+  formula engine, which nothing in the library used any longer.
+  `pyopenvba.formula` keeps its parser and its values.
+
+## [6.0.0] - 2026-09-20
+
+VBA runs. Not read, not analysed: executed, against an Office
+application that lives in memory, with the file written back out
+afterwards.
+
+```python
+from pyopenvba.apps.excel import ExcelApplication
+
+app = ExcelApplication.open("report.xlsm")
+app.run("BuildReport")
+print(app.describe())
+app.save("report_out.xlsm")
+```
+
+### Added
+
+- **A VBA interpreter.** Every statement form, the runtime library, and
+  three separate failures: `VBACompileError` for VBA that does not
+  compile, `VBARuntimeError` carrying the number `Err` would hold, and
+  `VBAUnsupportedError` for real VBA this does not implement, which
+  `On Error` deliberately cannot trap. An unknown member is told apart
+  by the type library rather than guessed: `Worksheet.PivotTables` is
+  unsupported, `Worksheet.Pivottabel` is VBA's own error 438.
+
+- **Excel, Word and PowerPoint object models**, each with real state
+  behind it, each measured against its own application. Cells, ranges,
+  names, queries, sheets; a document's text, paragraphs and ranges; a
+  presentation's slides. `ExcelApplication`, `WordApplication` and
+  `PowerPointApplication` open a file, run a macro and write it back.
+
+- **A calculation engine.** A macro can write a formula and read the
+  answer. Calculation is on demand, writing a cell spoils whatever
+  reads it, and about a hundred worksheet functions are implemented;
+  anything else Excel has says so by name rather than answering
+  `#NAME?`.
+
+- **A Power Query evaluator.** `WorkbookQuery.Refresh` works out the
+  query's M and lands its rows on the sheet it loads to, with the table
+  and its queryTable following. Queries can name each other and
+  `Excel.CurrentWorkbook()` reads the workbook's own tables. Nothing
+  reaches off the machine: the connectors report themselves.
+
+- **Shapes on all three surfaces.** Adding, reading, moving, resizing,
+  renaming, retyping and deleting, with the macro a click runs attached
+  or removed -- `Shape.OnAction` in Excel, form-control buttons
+  included, and `ActionSettings(ppMouseClick).Run` in PowerPoint. Word
+  has no macro on a shape and says so. An Excel form control is written
+  as its four parts, so a button a macro made opens as a button.
+
+Every answer was measured in the application itself rather than
+reasoned about: 245 VBA expressions, 223 formulas, 160 Excel object
+model probes, 46 PowerPoint, 43 Word, 269 Power Query expressions, one
+of every shape type in all three hosts, and a shape fixture per host,
+all committed so the tests need no Office.
+Seven live gates behind `RUN_LIVE_EXCEL`, `RUN_LIVE_WORD` and
+`RUN_LIVE_POWERPOINT` ask what only Office can answer.
+
+### Changed
+
+- `WorkbookQuery.Refresh` evaluates the query instead of reporting
+  itself unsupported.
+- A date is written out rather than handed to `strftime`, whose way of
+  asking for a number without its leading zero is Windows-only. The
+  Access SQL writer had the same defect and the same fix.
+
+## [5.2.4] - 2026-09-17
+
+Two defects in the member list beside a form or report, the stream that
+decides what `Me.` can reach. Both were reported with the measurements
+and the fixtures that pin them.
+
+### Fixed
+
+- **An entry holds two names, and the reader took one** ([#22]). It stores
+  the identifier VBA compiles against, a NUL, the name the designer shows,
+  a NUL, leaving the second empty where the two are the same. A control is
+  rarely named as VBA would name it: the wizard names one after its field,
+  so `Order Date` is ordinary and code reaches it as `Me.Order_Date`.
+  Reading to the first double NUL walked into the next entry's type id, so
+  every later entry was misaligned. A form with an ActiveX control failed
+  the edit outright; one without was rewritten with `Order Date` as the
+  member, which no code can reach, and `Me.Order_Date` stopped compiling
+  after any edit made here. Both names are read and written now, and an
+  entry carried forward writes back the bytes it was read from. An
+  identifier that is not one can only have come from the old writer, so
+  the next edit rebuilds it from the design's name.
+
+- **A name the code page cannot hold got a `???` member** ([#23]). Access
+  writes no entry at all for one, and takes no ordinal for it. Every edit
+  to a form with a control named in Cyrillic appended a `???`, and a
+  second edit gave the form's class two members of that name. Such a name
+  is left out now, on add and on rename alike, and no best fit is
+  accepted: a name with a `?` in it names something else.
+
+  Two members that are one identifier to VBA are refused, as Access
+  refuses the second control name as already in use.
+
+  The page is no longer hardcoded. PROJECTCODEPAGE is tried first, being
+  the page of the machine that last saved the project, and the stream's
+  own bytes overrule it. An earlier note claimed the stream is fixed at
+  cp1252 because patching PROJECTCODEPAGE to 1251 changed nothing. That
+  experiment was void: VBA went on reading the project as cp1252 and
+  Access wrote 1252 back over the patch on its next save.
+
+- **A refused edit left the design written and the member list stale.**
+  `_rewrite_design` wrote the design blob before building the member
+  list, so a refusal from the list left the database holding a design its
+  class does not describe. Everything is computed before anything is
+  written.
+
+Every `TypeInfo` stream in the fixtures still rebuilds byte for byte, and
+the live gate compiles a project whose code reaches each control by the
+identifier Access gives it.
+
+[#22]: https://github.com/WilliamSmithEdward/pyOpenVBA/issues/22
+[#23]: https://github.com/WilliamSmithEdward/pyOpenVBA/issues/23
+
+## [5.2.3] - 2026-09-08
+
+Three defects found by hunting the same seam the last few reports came
+from: the sheet writer reading its own output back, or Excel's, and
+assuming everything else looks the same.
+
+### Fixed
+
+- **A sheet could not be picked by a name holding `&`, `<`, `>` or `"`.**
+  Those are stored escaped, so a sheet named `A & B` sits in the file as
+  `A &amp; B`. Attribute values were read as stored and compared against
+  the name a caller passed, so the lookup failed and reported the escaped
+  spelling back in the error. Values are decoded on the way in and
+  escaped again on the way out.
+
+- **An apostrophe in a sheet name was not doubled in the defined name.**
+  A reference spells `It's` as `'It''s'`; a single apostrophe closes the
+  quoting early, so the name pointed at something else. Names opening
+  with a digit are quoted now as well, since unquoted they read as part
+  of a cell reference. Excel accepts all of them and reports the
+  references back exactly.
+
+- **The sheet's declared extent was never widened on a foreign sheet.**
+  The element was matched by its exact spelling, so a writer that puts a
+  space before the closing slash, as openpyxl does, kept the extent it
+  started with and the part said the sheet ended before the table began.
+
+Nothing here changes what is written for a workbook Excel authored.
+
+## [5.2.2] - 2026-09-08
+
+### Fixed
+
+- **Loading onto any sheet but the first made the workbook unopenable.**
+  The hidden `ExternalData_N` name was written with a constant
+  `localSheetId="0"`, and that attribute is the zero-based position of
+  the sheet the name belongs to. Loading to the second sheet wrote a name
+  claiming the first while its reference named the second, and Excel
+  refused the file outright. It is looked up now, from the same list of
+  sheets that settles which part a sheet is.
+
+  A one-sheet workbook cannot show this, which is why every fixture here
+  missed it. The live gate loads onto each of three sheets and has Excel
+  open and refresh all three.
+
+## [5.2.1] - 2026-09-08
+
+### Fixed
+
+- **Loading a query onto a sheet failed on a workbook another tool
+  wrote.** Three assumptions here came from reading only Excel's output,
+  and each broke on openpyxl's, which is as legal. Relationships were
+  matched with the id written first, where openpyxl writes it last, so a
+  sheet looked as though it had no part behind it and the load was
+  refused. `<definedNames />` written closed got a second block appended
+  beside it rather than being filled, leaving two in the workbook. And a
+  `tablePart` was added using the `r:` prefix on worksheets that never
+  declared it, because a worksheet with no table has no use for one,
+  which left the part not well formed. Excel now opens and refreshes a
+  query loaded into a workbook openpyxl wrote.
+
+  Saving through openpyxl still discards the Power Query package, since
+  it rebuilds the file from the parts it models and drops the rest. That
+  is not ours to fix, and `docs/power_query.md` now says so.
+
+- **`[trash]` parts are dropped instead of carried forward.** Excel's
+  file recovery leaves the parts it threw out under `[trash]/NNNN.dat`.
+  An OPC part name cannot open a segment with a bracket, and Excel will
+  not open a package holding one: the same workbook opens before the
+  entry is added and raises after. The container preserves entries as
+  they arrive, which handed back a file that stayed broken, so `save()`
+  now takes them out and warns. Nothing depends on them: no content type
+  declares them and no relationship points at them.
+
+### Internal
+
+- `openpyxl` joins the dev extras, so the interop tests run against the
+  real writer rather than only against a copy of its output. The runtime
+  still has no dependencies.
+
+## [5.2.0] - 2026-09-05
+
+### Added
+
+- **`rename_form()` and `rename_report()`** ([#21]). A design's name lives
+  in four places: its container's listing, its catalog row, its
+  navigation-pane row, and the module behind it, which Access binds by
+  name as `Form_<name>` or `Report_<name>`. A design Access has never
+  opened a code window for has no module, and then there are three. The
+  live gate renames a form that has code, opens the design in Access, and
+  reads the code back through the VBE.
+
+### Fixed
+
+- **A stale `DocClass=` line made Access call the whole project corrupt**
+  ([#21]). `PROJECT` names the module behind a form or report only as
+  `DocClass=<name>/<flags>`, never as `Module=` or `Class=`. The renamer
+  reached the first two and the workspace line and left `DocClass` alone,
+  so a rename produced a project naming a module it no longer had. Access
+  opened the database and showed the form, then reported the project as
+  corrupt on the first VBE reference. The remover had the same gap, so a
+  `DocClass=` line survived a delete. Both handle it now, carrying the
+  flag word after the slash through untouched.
+
+- **`delete_form()` and `delete_report()` left the module behind.** The
+  design went and its code stayed, listed in the VBE for a form that no
+  longer existed, and `delete_module` would not take it either because a
+  design's module has no storage folder. Deleting a design now removes
+  its module first, while the design is still there to name it.
+
+- **The first module in a project with none went unlisted.** Module
+  creation only updated the container's listing when the container
+  already had one, where design and macro creation create it. It also
+  needed an existing `Module=` or `Class=` line to insert after, so
+  adding a module back after deleting a project's last one raised
+  `ValueError` out of the PROJECT editor. Both containers now go through
+  one helper, and the first line of an empty module block opens below
+  `ID=`, where Access puts it. Found by the xlide_vscode port, which hit
+  it first on a blank template with no modules at all.
+
+[#21]: https://github.com/WilliamSmithEdward/pyOpenVBA/issues/21
+
+## [5.1.3] - 2026-09-05
+
+### Fixed
+
+- **`delete_module` took a module's storage folder by position** ([#19]).
+  The position came from `modules()`, which is dir-stream order and
+  includes the module behind a form or report. Those have no folder under
+  `Modules`, so the two lists were different lengths and every module
+  after a document one sat a place high. Deleting the last module of a
+  project that has a coded form raised `IndexError`, and the same
+  arithmetic quietly took another module's folder in the cases that did
+  not run off the end. The folder now comes from the container's own
+  `DirData`, which names it, the way `_delete_design` already read it.
+  Asked to delete the code behind a form, `delete_module` now says so
+  instead of taking the next module's folder.
+
+- **Decimal keys and values rounded at 29 digits** ([#20]). Both codecs
+  scaled through Python's default arithmetic context, which rounds at 28,
+  while the column is a 16-byte magnitude. `2**96 - 1` came back five too
+  high, so a key stopped naming the row it pointed at, and an index entry
+  that does not match its row sorts wrong and never matches on lookup.
+  The row and index codecs now share `scaled_decimal` and `scaled_int`,
+  which run at a precision no value a column can hold will overflow. The
+  index also rounds a fractional value the way the row encoder does,
+  rather than truncating, so the two agree on the same input.
+
+[#19]: https://github.com/WilliamSmithEdward/pyOpenVBA/issues/19
+[#20]: https://github.com/WilliamSmithEdward/pyOpenVBA/issues/20
+
+## [5.1.2] - 2026-09-05
+
+### Fixed
+
+- **The Access VBA writer read no PROJECTCODEPAGE** ([#18]). It encoded
+  and decoded every ANSI string as latin-1: module source, the dir
+  stream's name and stream-name records, the PROJECTwm entries, the
+  PROJECT stream, and reference names and libids. Two consequences, and
+  the first reaches ordinary English projects. Writing a module died
+  outright on anything latin-1 cannot hold, so an em dash, a curly
+  quote, an ellipsis or a euro sign in a comment raised
+  `UnicodeEncodeError`; latin-1 and cp1252 differ over exactly the
+  0x80-0x9F band those live in. And every non-1252 project was read
+  through the wrong page, which is invisible on a round trip because
+  latin-1 is a byte-identity codec and only shows once the text is
+  displayed or re-encoded.
+
+  The writer now resolves the project's declared code page the way the
+  readers already did, through `encoding_for_codepage`, and encodes with
+  `encode_mbcs`, so a character the page genuinely cannot hold folds to
+  `?` in the ANSI record while the UTF-16 record beside it stays exact.
+  That is what the VBE writes. A live gate has Access read an em dash, a
+  curly quote, an ellipsis and a euro sign back out of a module written
+  here.
+
+### Added
+
+- **The Access write path joins the language-matrix CI job.** The same
+  per-code-page sweep the Excel writer has had since [#13] now runs
+  against a database whose PROJECTCODEPAGE is each of the twenty-one
+  pages, covering module source, native module names through add,
+  rename and delete, and the cp1252 punctuation band on its own.
+
+### Documentation
+
+- **TypeInfo member names in `_designs.py` are cp1252, measured.** The
+  issue raised the hardcode there as a possible second instance. It is
+  not one: Access named a control with an em dash and wrote one byte,
+  `0x97`, which cp1252 gives U+2014 and latin-1 cannot represent at all,
+  and patching the project's PROJECTCODEPAGE to 1251 changed nothing.
+  That stream does not follow the VBA code page and must not be threaded
+  with it. Access also drops a member whose name the page cannot hold
+  rather than substituting it, which the writer here does not; it
+  differs only for names cp1252 cannot express.
+
+[#18]: https://github.com/WilliamSmithEdward/pyOpenVBA/issues/18
+[#13]: https://github.com/WilliamSmithEdward/pyOpenVBA/issues/13
+
+## [5.1.1] - 2026-09-05
+
+### Changed
+
+- **`examples/power_query_refresh.py`** no longer demonstrates a state
+  Excel's dialog cannot build. Its third query removed its data before
+  saving without also refreshing on open, which Excel draws as a ticked
+  box greyed out beneath an unticked one. That query now does both, and
+  is called `Transient` rather than `Manual`, since its rows are fetched
+  when the workbook opens and dropped again when it is saved.
+
+### Added
+
+- **What that pairing actually is**, in `docs/power_query.md`. The
+  dialog's wiring is not a rule about the file. Excel's object model sets
+  `QueryTable.SaveData = False` with refresh-on-open off and raises
+  nothing; Excel writes the same shape itself when refresh-on-open is
+  ticked, remove-data is ticked, and refresh-on-open is then unticked;
+  and Excel resaves a workbook pyOpenVBA wrote that way with the
+  attribute intact. So `keep_data = False` on its own stays legal, and
+  the only cost is a query whose table opens empty until someone
+  refreshes it.
+- `test_excel_keeps_remove_data_without_refresh_on_open` in the live
+  gate, which holds that measurement, and a test that the shipped example
+  writes nothing the dialog cannot reach.
+- Live coverage for `examples/power_query_refresh.py`. All three of its
+  queries now have to refresh in Excel, and Excel's object model has to
+  report the profiles the example's own printed table claims. The other
+  two Power Query examples already had this.
+
+### Fixed
+
+- The 5.0.0 entry's link to `docs/power_query.md` was relative, which
+  resolves from inside the repository but not from the GitHub release
+  page the entry was published to. It is an absolute URL now, in the
+  changelog and in the published release notes.
+
+## [5.1.0] - 2026-09-05
+
+### Added
+
+- **Refresh control on a loaded query.** `query.refresh` gives the
+  settings behind Excel's Connection Properties dialog: `background`,
+  `interval_minutes`, `on_open`, `keep_data`, `in_refresh_all` and
+  `enabled`. None of them live in the Power Query package; they sit on
+  the workbook connection the query loads through, and two are mirrored
+  onto the query table. Where each is written was measured by toggling it
+  in Excel and diffing the file, and two are not where the wording
+  suggests: removing data before saving reads from
+  `queryTable/@removeDataOnSave`, and staying out of Refresh All is
+  stored as an exclusion in a connection extension. The live gate sets all
+  six from Python and has Excel's object model read them back.
+
+  "Enable Fast Data Load" is deliberately absent. Excel's object model
+  does not expose it, so there was no way to watch Excel write it.
+
+- **`examples/power_query_refresh.py`** gives three loaded queries three
+  refresh profiles, and prints what each one will do.
+
+- **`examples/power_query_steps.py`**, a second Power Query example built
+  around a query's Applied Steps. It writes a sales pipeline whose main
+  query has eleven steps, and keeps those steps in a list with `#PREV`
+  standing for the step before, so inserting or removing one is a list
+  operation and the references rewire themselves. Both the built workbook
+  and an edited copy refresh in Excel.
+- `quote_name()` and `unquote_name()` are public, so code that generates M
+  can spell a name the way M spells it without reaching into a private
+  module.
+
+## [5.0.0] - 2026-09-05
+
+### Added
+
+- **Power Query, read and written in pure Python.** A workbook keeps its
+  Get and Transform queries in one custom XML part: an OPC package
+  holding an M section document, a metadata document beside it and a
+  permission list, all base64 inside a `DataMashup` element.
+  `PowerQueryWorkbook` opens any Excel package -- `.xlsx` included, which
+  has no VBA project at all -- and reads, edits, adds, renames, groups
+  and removes the queries in it.
+
+  - `queries()`, `query(name)`, `query_names()`, and per query the
+    formula, description, steps, load target, group and every metadata
+    entry Excel recorded.
+  - `add_query()`, `remove_query()`, `rename_query()` (which rewrites the
+    queries that name the old one, through the M tokenizer, so a match
+    inside a text literal or a record's field name is left alone),
+    `set_section_text()` for the whole document at once.
+  - `add_group()` / `remove_group()` and `move_to_group()` for the
+    folders in the Queries pane.
+  - `load_to_sheet()` and `unload()`, which write and remove the
+    connection, query table, table and sheet reference that actually put
+    a query's result on a worksheet.
+  - `PowerQueryWorkbook.create_new()` builds a workbook from nothing.
+  - `pull_power_query()` / `push_power_query()` and `pq-ls`, `pq-pull`,
+    `pq-push` on the command line: one `.m` file per query beside a
+    manifest carrying the names a file name cannot hold.
+
+  The writer aims at Excel's own bytes rather than at something Excel
+  will accept. A workbook read and written unchanged is identical to the
+  byte; a package rebuilt from its parts reproduces Excel's ZIP exactly,
+  down to the raw deflate at level 6 and the growth-hint extra field; and
+  the metadata section, the entry encodings and the query-group blob are
+  byte-identical to what Microsoft's own packaging assemblies produce for
+  the same input. Twelve live gates have Excel open what was written and
+  evaluate it, and
+  [docs/power_query.md](https://github.com/WilliamSmithEdward/pyOpenVBA/blob/main/docs/power_query.md)
+  records how every rule was measured, including the three that a
+  specification would not tell you: a query is a metadata item with at
+  least one entry, the permission list and the metadata content package
+  are both load-bearing, and the permission bindings are not.
+
+- **`examples/power_query_demo.py`** builds a workbook of twelve queries
+  in four groups, six of them loaded onto a sheet, reading JSON from four
+  public APIs in five shapes: a list of records, one request per row, a
+  list of bare numbers, GeoJSON features, a record whose field names are
+  data, and a record of records. Every query in it was refreshed in Excel
+  before it was committed.
+
+### Changed
+
+- The deflate port moved from `pyopenvba.access._deflate` to
+  `pyopenvba._deflate`, where both the Access attachment codec and the
+  Power Query package writer use it, and gained `raw_compress()` for the
+  headerless stream a ZIP entry carries.
+
+## [4.0.0] - 2026-09-05
+
+### Added
+
+- **Access has the same API as the other hosts.** `AccessDatabase` gains
+  `module_names()`, `get_module()`, `set_module()`, `add_module()` (taking
+  `VBAModuleKind`), `vba_project()` with `add_module` / `rename_module` /
+  `delete_module`, and `pull_modules()` / `push_modules()`; the top level
+  gains `push_access()` beside `pull_access()`, and the command line
+  `access-push` beside `access-pull`. Forms and reports come back from
+  `forms()`, `reports()`, `form()` and `add_form()` / `add_report()` as
+  `AccessForm` objects with `walk()`, `control()`, `properties()`,
+  `set_property()`, `add_control()`, `remove_control()` and `set_code()`,
+  the calls a UserForm takes; a control is an `AccessControl` with the
+  same `properties()` / `set_property()`. Removing a control re-marks the
+  ones left in its section and closes the tab order up behind it; the
+  live gate has Access read back what remains.
+
+- **Compact and Repair.** `db.compact_and_repair()` builds a new database
+  the way DAO's `CompactDatabase` does: a bare engine skeleton with every
+  object copied in -- containers, forms and modules, then tables, queries
+  and links in the order of the catalog's Name index, rows in primary-key
+  order, indexes built over them, AutoNumber counters reset to the largest
+  value present, permission rows and property blobs written in a last
+  pass, relationships re-created. Jet 4 `.mdb` files take their own
+  skeleton. Under a frozen engine clock five compactions -- tables with
+  deletes, keys and memos; counters and queries; attachments; forms,
+  reports, macros, modules, a link and seven query shapes; a Jet 4 file
+  -- match the engine's output on every page but page 0. The
+  result keeps the source's creation date, because the engine keys its
+  encoding of owner and permission SIDs to that date (a 30-bit fold of
+  five of its bytes feeds a generator that stayed unknown), so those
+  bytes copy across unchanged. A table whose definition runs past one
+  page is built column by column as the engine builds it, two writes
+  per column onto fresh continuation pages, and the destination grows
+  and lets rewritten pages back into use by the engine's rule (64 pages
+  ahead, then 8 or 64 at a time, the waiting pages returning once 24
+  pages have been taken since they last did), so the stale pages behind
+  a wide table and every page after them land where the engine puts
+  them: a sixth compaction, two 161-column tables with a memo, a key and
+  rows, matches the engine page for page.
+
+- **Fourteen more form property codes are named** -- `Glow`, `Shadow`,
+  `QuickStyle`, `HoverForeColor`, `PressedForeColor` and the hover and
+  pressed theme index, tint and shade properties -- by differencing a
+  command button and a toggle button in Access, taking the table to 180.
+  The four codes still keyed by number, 700-703, turned out not to be
+  properties: they are the insets a button keeps for an effect that is
+  off, dropped in favour of the paddings when Glow or Shadow is set.
+
+- **`SELECT ... INTO` makes a table.** The make-table query creates the
+  table the engine creates: a copied column keeps its definition, an
+  expression gets the type the engine's own inference gives it (157
+  expressions measured, every definition page byte-identical), the rows
+  follow, and the three quirks a made table's headers carry -- computed
+  columns variable-length, ordinals from one, a Decimal's precision and
+  scale leaking into the columns after it -- are written as the engine
+  writes them.
+- **`UPDATE` and `DELETE` run over a join**, writing to either table of
+  the join, applying every join row in the engine's order, and refusing
+  what the engine refuses: a subquery in a SET clause, a join DELETE that
+  does not name its table, a row a DELETE reaches twice.
+- **A FROM clause with joins in parentheses reads** -- `(A INNER JOIN B
+  ON ...) INNER JOIN C ON ...`, which is how Access writes every query
+  over three tables, and the group on the right side too.
+- **A numeric literal with an exponent** (`1E3`, `1.5E-1`) reads.
+
+- **A table's rows can be packed onto fewer pages.**
+  `db.rebuild_table(name)` reads a table's rows out, drops the table,
+  makes it again from the same definition and writes the rows back, so
+  they land on as few pages as they need; `db.compact(rebuild=True)` does
+  that for every table it can and then reclaims the file's tail. A
+  2000-row table cut to 200 went from 270 pages to 92.
+
+  Deleting rows does not shrink a table -- not here and not in Access,
+  which is what Compact and Repair is for -- so until now a large delete
+  left the space stranded: free pages, but in the middle, where the
+  trailing-run reclaim could not reach them.
+
+  Both halves are writers the engine was measured against, so this adds
+  no new way to lay a table out. It refuses a table it cannot carry
+  across whole -- one with a complex column, a link, or a relationship
+  naming it -- and it compares the rows before and after, putting the
+  whole database back if they differ. A rebuild either round-trips or
+  changes nothing. The AutoNumber values and their counter are kept,
+  where Access's own compact resets the counter.
+
+  `db.table_specs(name)` is the piece that made it possible: the table
+  described as the `ColumnSpec` and `IndexSpec` list that would create it
+  again, with sizes in the units those take rather than the header's
+  bytes.
+
+- **Charts and Edge browsers can be written**, and the reader knows two
+  more types (navigation buttons and the navigation control's own kind).
+  That takes the reader to 28 control types and the writer to 23. Naming
+  a record is not needed to write one: a slot whose code has no
+  established meaning is keyed by its code, which also expresses the one
+  case a name could not -- an Edge browser carries code 450 twice, at two
+  ids.
+
+  Three records Access writes on these are deliberately left out. 596,
+  597 and 600 put the control in a layout, which is where the designer
+  drops a new one; with them written, Access stacks a chart under
+  whatever else claims the same layout instead of leaving it where it was
+  put. Isolating that took building the same three-control form five ways
+  and comparing where Access reported each control.
+
+  A navigation control stays read-only for a reason that is not about
+  codes: it is not one control. One of its records names a sibling
+  subform by name, and Access builds navigation buttons beside it, so one
+  written alone would point at a subform that is not there.
+
+- **A design's properties can be changed.**
+  `db.set_control_property(form, control, "FontSize", 18)` and
+  `db.set_design_property(form, "Caption", "My window")` write one
+  property of one control, section, or of the form or report itself.
+  Access reads every one back exactly as written -- captions, fonts,
+  colours, sizes, control sources, tips and tags among them.
+
+  `PROPERTY_CODES` grew from 40 names to 107 along the way. Codes whose
+  values are small integers every other property also uses cannot be
+  named by matching values, so those were named by differencing: build
+  the same form twice, identical but for one property, and see which
+  record moved.
+
+  A record's id is its slot in that object type's own schema, so changing
+  a property an object does not already carry means knowing the id Access
+  would have given it. `PROPERTY_SLOTS` holds 959 of those across 26
+  object types, every one read off an object Access itself wrote; across
+  seven databases every id, code and value type agreed, and so did every
+  length except the strings', whose length is their text's. A property
+  the object already carries keeps its record where it stands; a name
+  that is not in the table is refused rather than written somewhere it
+  does not belong.
+
+- **Every control type pyOpenVBA can read, it can now write.**
+  `add_control` wrote a Label or a TextBox; it now writes all eighteen --
+  CommandButton, ToggleButton, OptionButton, CheckBox, OptionGroup,
+  ListBox, ComboBox, Rectangle, Line, Image, PageBreak,
+  BoundObjectFrame, ObjectFrame, Subform, Tab and Page as well. Every
+  slot's id, code, value type and width was read back from a control
+  Access itself made, and each type gets only the slots it has: a page
+  break carries a top and nothing else, a tab control no left or top at
+  all, an image no overlap flags, a combo box its GUID ahead of its
+  name. A button is written with the padding Access gives it, a list or
+  combo box with `Table/Query` as its row source type, and anything that
+  takes the focus with the next tab index.
+
+- **Twenty-nine more design property codes named**, taking the table from
+  40 to 69. Access's `SaveAsText` writes a design's properties with their
+  names, so pairing that against the blob names the codes -- but pair on
+  the *value*, not the position: the blob carries records the text does
+  not write, so a straight walk drifts and starts naming codes wrongly a
+  few records in. Both runs re-derived every code already named and
+  contradicted none, which is what makes the new names evidence rather
+  than a guess. `docs/research/access_designs/` carries the scripts.
+
+- **Six control types the reader did not recognise at all**: custom
+  (ActiveX) controls, attachment controls, the web browser, the
+  navigation control, charts and the Edge browser. All six now parse and
+  report their type; the first three are written as well, and Access
+  accepts each. The other three are read but not written: each
+  carries records this project cannot name -- 450, 456, 458, 600 among
+  them, and a dozen more on a chart -- and on the navigation control and
+  the Edge browser one of those, 450, appears twice at two ids, which a
+  table keyed by property name cannot express. Writing one is refused
+  with the reason rather than attempted.
+
+  That takes the reader to 27 control types and the writer to 21. Two
+  more codes Access accepts, 131 and 132, turn out to be alternate ways
+  to ask for a subform and a text box: the file records them as 112 and
+  109.
+
+- **A control can hold controls.** `add_control(..., parent="Tabs")` puts
+  a page on a tab control, which is written as a group of its own right
+  after it. Reading a design is now a tree walk rather than a flat scan,
+  since a section's count is of its own controls and not of everything
+  beneath them. A page must have a parent tab and nothing else may have
+  one, both of which are refused rather than written.
+
+  The live gate puts one of every writable type on a single form and has
+  Access name them all back, and builds a tab control with two pages
+  between a text box and a button -- Access reports the tab as each
+  page's parent and the form as the parent of the two beside it.
+
+- **Jet 3 (Access 97) databases read.** `AccessDatabase` opens a 2 KiB
+  page `.mdb` and reads its catalog, tables, rows and long values the
+  same way it reads an `.accdb`. Everything that moved between the two
+  versions lives in one `Layout` record, so there is a single parser, a
+  single row splitter and a single set of value decoders rather than a
+  second implementation: the page halves, a row counts its columns and
+  its variable-column offsets in bytes rather than words, text is stored
+  in the code page page 0 names rather than UTF-16, and the definition,
+  column, index and name headers all shrink and move.
+
+  Every offset was measured against files the Jet engine wrote, and the
+  parser checks that what it consumed equals the length the page
+  declares. The live gate has DAO 3.6 -- which still creates Access 97
+  files though Access dropped the format in 2013 -- build a database with
+  every Jet 3 column type, a 4000-character memo, code page text, a
+  deleted row and four hundred rows over many pages; pyOpenVBA reads the
+  same file with no COM involved and the two agree cell for cell.
+
+  Writing a Jet 3 file is refused rather than attempted, at the page
+  store itself, so nothing can put a Jet 4 shape into one.
+
+- **Compaction.** `db.compact()` gives back the free pages at the end of
+  the file and says how many went. That is what a dropped table or a
+  large delete leaves behind, and it is the part of compaction that can
+  be done without moving a page: nothing moves and no object is
+  rewritten, so nothing can be lost. Free pages in the middle keep their
+  place, and the first two pages are never dropped.
+
+  A 954 KB database with a dropped 3000-row table came back at 300 KB
+  with its other table intact. The live gate has the engine itself read
+  a compacted file row for row and then run its own Compact and Repair
+  over it, which rebuilds every page it kept.
+
+  This is not Access's Compact and Repair, which also renumbers pages,
+  resets AutoNumber counters and drops deleted rows from the middle of a
+  table.
+
+- **The domain functions.** `DLookup`, `DCount`, `DSum`, `DAvg`, `DMin`,
+  `DMax`, `DFirst`, `DLast`, `DStDev`, `DStDevP`, `DVar` and `DVarP` run
+  in `db.execute(...)`. Each is a query over another table, so each runs
+  as one: `DLookup("Total", "Orders", "Id = 1")` is
+  `SELECT Total FROM Orders WHERE Id = 1`. A criteria can name a column
+  of the row it is evaluated in, which is what makes them worth having.
+
+  These are Access's own rather than the database engine's, so DAO cannot
+  answer for them: the gate compares every one against Access's `Eval` on
+  the same database, and all seventeen agree.
+
+- **The password guard reaches Access.** `db.vba_is_protected()` reads
+  the `PROJECT` stream's `DPB` record, and `db.save()` refuses to write a
+  VBA change into a protected project unless it is told
+  `allow_protected=True` -- which is what the other hosts already do on
+  their own `save`. A change that is not to the VBA project saves as
+  before.
+
+- **The project's references.** `db.references()` reads the libraries a
+  VBA project points at, `db.add_reference(name, guid, major, minor,
+  path=, description=)` adds one and `db.drop_reference(name)` removes
+  it. A live gate adds the Scripting Runtime, writes a module that uses
+  `Scripting.Dictionary`, and has Access compile and run it.
+
+  Access keeps them only in the dir stream, three records each --
+  `REFERENCEORIGINAL`, its Unicode twin, and `REFERENCEREGISTERED`
+  holding `*\G{GUID}#major.minor#lcid#path#description`. `PROJECT`
+  carries no `Reference=` line, and the two libraries every project has,
+  VBA itself and Access, are not in the file at all. The version is
+  written in **hex**: DAO 12.0 is stored as `c.0`.
+
+- **Forms and reports.** `db.forms()`, `db.reports()`, `db.form(name)`,
+  `db.report(name)`, `db.create_form(name)`, `db.create_report(name)`,
+  `db.delete_form(name)` and `db.delete_report(name)`. A live gate opens
+  what this writes in Access's own designer, and a created form also
+  opens in form view.
+
+  A design is a stream of property records, `<u32 id><u16 code><u32
+  type><u32 width><u32 length><value>`, with the ids ascending inside one
+  object. Three ids are not properties but markers that open the next
+  object: `0xFE` a section, `0xFD` the next object at the same level, and
+  `0xFF` a control, which carries a second `u16` naming its type. Every
+  design measured -- an empty form, a form with a label and a text box,
+  and a report with its three sections -- rebuilds byte for byte.
+
+  `db.add_control(design, type, name, ...)` puts a Label or a TextBox on
+  one, and Access reads back every measurement it was given. Thirty-three
+  property codes are named, worked out by exporting a design with
+  `SaveAsText` -- which writes the same records with their names, in the
+  same order -- and walking the two together.
+
+  A control belongs to a section and is written immediately after it, and
+  its marker depends on **how many controls that section holds**: one is
+  a single child, `0xFE`; two or more open a group, `0xFF` then `0xFD`.
+  Access writes both in one report -- a page header holding one control
+  and a detail band holding two -- and refuses each in the other's place,
+  with "saved in an invalid format" for one of them.
+
+  `db.set_design_code(name, code)` puts code behind one, creating the
+  module when the design has none, and Access runs it. A document module
+  belongs to its design rather than to `Modules`: no storage folder, no
+  catalog row, and a `DocClass=` line in `PROJECT` where a class module
+  gets `Class=`. Without that line Access loads the module and the form
+  still does not answer to it. The design's `TypeInfo` and the module's
+  `VB_Base` share a CLSID, and a byte in the design folder's `PropData`
+  records that it has a module at all.
+
+  Creating cuts from a captured empty design with a GUID of its own
+  patched in, since the catalog row repeats the one the design carries.
+
+- **Macros.** `db.macros()`, `db.macro(name)`, `db.create_macro(name,
+  actions)` and `db.delete_macro(name)`, with `MacroAction(name,
+  arguments)` for each step. A live gate creates a macro, has Access run
+  it with `DoCmd.RunMacro`, and reads back the value it set.
+
+  Access stores a macro as a binary blob, not as the XML its designer
+  shows: a 32-byte header, a length-prefixed `"33"`, then one record per
+  action carrying the action id, the row number, fourteen `u16` slots
+  holding byte offsets into a string area, and the strings themselves.
+  Arguments occupy slots from 4 upward and an empty one takes no slot,
+  so a gap in the middle reads back as an empty string. Every blob in
+  the fixture rebuilds byte for byte.
+
+  Twenty-four action ids, measured by loading one macro each through
+  `LoadFromText` and pairing storage folders with `MSysObjects` rows in
+  id order. A macro's object id steps by **one** where a module's steps
+  by four, and a macro gets no navigation-pane group row where a module
+  does -- so the step is what an object reserves for itself rather than
+  a global stride.
+
+- **Attachments and multi-valued columns.** `db.complex_columns()` finds
+  them, `table.attachments(column, key)` and
+  `table.multi_values(column, key)` read them, `set_attachments` /
+  `set_multi_values` write them, and
+  `table.add_complex_column(name, kind)` creates one. An inserted row is
+  given its complex id automatically. A live gate builds a database, a
+  table and both kinds of column from nothing and has the ACE engine read
+  the bytes back.
+
+  Creating one costs four things beyond the column itself, and three were
+  invisible until the engine refused the result. The flat table keeps its
+  two Long bookkeeping columns **among the variable columns**, where a
+  Long would normally sit in the fixed block, with no collation and no
+  fixed bit -- `ColumnSpec(..., variable=True)` now says so. Its catalog
+  row carries `Flags` `0x800A0000`. And the table that *has* the column
+  carries `0x40000`, which no other table does; without it DAO opens the
+  child recordset and finds no fields in it.
+
+  A `Complex` column keeps only a Long in the row -- an id shared by
+  every complex column in that row, handed out from a counter at 0x1C of
+  the table definition and never reused. The values live one per row in
+  `f_<GUID>_<Column>`, joined on that Long, and `MSysComplexColumns`
+  names the pairing. `FileData` is a container of its own: a flag and an
+  inflated size, then either a zlib stream or the bytes as they are, and
+  inside that a header carrying the file's extension.
+
+  Access decides whether to compress **by file type**, measured across 45
+  extensions: it leaves `docx`, `gif`, `jpeg`, `jpg`, `png`, `pptx`,
+  `xlsx` and `zip` alone and compresses everything else, including `7z`
+  and `mp4`. Those eight are written byte-identically; a compressed one
+  was not at the time -- see the fix above: the deflate is classic zlib's
+  at level 5 and memLevel 7, which the zlib-ng behind Python's `zlib`
+  cannot reproduce.
+
+  Two corrections to the table definition came out of this: the field at
+  0x18 is a constant (1 in ACE, -1 in Jet 4) and not a counter, and the
+  complex-id counter is the u32 at 0x1C. A complex column is flagged
+  AutoNumber like any other, so the row writer had been handing it a
+  value from the ordinary AutoNumber counter, which gave two columns in
+  one row two different ids.
+
+- **Access VBA is writable.** `AccessDatabase` gained `modules()`,
+  `module(name)`, `create_module(name, code, kind="module"|"class")`,
+  `set_module_source(name, code)`, `rename_module(old, new)` and
+  `delete_module(name)`. Standard and class modules both, with whatever
+  source you give them.
+
+  The route is not a p-code writer. `_VBA_PROJECT` is [MS-OVBA]'s
+  PerformanceCache, and its `Version` field names the build of VBA that
+  compiled it; writing a version the host does not recognise makes VBA
+  discard the cache and compile the project from the module streams, the
+  same thing Access's `/decompile` does. A module's stream is therefore
+  the compressed source alone with MODULEOFFSET at zero, and none of the
+  compiled tables have to be generated -- one of which could not have
+  been, since the 32-slot table ahead of the module table is runtime
+  state and adding the same module to the same database twice gives two
+  different tables. The cost is a recompile on the next open: the code
+  has to compile, and the cache stops matching what Access wrote until
+  Access rewrites it.
+
+  Three of the rules are invisible from the file and were caught only by
+  asking Access: a module's storage folder is named from the rows its
+  container already holds and Access will not look under any other name,
+  `MSysObjects` ids step by four rather than one, and a delete has to
+  free the folder or the next create picks a name Access rejects. A live
+  gate (`RUN_LIVE_ACCESS_VBA=1`) runs the result in Access and compares
+  the value the code returns, class instantiation included.
+
+- **More of the statement.** `TOP n PERCENT`, `ORDER BY <position>`, and
+  a comparison against `ALL`, `ANY` or `SOME` of a subquery. A column
+  name two sources share is now qualified in the output the way the
+  engine qualifies it, and a crosstab pivoting on a comparison names its
+  columns -1 and 0.
+
+- **The rest of the Jet expression functions.** Replace, Space, String,
+  StrComp, StrReverse, Asc, Chr, Sgn, Sqr, Exp, Log, Fix, Val, Str, Hex,
+  Oct, the CBool/CByte/CCur/CSng/CDate family, DateAdd, DateDiff,
+  DatePart, DateSerial, TimeSerial, Weekday, WeekdayName, MonthName,
+  DateValue, TimeValue, Time, IsNull, IsNumeric, IsDate, Switch, Choose,
+  Format and Partition, with the First, Last, StDev, StDevP, Var and
+  VarP aggregates. A gate runs 131 expressions through DAO and through
+  the executor over the same four rows and compares them cell by cell.
+
+- **Truth values as Jet writes them.** A computed comparison, logical
+  operator or yes-or-no function now answers -1 or 0, and so does an
+  aggregate over a Boolean column, which is what the engine answers. A
+  Boolean column selected on its own still reads as a Boolean.
+
+- **Linked tables.** `db.links()` and `db.link(name)` read the tables a
+  database only points at; `db.link_table(name, database, source,
+  connect=...)` writes one and `db.drop_link(name)` forgets it, byte for
+  byte as DAO's `TableDefs.Append` and `Delete` do, for a link to another
+  Access file and to a folder of text files. Following a link is left to
+  the caller: the path comes out of the database, so opening it is not
+  something the library does on its own.
+
+- **A column's own rules.** Required, DefaultValue, ValidationRule and
+  ValidationText are properties on the column, not bits in its header,
+  and the writers now put them there the way the engine does: one blob
+  write per column, the engine's DAO type and flags, and the catalog
+  stamp that goes with it. `CREATE TABLE ... NOT NULL` and
+  `DEFAULT <expr>` set them, and `ColumnSpec` carries them.
+
+- **The engine's rules applied to every row.** A column an INSERT does
+  not name takes its DefaultValue, evaluated as Jet evaluates it; a null
+  in a Required column and a value against a ValidationRule, the
+  column's or the table's, are refused with the engine's own message, on
+  insert and on update. A live gate has the engine reject the same four
+  statements.
+
+- **Which LVAL page a long value lands on**, measured: a value of 256
+  bytes or fewer goes on the first page the free-space map lists, a
+  larger one on the last, and when that page cannot take it, on a new
+  page rather than an earlier one.
+
+- **A gate for a database built without the engine at all**: every
+  column type, keyed and unique indexes, a foreign key, long values,
+  four saved queries and table and column properties, all written by
+  pyOpenVBA, then read back field for field by DAO and compacted by it,
+  which fails on any structure the engine cannot follow.
+
+- **Subqueries in saved queries.** A subquery in a WHERE, one used as a
+  value, and a bracketed SELECT standing where a table does all save as
+  the engine saves them; a derived table's text goes in its row's
+  expression with only the alias naming it.
+
+- **Pass-through queries.** `db.create_query(name, sql, connect=...)`
+  saves one, byte for byte as DAO does, dead row and all; the SQL is
+  kept exactly as given because the server parses it, not Jet.
+  `query.connect` reads the connect string back.
+
+- **Usage maps past their row.** A map whose bitmap can no longer grow
+  inside its page becomes the engine's reference form: a row of chunk
+  pointers, each naming a page holding one 32 736-page bitmap. The
+  global free map converts the same way and marks each new chunk's
+  unreached pages free. A 130 MB database of long values is now
+  byte-identical to the engine's, both maps converted.
+
+- **`with db.transaction():`** groups writes so they all land or none
+  do; an exception puts the pages and the session's state back exactly
+  as they were. The engine writes the same bytes either way, and a live
+  gate checks that against DAO running the same statements inside
+  BeginTrans/CommitTrans.
+
+- **Crosstabs run, not just save.** `db.execute("TRANSFORM ... PIVOT
+  ...")` returns the pivoted rows: one column per pivot value, `<>` for
+  a Null heading, an `IN` list fixing the columns and their order, an
+  aggregate allowed among the row headings, and the rows sorted by those
+  headings as the engine sorts them. Two of these answer exactly as DAO
+  does (live gate).
+- **Jet's `Mod`, `\` and `^` operators**, in VBA's order of
+  precedence, with both sides rounded half to even and the division
+  truncating toward zero.
+
+- **Subqueries, unions and saved queries in `db.execute`.** `IN`,
+  `NOT IN`, `EXISTS`, `NOT EXISTS` and a scalar subquery work in any
+  expression, correlated when they name the outer query; a bracketed
+  SELECT or a saved query's name can stand where a table does in FROM;
+  and `UNION` / `UNION ALL` fold left to right with a trailing ORDER BY
+  over the result. Eight of these shapes answer exactly as DAO does on
+  the same database (live gate).
+
+- **DDL through `db.execute`.** CREATE TABLE (every Jet type word, named
+  primary keys, inline and table constraints, foreign keys), CREATE
+  [UNIQUE] INDEX with ASC/DESC columns and WITH IGNORE NULL, DROP TABLE,
+  DROP INDEX, and ALTER TABLE ADD / ALTER / DROP COLUMN and ADD / DROP
+  CONSTRAINT. Fourteen statements leave the same bytes DAO's Execute
+  leaves for the same SQL (live gate). What the Jet parser refuses --
+  `CHAR`, `DECIMAL`, `NUMERIC`, `WITH COMPRESSION` -- is refused here
+  with the reason.
+- **A table with a BigInt column carries the engine's version
+  properties** (`FCMinReadVer`, `FCMinWriteVer`, `FCMinDesignVer`),
+  written one at a time as the engine writes them.
+
+- **Crosstab saved queries.** `db.create_query(name, "TRANSFORM ... PIVOT
+  ...")` writes the rows DAO writes, byte for byte, with an `IN` list, a
+  TOP, a join or a parameter; `db.query(name).sql` gives the statement
+  back. HAVING is refused there, as the engine refuses it.
+
+- **`db.drop_index(table, name)`**, byte-identical to the engine's DROP
+  INDEX: the index's pages released with their bytes untouched, its
+  usage-map row deleted, its records taken out of the definition with
+  the indexes after it moved up, and the catalog row stamped. The
+  primary key and an index a relationship rests on are refused, as the
+  engine refuses them.
+
+- **SQL executor.** `AccessDatabase.execute(sql, parameters)` runs Jet
+  SQL against the engine in pure Python: SELECT with a column list or
+  `*`, INNER / LEFT / RIGHT JOINs, WHERE, GROUP BY with Count, Sum, Avg,
+  Min and Max, HAVING, ORDER BY, DISTINCT and TOP; the comparison,
+  logical, arithmetic and `&` operators, LIKE with the engine's
+  wildcards, IN, BETWEEN, IS NULL, `[parameters]` and the common string,
+  numeric and date functions; INSERT ... VALUES, INSERT ... SELECT,
+  UPDATE and DELETE through the row writers, with values coerced to the
+  column type as the engine coerces them. Three-valued logic follows the
+  engine. Eleven SELECT shapes answer exactly as DAO does on the same
+  database, name for name and value for value, and an UPDATE plus a
+  DELETE write the same bytes DAO's Execute writes (live gate).
+- **Index row counters.** An index built over existing rows records how
+  many rows it holds next to its distinct-key count. Every row that
+  leaves the index takes one off, whether deleted or written by an
+  UPDATE that names one of the index's columns, and the distinct count
+  is capped at what is left; a null key in an ignore-nulls index costs
+  nothing, the count stops at zero, and an unfiltered DELETE zeroes
+  both. Inserts leave the row counter alone, as the engine does.
+
+### Fixed
+
+- **Code behind a written form sees its controls, and their events fire.**
+  Access lists a design's sections and controls in a `TypeInfo` stream
+  beside it, and VBA takes that list as the form class's members. A form
+  written here carried the empty template's list, so `Me.<control>` failed
+  to compile and a button's click never bound. The stream is now carried
+  forward on every change the way Access carries it: a new member is
+  appended with the next ordinal, a removed one drops out and the rest
+  keep their ordinals, a renamed one moves to the end with its ordinal.
+  Each member's type id was read off a form and a report Access built
+  with one of every control and every section
+  (`tests/live_access_test/designs_every.accdb`): a report's controls
+  share one class index, a label attached to a control or a button inside
+  an option group has a class of its own, an ActiveX control's entry
+  carries 36 more bytes, and a form's header, footer, page and group
+  sections are read as sections. Three copies of that form edited in
+  Access sit in the fixture, and the same edits made here give the same
+  streams.
+- **`RowSourceType` takes effect.** The text is only what the property
+  sheet shows; Access acts on a one-byte companion record, written now
+  with the text (a value list, a field list, or none for a table or query).
+- **A written control brings its type's control-defaults object.** Access
+  keeps one nameless object per control type ahead of a design's
+  sections, the type's theme-derived defaults, and reads a control's
+  themed properties against it: a button written without it ignored its
+  `UseTheme`, colours and gradient and came out as a default themed
+  button. The first control of a type now writes the object Access
+  writes (captured per type for forms and for reports), the run of
+  top-level objects is marked as the group it is, and a button's six
+  hover and pressed slots are in its schema.
+- **A colour or font set on a control takes effect.** With the defaults
+  object in place, Access reads the theme index ahead of the colour, so
+  `set_property("ForeColor", ...)` now writes the -1 index Access writes
+  beside it (and `Gradient` 0 with a button's fill, `ThemeFontIndex` -1
+  and the pitch-and-family byte with a font name), measured one property
+  at a time on nine control types.
+- **`set_database_properties()`** sets the database's own options --
+  `StartUpForm` to open a form with the file, `AppTitle` and the rest --
+  writing the MSysDb property blob byte for byte as DAO's
+  `Properties.Append` does.
+
+- **A second text box gets its tab index.** The text box Access made for
+  the slot table was the first on its form and so carried no `TabIndex`;
+  every later focusable control does, and the writer now gives one to a
+  text box as it already did to every other type (measured: three text
+  boxes written without it came back from Access tabbed 1, 2, 0).
+
+- **A large long value lands on the highest-numbered listed page.** The
+  engine takes the highest page the column's free-space map lists when
+  it has room, and otherwise a fresh page; it does not go back to the
+  page the last value went to. The two coincide until a delete lists an
+  older page again, which is what Access's own module save does, and the
+  library kept a per-column cursor for the wrong rule. Measured with DAO
+  and held by the long-value placement gate; the page store's
+  `lval_cursor` is gone.
+
+- A long value of 256 bytes or fewer now takes the first listed page of
+  its column rather than the page the last value went to, which is where
+  the engine puts it (measured on a compaction's 200 memos).
+- A relationship on a column that already has an index shares that index,
+  as the engine's does; a table may now be related to itself; the
+  relationship rows go before the index root.
+- Rewriting a definition no longer resets its complex-id counter.
+- A new object's owner is taken from MSysDb rather than the commonest
+  owner among the tables, which in a fresh `.mdb` was the engine's own.
+- Access's own MSysNameMap and MSysAccessXML, whose OLE column has no
+  free-space map, can be written to and copied.
+- **Compressed attachments are byte for byte what Access writes.** The
+  engine's deflate turned out to be classic zlib's at level 5, memLevel 7
+  and a 32 KB window -- one of eight engine-written streams admits exactly
+  that parameter set, and classic zlib reproduces all eight -- where the
+  earlier note that it "was not zlib's" came from comparing against the
+  zlib-ng that Python bundles. Since a Python's zlib may not be classic
+  zlib and exposes no memLevel, `pyopenvba.access._deflate` carries zlib's
+  own algorithm; a live gate attaches five files through DAO and finds
+  each stored container identical to ours.
+
+- **A number keeps the engine's type through every operator.** `db.execute`
+  now answers an `int`, a `float` or a `Decimal` exactly where the engine
+  answers a Long, a Double or a Currency/Decimal: `5.5` and its arithmetic
+  are Decimals, `5.5 / 3` runs to 28 places, `Sum(Long)` and `Abs` are
+  Doubles, `Currency * Double` is a Double while `Currency + Double`
+  stays Currency, `Date + 1` is a Date (it was a float), a Large Number
+  takes everything into itself, and `IIf` widens its branches. Measured
+  through DAO's reported type of 135 expressions and the full
+  operator-by-type matrix; a live gate holds 185 of them and
+  `docs/access_engine.md` has the rules, including the two that look at
+  the shape of an operand rather than its value.
+
+- **What a query stores in a column now matches the engine**, measured
+  statement by statement against DAO: over-long Text is cut to size
+  rather than refused (a Memo is not), a Byte takes the low byte of its
+  number, a number in a Date column is its serial, a value list with no
+  column list covers the AutoNumber too, an explicit AutoNumber moves the
+  counter and a Null there is an error, and no query updates an
+  AutoNumber.
+- **An action query is all or nothing.** An INSERT, UPDATE or DELETE that
+  fails part way leaves the rows as they were, through a page journal in
+  the store rather than a copy of the file. The AutoNumber counter and the
+  header's row count keep what the attempted rows took, which is what the
+  engine leaves too.
+- **Joins, GROUP BY and DISTINCT answer in the engine's order.** An inner
+  join scans the smaller side and probes the other newest-first, groups
+  and distinct rows come out sorted by their keys; an UPDATE over a join
+  keeps the last join row's write, and which row that is now follows.
+- **One- and two-character Text values are stored uncompressed**, as the
+  engine stores them; compression is applied only where it shortens the
+  value. Rows holding such values were one byte off the engine's.
+
+### Removed
+
+- **Jet 3 (Access 97) databases are refused again.** Reading them worked
+  and was gated against the engine, but the scope is now what the Access
+  application opens today, and Access has not opened an Access 97 file
+  since 2013. A 2 KiB page format is a second set of offsets through the
+  reader for a format nobody authors; `git log` has the implementation if
+  it is ever wanted back.
+
+  The plumbing that carried it went with it: the `Layout` record, the
+  page size and text encoding read from the file rather than fixed, and
+  the layout argument threaded through the page, row and definition
+  readers. One page format means one set of constants, in the modules
+  that own them, so there is no second source for an offset and no
+  parameter that can only take one value.
+
+## [3.5.1] - 2026-08-31
+
+### Changed
+
+- The README now introduces the form designer where a reader starts.
+  3.5.0 documented it in full, but the "Why use this?" pitch and the
+  "good fit for" list still described module operations only, and the
+  architecture map predated `forms.py`, `_oforms_records.py`,
+  `_oforms_pages.py` and `_ppt_container.py`, the `forms` CLI command,
+  and the `.xlam` and `.accdb` templates.  PyPI renders a project page
+  from the README in the released sdist, so correcting it there takes a
+  release.
+
+The library itself is unchanged: 3.5.0 and 3.5.1 are the same code.
+
+## [3.5.0] - 2026-08-31
+
+### Added
+
+- **UserForm designs are now read and written, not just preserved**
+  (issue #15).  A form's *code* was always a module like any other; its
+  *design* -- which controls exist, how they nest, and what their
+  properties are -- lived in streams the library carried verbatim.  It is
+  now a first-class surface, with no Office installed:
+
+  ```python
+  with pyopenvba.ExcelFile("book.xlsm") as wb:
+      form = wb.add_form("Wizard", caption="Setup", width=300, height=200)
+      form.add_control("Frame", "Shipping", left=12, top=40, width=200, height=80)
+      form.add_control("OptionButton", "Ground", container="Shipping")
+      form.add_control("MultiPage", "Tabs", left=12, top=140, width=280)
+      form.add_page("Tabs", name="Review")
+      form.control("Ground").set_property("Caption", "Ground shipping")
+      wb.save()
+  ```
+
+  `host.forms()` reads the tree; `host.add_form()` composes one from
+  nothing; `form.add_control()` / `remove_control()` / `add_page()` /
+  `remove_page()` and `control.set_property()` edit it.  Containers
+  recurse -- a `Frame`'s children and a `MultiPage`'s pages live in
+  storages of their own -- and each is created and deleted with its
+  storage.  Geometry is in points.  `python -m pyopenvba forms <file>`
+  prints the tree; `--mask` gives the raw property bits instead.
+
+- **Only what the developer set.**  MSForms stores a property just when it
+  differs from that control's default, so `control.properties()` is the
+  set the author chose -- which a live COM read cannot distinguish from
+  inherited and default values.  That is the reason this belongs in a
+  file-level library.
+
+- **Writing is lossless.**  An unedited form saves back byte for byte:
+  alignment padding, raw string bytes, pictures and any tail the property
+  tables do not model are all replayed as read.  Bytes inside a record
+  that the tables cannot explain are refused rather than dropped, and a
+  form whose streams do not reconcile raises `FormParseError` rather than
+  returning a partly guessed control list.
+
+- **Verified against live Excel and live PowerPoint**, which is where four
+  defects surfaced that no structural check could catch: an added control
+  colliding with the last one's id (`NextAvailableID` is the highest
+  handed out, not the next free), a MorphData record omitting reserved
+  mask bit 31 ([MS-OFORMS] 2.2.5.2), a container written with a leaf's
+  site, and a designer edit leaving the `_VBA_PROJECT` cache stale.
+
+- **Path-addressed CFB navigation and editing**: `CFB.list_storages_at`,
+  `list_streams_at`, `get_stream_at`, `write_stream_at`, `add_stream_at`,
+  `add_substorage_at` (which can set a storage's CLSID), and
+  `remove_storage_at` (recursive).  Nested designer storages repeat
+  names -- every container owns an `f` -- so a name-based lookup finds
+  whichever comes first in directory order.
+
+- `VBAForm`, `FormControl`, `Size` and `FormParseError` are exported from
+  the package root.
+
+### Fixed
+
+- **A UserForm edit left the VBA performance cache stale.**  Only module
+  changes counted as mutating, so a designer-only save kept a
+  `_VBA_PROJECT` cache describing the form's old members and Office
+  refused to load the form.  A designer edit now invalidates it too.
+- **`.ppt` was advertised but could not be read** (issue #17).
+  `PowerPointFile` listed `.ppt` and failed on every real one with
+  "No 'dir' stream found", which reads like file corruption and is not.
+  Unlike `.doc` and `.xls`, a binary presentation's CFB root carries no
+  VBA storage: the project is a whole CFB, zlib-deflated, inside an
+  `ExOleObjStg` record of the `PowerPoint Document` stream, reached
+  through the persist chain.  Both directions now work; the write path
+  splices the record back in and shifts every absolute offset past it.
+  Verified against live PowerPoint, each check run first against an
+  untouched control: a rewritten presentation opens with its slides,
+  titles and body text intact, and an edited macro returns the new value.
+
+## [3.4.0] - 2026-08-03
+
+### Fixed
+
+- **Non-Latin module names were corrupted in the PROJECT stream**
+  (issue #11).  The PROJECT stream is code-page ANSI per [MS-OVBA]
+  2.3.1, but four sites hardcoded cp1252, so any rewrite of it -- add,
+  rename, or delete -- re-encoded module names with `errors="replace"`.
+  A cp1251 project containing `МодульТест` came out as
+  `Module=??????????` while the dir stream kept the real name; Excel
+  cross-checks those declarations, so the project was left internally
+  inconsistent.  `serialize_project_stream`, `parse_project_stream`, and
+  `parse_projectwm` now take the project's `code_page` (defaulting to
+  1252 for standalone callers) and the save path passes it.  Verified in
+  live Excel: a cp1251 workbook whose module is *named* `МодульТест`
+  now compiles and returns `Привет, мир` from a Cyrillic-named function.
+- **Vietnamese text was destroyed on encode** (issue #13).  Python's
+  charmap codecs do no composition, so `'Tiếng Việt'.encode('cp1258')`
+  lost every stacked-diacritic character -- and NFD does not help, since
+  cp1258 stores `ệ` as precomposed `ê` plus a combining dot-below rather
+  than its canonical decomposition.  The new
+  `pyopenvba.vba.encode_mbcs` decomposes unmappable characters and folds
+  each combining mark back into the base until the codec accepts the
+  result, emitting the remaining marks as combining bytes.  Text the
+  codec already encodes directly is returned byte-for-byte unchanged.
+- **Code pages resolved differently on Windows than on Linux/macOS.**
+  CPython falls through to the operating system's code-page registry on
+  Windows, so `cp10000`, `cp20866`, `cp21866`, `cp28592`, and `cp28595`
+  resolved there while raising `LookupError` elsewhere -- text in those
+  pages decoded correctly on one platform and became latin-1 mojibake
+  on another.  `_CODEPAGE_ALIASES` now maps 30 Windows code-page
+  identifiers (Macintosh, KOI8, the ISO-8859 family, ISO-2022, EUC, GB,
+  UTF-7, GB18030) to portable Python codec names and is consulted
+  first, so every platform resolves identically.  Found by the new
+  cross-OS CI job on its first run; two tests now assert portability
+  against the pure-Python codec registry so a regression fails on every
+  platform rather than only the affected one.
+- **Unresolvable code pages failed silently** (issue #12).  Falling back
+  to latin-1 now emits a `UserWarning` instead of quietly producing
+  mojibake that survives round-trip checks.
+- **ANSI and Unicode dir records are reconciled** (issue #12).  When a
+  module's name, stream name, or doc string disagrees between its ANSI
+  record and its UTF-16 partner, the Unicode record -- lossless by
+  construction -- is now authoritative.
+
+### Added
+
+- **20-language code-page test matrix** (issue #13, ported from
+  `xlide_vscode`): one native-language sample per supported code page,
+  each asserting zero substitution bytes on encode, an NFC-normalized
+  round trip, and a full write -> read -> list -> validate cycle on a
+  workbook whose PROJECTCODEPAGE is that page, plus native-language
+  module names for cp1251 / cp932 / cp936.  The zero-substitution
+  assertion is the load-bearing one: with `errors="replace"` a wall of
+  `?` round-trips happily.  Fixtures are generated by patching one
+  template's dir record, so no per-language binaries are committed.
+- **Dedicated cross-OS `languages` CI job** running that matrix on
+  ubuntu and windows, mirroring the equivalent job in the port, so a
+  code-page regression names its own OS.
+- Live Excel gate case for a Cyrillic-named module (opt-in via
+  `RUN_LIVE_EXCEL=1`).
+
+## [3.3.0] - 2026-08-01
+
+### Added
+
+- **Excel fixture CI on real Office** (#4, contributed by
+  @DecimalTurn): a Windows workflow that builds fixture workbooks with
+  the checked-out pyOpenVBA (no Office needed for the build), installs
+  Excel on the runner via the SHA-pinned `DecimalTurn/setup-vba`
+  action, runs each fixture's macro over COM, verifies its sentinel
+  output, and uploads a desktop screenshot on failure.  Path-filtered
+  to fixture and harness changes.  Complements the local
+  `RUN_LIVE_EXCEL` gate with per-PR live-Office coverage -- the
+  `with_class` fixture is a genuine VBE-export-form class module, so
+  the issue #1 bug class is now regression-tested on real Excel in CI.
+- **`ExcelFile.create_new` supports `.xlam`** (Excel add-in), joining
+  `.xlsm` and `.xlsb`.  The baked-in template is captured from a
+  freshly Excel-authored add-in (`ThisWorkbook`, `Sheet1`, bare
+  `Module1`) via the new `scripts/bake_xlam_template.py`, following
+  the existing bake pattern.
+
+## [3.2.0] - 2026-08-01
+
+### Changed
+
+- **Decompression is 1.76x faster, byte-for-byte identical** (issue #5).
+  `decompress` now emits output with slice operations wherever the spec
+  allows -- non-overlapping copy tokens move as one slice, runs of
+  literal tokens within a flag byte extend once -- and recomputes the
+  copy-token masks only when the chunk-local output size crosses a
+  power of two.  Overlapping copies keep the spec's byte-at-a-time
+  semantics.  Measured 12.4 -> 21.8 MB/s across the 31 module and dir
+  streams in the live fixtures; new oracle-equivalence tests pin the
+  optimized decoder against the original per-byte implementation,
+  including identical error messages and offsets on malformed input.
+- **Module source loads lazily** (issue #5).  Decompressing module
+  source is 88-96% of the cost of opening a project, so
+  `parse_vba_project` now decompresses only the first chunk of each
+  module stream (enough for the `Attribute VB_*` header; for
+  single-chunk modules it already is the whole source) and defers the
+  rest until the first `VBAModule.source` access.  Stream lookup and
+  MODULEOFFSET bounds checks stay eager.  Opening the large-module
+  fixture for `module_names()` drops from 1.47 ms to 0.79 ms.  Two
+  visible consequences: a corrupt chunk past the first one raises
+  `VBAProjectError` at first access instead of at parse time, and
+  `VBAModule` is now a regular class rather than a dataclass -- the
+  constructor signature is unchanged, a new `source_loaded` property
+  reports materialization, but dataclass-generated field equality and
+  repr are gone (equality is identity).
+
+### Added
+
+- `decompress(..., max_bytes=N)` stops at the first chunk boundary at
+  or beyond N output bytes and returns the chunk-aligned prefix.  Copy
+  tokens never cross chunk boundaries (the decoder enforces it), so
+  the prefix is byte-identical to the same range of a full
+  decompression.
+
 ## [3.1.0] - 2026-07-22
 
 ### Fixed

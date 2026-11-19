@@ -1,0 +1,42 @@
+"""Edits on a filtered sheet, replayed against the in-memory model.
+
+tests/fixtures/autofilter_edits.json is what scripts/measure_autofilter_edits.py
+saw in live Excel: a table filtered to its apples, each layout in a new
+workbook, then an edit -- a write, a clear, a fill, a copy, a cut, rows or
+columns deleted or inserted -- and a dump of A1:G8 (each cell's formula),
+which of rows 1 to 14 are hidden, the filter's range and criteria, the
+hidden _FilterDatabase name, what a copy landed, and what the last call
+returned or the error it raised.
+"""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+from typing import Any
+
+import pytest
+
+from pyopenvba.apps.excel import ExcelApplication
+
+RECORD: dict[str, Any] = json.loads((Path(__file__).parent / "fixtures" / "autofilter_edits.json")
+                                    .read_text(encoding="utf-8"))
+LAYOUTS: list[dict[str, Any]] = RECORD["layouts"]
+
+def _run(layout: dict[str, Any]) -> object:
+    code = ["Public Function Report() As String", "Dim ws As Object, failed As String, v As Variant, dest As Object",
+            # As the measurement ran: with DisplayAlerts off (scripts/measure_autofilter_edits.py).
+            "Application.DisplayAlerts = False",
+            "Set ws = ActiveWorkbook.Worksheets(1)", f'ws.Name = "{layout["name"][:28]}"', "On Error Resume Next",
+            "Err.Clear", *RECORD["table"].splitlines(), *layout["setup"].splitlines(),
+            'If Err.Number <> 0 Then failed = "S" & Err.Number & ";"', "On Error GoTo 0",
+            'Report = failed & Show(v) & ";" & Dump(ws)', "End Function"]
+    app = ExcelApplication()
+    app.add_workbook()
+    app.add_module(RECORD["helper"] + "\n".join(code) + "\n", name="Probe")
+    return app.run("Report")
+
+
+@pytest.mark.parametrize("layout", LAYOUTS, ids=[layout["name"] for layout in LAYOUTS])
+def test_a_filtered_sheet_takes_edits_as_excel_does(layout: dict[str, Any]) -> None:
+    assert _run(layout) == layout["answers"]

@@ -13,5 +13,147 @@ class VBAProjectError(PyOpenVBAError):
     """Raised when the VBA project structure is invalid."""
 
 
+class NoVBAProjectError(VBAProjectError):
+    """Raised by a read or write that needs a VBA project the file does not have.
+
+    A macro-enabled file saved before its first macro, or a binary file
+    that never held one, has no VBA project at all. That is its normal
+    shape, not damage: ``has_vba_project()`` says False, listing reads
+    answer empty, and only a read or write of the project, a module, a
+    form or a reference raises this. The first macro has to be written
+    in the host application, which creates the project.
+    """
+
+
 class UnsupportedFormatError(PyOpenVBAError):
     """Raised for file formats that pyOpenVBA cannot handle."""
+
+
+class FormParseError(PyOpenVBAError):
+    """Raised when a UserForm's designer streams do not reconcile.
+
+    Deliberately an error rather than a partial control list: a misread
+    site array yields plausible-looking controls, and wrong knowledge is
+    worse than none.
+    """
+
+class VBAError(PyOpenVBAError):
+    """Base for the three ways evaluating VBA can fail.
+
+    They are kept apart because they mean different things to whoever is
+    reading the output.  A compile error is wrong VBA, a run-time error
+    is VBA that the host refused, and an unsupported error is a gap in
+    pyOpenVBA.  Collapsing the third into either of the others would
+    report our own limit as the caller's mistake.
+    """
+
+    def __init__(self, message: str, *, where: str = "") -> None:
+        super().__init__(f"{where}: {message}" if where else message)
+        self.message = message
+        self.where = where
+
+
+class VBACompileError(VBAError):
+    """Raised for source VBA itself would refuse to compile.
+
+    Module declarations are checked on load. Procedure-specific checks run
+    on demand, before the affected procedure executes. Unlike a run-time
+    error, this cannot be trapped by On Error.
+    """
+
+
+class VBARuntimeError(VBAError):
+    """Raised for an error VBA would raise while running.
+
+    Carries the same number and description the ``Err`` object would, and
+    is the only one of the three that ``On Error`` can trap. An error that
+    escapes an event callback, or a macro ``Application.Run`` started,
+    bypasses every handler of the procedures that called it, and
+    ``past_handlers`` is then True: Excel shows its run-time error dialog
+    there and ends every macro.
+    """
+
+    def __init__(
+        self,
+        number: int,
+        description: str,
+        *,
+        source: str = "",
+        where: str = "",
+    ) -> None:
+        super().__init__(f"run-time error {number}: {description}", where=where)
+        self.number = number
+        self.description = description
+        self.source = source
+        # Once an error escapes an event callback or a macro Application.Run
+        # started, no calling procedure's On Error recovers it
+        # (tests/fixtures/vba_run_errors.json).
+        self.past_handlers = False
+
+
+class VBAUnsupportedError(VBAError):
+    """Raised for VBA this understands but does not implement.
+
+    A statement, function or object member that real VBA would have run
+    and pyOpenVBA cannot.  Deliberately not trappable by ``On Error``:
+    swallowing it would let a script carry on over a step that never
+    happened and report a result computed from a state that never
+    existed.
+    """
+
+
+class VBADialogError(VBAUnsupportedError):
+    """Raised for a dialog that nobody answered, or answered with what it cannot take.
+
+    Nothing is at the screen, so a macro's InputBox, GetOpenFilename,
+    FileDialog or Dialogs takes its answer from those the caller queued
+    with ``answer_dialogs``.  Like its base it cannot be trapped by
+    ``On Error``.
+    """
+
+
+class VBASandboxError(VBAUnsupportedError):
+    """Raised for VBA that would reach outside the engine while the sandbox is on.
+
+    Files, the network, other programs, the machine's settings.  The
+    application takes ``sandbox=False`` to allow what pyOpenVBA implements
+    of them.  Like its base it cannot be trapped by ``On Error``.
+    """
+
+
+class VBAStepLimitError(VBAError):
+    """Raised when a run of VBA has taken more steps than the host allows.
+
+    A host that runs macros it does not trust sets ``step_limit`` on the
+    application, so a loop that never ends stops instead of holding it.
+    A step is an instruction the interpreter carries out, a loop's test
+    and a jump included.  Like ``VBAUnsupportedError`` it cannot be trapped
+    by ``On Error``, and it is no run-time error, so ``Err`` is not set:
+    the run ends where it was, with what it had done kept.
+    """
+
+
+class BackgroundRefreshError(PyOpenVBAError):
+    """Raised by ExcelApplication.run after a macro, when a query table it refreshed in the background then failed.
+
+    Excel refreshes such a table once no macro is running and shows a failure in a message the macro never sees, so the
+    caller hears of it here, after the run's own result. Every pending refresh is run and each failure is in ``failures``,
+    the first also as ``__cause__``. Where the run itself ended in an error, that error is raised instead, with the
+    failures as its ``refresh_failures``.
+    """
+
+    def __init__(self, failures: list[Exception]) -> None:
+        count = len(failures)
+        super().__init__(f"{count} background refresh{'es' if count != 1 else ''} failed after the run: "
+                         + "; ".join(str(one) for one in failures))
+        self.failures = failures
+
+
+class PowerQueryError(PyOpenVBAError):
+    """Raised when a workbook's Power Query package cannot be read or written.
+
+    The DataMashup blob is a container of containers -- an OPC package, an
+    M section document and a metadata document -- and a malformed one is
+    refused rather than half-read: a query list built from a broken
+    package would look ordinary and be wrong.
+    """

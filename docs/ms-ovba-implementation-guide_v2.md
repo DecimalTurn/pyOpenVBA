@@ -399,7 +399,7 @@ that you need the `PROJECT` stream (Section 8).
 Each module's source lives at `/VBA/<MODULESTREAMNAME>`. Layout:
 
 ```
-[ PerformanceCache prefix ]  MODULEOFFSET bytes (opaque; preserve)
+[ PerformanceCache prefix ]  MODULEOFFSET bytes (preserve only for unedited modules)
 [ CompressedSourceCode    ]  bytes from MODULEOFFSET to EOF
 ```
 
@@ -415,12 +415,18 @@ text = decode(raw, code_page=project.code_page)
 **Write (in-place source replacement):**
 
 ```pseudo
-old      = cfb.get_stream_in_storage("VBA", module.stream_name)
-prefix   = old[:module.text_offset]                          # preserve verbatim
 new_raw  = encode(new_text, code_page=project.code_page)
 new_body = ovba_compress(new_raw)
-cfb.write_stream_in_storage("VBA", module.stream_name, prefix + new_body)
+cfb.write_stream_in_storage("VBA", module.stream_name, new_body)
+module.text_offset = 0
+module.prefix_bytes = b""
+# Rewrite the dir stream with this module's MODULEOFFSET = 0.
 ```
+
+An edited module is source-only: retaining its old compiled prefix would
+leave removed comments and string literals readable in the saved file.
+Unedited modules keep their streams, including their cached p-code.
+The project cache is invalidated as before so Office compiles the source.
 
 **Write (new module):**
 
@@ -466,6 +472,7 @@ Document=ThisWorkbook/&H00000000
 Document=Sheet1/&H00000000
 Module=Module1
 Class=Class1
+Package={AC9F2F90-E877-11CE-9F68-00AA00574A4F}
 BaseClass=UserForm1
 Name="VBAProject"
 HelpContextID="0"
@@ -496,6 +503,15 @@ On mutation rewrite the declaration lines and the `[Workspace]`
 entries together. Do not create `Document=` lines (host-owned). Do
 not create `BaseClass=` lines unless you also emit a designer
 sub-storage.
+
+The editor writes `Package={AC9F2F90-E877-11CE-9F68-00AA00574A4F}`,
+the Forms designer's package, once: immediately before the
+`BaseClass=` line of a form added to a stream that has no such line.
+It never moves or removes the line afterwards, even when the last
+form goes, and a declaration added later goes after it as after any
+other. A project that declares a form without the line gets it only
+with its next new form. Keep every line a mutation does not touch
+byte for byte; a `[Workspace]` value can end in a space.
 
 ---
 
@@ -530,17 +546,20 @@ deprecated control surface.
 
 ## 11. UserForms / designer storages
 
-For each `BaseClass=` module there is a **sub-storage** at the CFB root
-with the same name as the module. It contains designer streams:
+For each `BaseClass=` module there is a **sub-storage** in the project's
+storage, beside `/VBA`, with the same name as the module: at the CFB
+root of `vbaProject.bin`, in `_VBA_PROJECT_CUR` in a `.xls` and in
+`Macros` in a `.doc`. It contains designer streams:
 typically `f`, `o`, `\x01CompObj`, `\x03VBFrame`, and sometimes more.
 
 Editing the **code-behind** of a UserForm is identical to editing any
 other module's source: the form's *code* lives in `/VBA/<FormName>` and
 is round-tripped through the same compressed-source pipeline.
 
-Editing the **layout** (controls, properties, positions) requires the
-Office Forms binary format and is out of scope for v1. Preserve the
-designer sub-storage byte-for-byte.
+Editing the **layout** (controls, properties, positions) means writing
+the Office Forms binary format, [MS-OFORMS]. pyOpenVBA reads and writes
+it in `forms.py` (docs/architecture.md, section 5a). A writer that does
+not must preserve the designer sub-storage byte for byte.
 
 ---
 
@@ -576,9 +595,9 @@ unconditionally on save. Office will regenerate them on next open.
 These three keys in the `PROJECT` stream carry the obfuscated
 project-password material:
 
-- `CMG` — Crypted Message Group, encrypted password hash + flags.
-- `DPB` — Data Protection Block, encrypted password.
-- `GC`  — Group Code (visibility flag).
+- `CMG`: Crypted Message Group, encrypted password hash + flags.
+- `DPB`: Data Protection Block, encrypted password.
+- `GC`: Group Code (visibility flag).
 
 You can **detect** a protected project by parsing `DPB`: if its
 decoded payload's first protection-state byte is non-zero, the project
@@ -591,7 +610,7 @@ ethically and legally questionable; treat it as out of scope.
 **Save safety gate:** if the project is password-protected AND the save
 would emit any change, **refuse the save** unless the caller passes an
 explicit opt-in flag (e.g. `allow_protected=True`). With the opt-in,
-preserve the password material verbatim — the workbook will still
+preserve the password material verbatim; the workbook will still
 require the original password to unlock the project, and the protection
 state is preserved.
 
@@ -726,10 +745,12 @@ For each operation, every step must succeed or you must abort.
 | Drop declaration line | `PROJECT` |
 | Drop `[Workspace]` entry | `PROJECT` |
 | Drop NAMEMAP pair | `PROJECTwm` |
+| Remove a form's designer sub-storage | beside `/VBA` |
 | Invalidate + drop SRP + signatures | as above |
 
 Forbidden: deleting `Document=` modules (host-owned), deleting
-designer modules without also removing their sub-storage.
+designer modules without also removing their sub-storage. The
+`Package=` line stays when the last form goes.
 
 ---
 
@@ -780,15 +801,15 @@ else:
 ### 18.4 Empty-VBA xlsm
 
 A `.xlsm` that has never had a VBA project initialized **does not
-contain** `xl/vbaProject.bin`. Raise a structured error:
+contain** `xl/vbaProject.bin`. Not having it is not a corruption signal;
+it's a first-class user-facing case, and the file opens. Listing reads
+answer empty, and a read or write that needs the project raises the
+structured `NoVBAProjectError`:
 
 ```text
-"<filename> contains no xl/vbaProject.bin. Make sure the workbook has
-a VBA project (save as .xlsm in Excel with at least one macro)."
+"'<filename>' has no VBA project: it is a workbook with no macros.  The
+first macro has to be written in Excel, which creates the project."
 ```
-
-Not having `vbaProject.bin` is not a corruption signal; it's a
-first-class user-facing case.
 
 ---
 
@@ -879,8 +900,9 @@ fixture (deterministic RNG seed for reproducibility).
 11. **Protected projects must not be silently re-saved.** Require an
     explicit opt-in.
 12. **CFB stream names are case-insensitive but case-preserving.**
-13. **A `.xlsm` with no VBA project has no `vbaProject.bin`.** Surface
-    a structured error.
+13. **A `.xlsm` with no VBA project has no `vbaProject.bin`.** Open it,
+    list nothing, and refuse only what needs the project, with a
+    structured error.
 14. **The `Attribute VB_Name = "..."` line inside the source must
     match `MODULENAME`.** Rename touches both.
 15. **Renaming a module renames the CFB stream too** (in

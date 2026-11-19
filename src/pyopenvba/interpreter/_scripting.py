@@ -1,0 +1,294 @@
+"""Scripting.Dictionary and FileSystemObject's path functions, which CreateObject makes without starting the
+Scripting Runtime.
+
+Measured in live Excel (tests/fixtures/vba_semantics/probes.txt). Keys
+are matched as the real dictionary matches them: numbers by value
+whatever their type -- 1, 1# and 1& are one key, and so are a Date and
+its serial number, and True and -1 -- while the text "1" is another;
+Empty and "" are one key; Null is a key of its own; an object is a key
+by its identity; text is matched case and all, or without case under
+vbTextCompare, which can only be set while the dictionary is empty.
+
+Reading a key the dictionary has not got adds it, holding Empty; Exists
+adds nothing. An item keeps the type it was given. Keys and Items are
+zero-based Variant arrays in the order the keys went in, and For Each
+walks the keys. Adding a key twice is error 457, removing or renaming
+one it has not got 32811, renaming one onto another 457.
+
+FileSystemObject takes a path apart and puts one together as the real one
+does (tests/fixtures/scripting_objects.json): a backslash or a slash parts
+folders, a drive is a letter and a colon or a server and share, a trailing
+separator is left off, and the extension is what follows the last point of
+the file name, spaces and all. Everything that reads or writes the disk
+reports itself unsupported, as VBA's own file statements do.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Hashable, Iterator
+from decimal import Decimal
+from typing import TYPE_CHECKING
+
+from pyopenvba.exceptions import VBAUnsupportedError
+from pyopenvba.interpreter._fso import FileSystemMembers
+from pyopenvba.interpreter._objects import BINDING, VBAObject, member, method, setter
+from pyopenvba.interpreter._values import (
+    EMPTY,
+    MISSING,
+    NULL,
+    VBAArray,
+    VBAErrorValue,
+    VBAInt,
+    error,
+    to_integer,
+    to_number,
+    type_name,
+)
+
+if TYPE_CHECKING:
+    from pyopenvba.interpreter._runtime import Interpreter
+
+#: The error for a key the dictionary has not got, which Remove and Key raise.
+ERR_NOT_FOUND = 32811
+
+
+class Dictionary(VBAObject):
+    """Scripting.Dictionary."""
+
+    vba_type_name = "Dictionary"
+    vba_library = "scripting"
+
+    def __init__(self) -> None:
+        #: Each entry under the identity its key is matched by: the key as given, and the item.
+        self._entries: dict[Hashable, tuple[object, object]] = {}
+        self._mode = 0
+
+    def _identity(self, key: object) -> Hashable:
+        """What a key is matched by."""
+        if key is EMPTY or key == "":
+            return ("text", "")
+        if key is NULL:
+            return ("null",)
+        if isinstance(key, str):
+            return ("text", key.lower() if self._mode else key)
+        if isinstance(key, VBAObject):
+            return ("object", id(key))
+        if isinstance(key, (VBAArray, VBAErrorValue)) or key is MISSING:
+            raise VBAUnsupportedError(f"a Dictionary key that is {type_name(key)} is not implemented")
+        number = to_number(key)
+        return ("number", float(number) if not isinstance(number, Decimal) else number)
+
+    @method
+    def Add(self, Key: object = MISSING, Item: object = MISSING) -> object:
+        if Key is MISSING or Item is MISSING:
+            # Bound late, the object counts its arguments itself: o.Add 1 is 450 (tests/fixtures/com_objects.json).
+            raise error(450 if BINDING.late else 449)
+        identity = self._identity(Key)
+        if identity in self._entries:
+            raise error(457)
+        self._entries[identity] = (Key, Item)
+        return EMPTY
+
+    @method
+    def Exists(self, Key: object = MISSING) -> object:
+        return self._identity(Key) in self._entries
+
+    @member(default=True)
+    def Item(self, Key: object = MISSING) -> object:
+        if Key is MISSING:
+            # A Let of the dictionary itself reads its default member with no key, which is 450 (tests/fixtures/com_objects.json).
+            raise error(450)
+        identity = self._identity(Key)
+        if identity not in self._entries:
+            # Reading a key the dictionary has not got adds it, holding Empty.
+            self._entries[identity] = (Key, EMPTY)
+        return self._entries[identity][1]
+
+    @setter("Item")
+    def _set_item(self, Key: object, value: object) -> None:
+        identity = self._identity(Key)
+        given = self._entries[identity][0] if identity in self._entries else Key
+        self._entries[identity] = (given, value)
+
+    @method
+    def Items(self) -> object:
+        return VBAArray([(0, len(self._entries) - 1)], items=[item for _, item in self._entries.values()])
+
+    @method
+    def Keys(self) -> object:
+        return VBAArray([(0, len(self._entries) - 1)], items=[key for key, _ in self._entries.values()])
+
+    @method
+    def Remove(self, Key: object = MISSING) -> object:
+        identity = self._identity(Key)
+        if identity not in self._entries:
+            raise error(ERR_NOT_FOUND, "Element not found")
+        del self._entries[identity]
+        return EMPTY
+
+    @method
+    def RemoveAll(self) -> object:
+        self._entries.clear()
+        return EMPTY
+
+    @member
+    def Count(self) -> object:
+        return VBAInt(len(self._entries), "Long")
+
+    @member
+    def CompareMode(self) -> object:
+        return VBAInt(self._mode, "Long")
+
+    @setter("CompareMode")
+    def _set_compare_mode(self, value: object) -> None:
+        if self._entries:
+            raise error(5)
+        mode = int(to_integer(value, "Long"))
+        if mode not in (0, 1):
+            raise VBAUnsupportedError("a Dictionary's CompareMode other than vbBinaryCompare or vbTextCompare is "
+                                      "not implemented")
+        self._mode = mode
+
+    @member
+    def Key(self, Key: object = MISSING) -> object:
+        # Through an Object it is 438 (tests/fixtures/vba_everyday_17.json); 451 stays for a call not bound late, unmeasured.
+        raise error(438 if BINDING.late else 451, "Dictionary.Key can only be assigned to")
+
+    @setter("Key")
+    def _set_key(self, Key: object, value: object) -> None:
+        """Give an entry a new key, where it stands in the order."""
+        identity = self._identity(Key)
+        if identity not in self._entries:
+            raise error(ERR_NOT_FOUND, "Element not found")
+        renamed = self._identity(value)
+        if renamed != identity and renamed in self._entries:
+            raise error(457)
+        self._entries = {(renamed if one == identity else one): ((value, entry[1]) if one == identity else entry)
+                         for one, entry in self._entries.items()}
+
+    def vba_iterate(self) -> Iterator[object]:
+        yield from [key for key, _ in self._entries.values()]
+
+
+def in_memory(name: str, *, program: bool, interpreter: Interpreter) -> VBAObject | None:
+    """The object CreateObject makes for a program's name, or New for a class's, where pyOpenVBA makes it in
+    memory; None for any other."""
+    from pyopenvba.interpreter._adodb import AdoStream
+    from pyopenvba.interpreter._http import PROGRAMS as HTTP_PROGRAMS, HttpRequest
+    from pyopenvba.interpreter._regexp import RegExp
+
+    key = name.lower()
+    if program and key == "adodb.stream":
+        return AdoStream(interpreter)
+    if program and key in HTTP_PROGRAMS:
+        interpreter.outside(f"CreateObject({name!r})")
+        return HttpRequest(key, interpreter)
+    if program:
+        made = {"scripting.dictionary": Dictionary, "scripting.filesystemobject": FileSystemObject,
+                "vbscript.regexp": RegExp}.get(key)
+    else:
+        made = {"scripting.dictionary": Dictionary, "dictionary": Dictionary,
+                "scripting.filesystemobject": FileSystemObject, "filesystemobject": FileSystemObject,
+                "vbscript_regexp_55.regexp": RegExp, "regexp": RegExp}.get(key)
+    if made is None:
+        return None
+    created = made()
+    if isinstance(created, FileSystemObject):
+        created.interpreter = interpreter
+    return created
+
+
+_SEPARATORS = "\\/"
+
+
+def drive_of(path: str) -> str:
+    """The drive a path starts with: C: or \\\\server\\share; "" for none."""
+    if len(path) >= 2 and path[1] == ":" and path[0].isalpha():
+        return path[:2]
+    if len(path) >= 2 and path[0] in _SEPARATORS and path[1] in _SEPARATORS:
+        parts = path[2:].replace("/", "\\").split("\\")
+        if len(parts) >= 2 and parts[0] and parts[1]:
+            return path[:2 + len(parts[0]) + 1 + len(parts[1])]
+    return ""
+
+
+def _split(path: str) -> tuple[str, str, str]:
+    """A path's drive, the folders after it, and the name at its end, trailing separators left off."""
+    drive = drive_of(path)
+    rest = path[len(drive):].rstrip(_SEPARATORS)
+    cut = max(rest.rfind("\\"), rest.rfind("/"))
+    return drive, rest[:cut + 1] if cut >= 0 else "", rest[cut + 1:]
+
+
+class FileSystemObject(FileSystemMembers):
+    """Scripting.FileSystemObject: its path functions here, which reach nothing, and the rest in _fso."""
+
+    vba_type_name = "FileSystemObject"
+    vba_library = "scripting"
+
+    #: Whose sandbox it answers to.
+    interpreter: Interpreter
+
+    @method
+    def GetFileName(self, Path: object = MISSING) -> object:
+        return _split(_path(Path))[2]
+
+    @method
+    def GetBaseName(self, Path: object = MISSING) -> object:
+        name = _split(_path(Path))[2]
+        return name[:name.rfind(".")] if "." in name else name
+
+    @method
+    def GetExtensionName(self, Path: object = MISSING) -> object:
+        name = _split(_path(Path))[2]
+        return name[name.rfind(".") + 1:] if "." in name else ""
+
+    @method
+    def GetParentFolderName(self, Path: object = MISSING) -> object:
+        drive, folders, name = _split(_path(Path))
+        if not name:
+            return ""
+        parent = folders.rstrip(_SEPARATORS)
+        if parent:
+            return drive + parent
+        # A file at a drive's root has the root for its parent, C:\ with its backslash; one at a share's root has
+        # the share, and one at the root of no drive none.
+        if folders and drive[1:2] == ":":
+            return drive + folders[0]
+        return drive
+
+    @method
+    def GetDriveName(self, Path: object = MISSING) -> object:
+        return drive_of(_path(Path))
+
+    @method
+    def BuildPath(self, Path: object = MISSING, Name: object = MISSING) -> object:
+        folder, name = _path(Path), _path(Name)
+        if not folder or not name:
+            return folder + name
+        if folder.endswith(":"):
+            return folder + name
+        ends, starts = folder[-1] in _SEPARATORS, name[0] in _SEPARATORS
+        if ends and starts:
+            return folder + name[1:]
+        return folder + name if ends or starts else folder + "\\" + name
+
+    def vba_no_member(self, name: str) -> Exception:
+        from pyopenvba.interpreter._inventory import member_exists
+
+        if member_exists(self.vba_type_name, name, self.vba_library):
+            self.interpreter.outside(f"FileSystemObject.{name}")
+            return VBAUnsupportedError(f"FileSystemObject.{name} reaches the real file system, which pyOpenVBA "
+                                       "does not do")
+        return super().vba_no_member(name)
+
+
+def _path(value: object) -> str:
+    from pyopenvba.interpreter._values import to_text
+
+    if value is MISSING:
+        raise error(449)
+    if value is NULL:
+        # As RegExp's text arguments are (tests/fixtures/scripting_objects.json).
+        raise error(13, "Type mismatch")
+    return to_text(value)

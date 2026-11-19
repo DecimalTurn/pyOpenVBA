@@ -3,8 +3,12 @@
 from __future__ import annotations
 
 import struct
+import sys
+import zipfile
+from pathlib import Path
 
 import pytest
+from _cfb_trees import directory, tree_problems, windows_adds_modules
 
 from pyopenvba.cfb import CFB
 from pyopenvba.exceptions import CFBError
@@ -37,7 +41,7 @@ def _make_minimal_cfb() -> bytes:
         root_name_padded,      # name (64 bytes)
         root_name_len,         # name length
         5,                     # obj_type = root
-        1,                     # color = red
+        1,                     # color = black
         0xFFFF_FFFF,           # left sibling
         0xFFFF_FFFF,           # right sibling
         0xFFFF_FFFF,           # child
@@ -499,3 +503,282 @@ class TestStorageScopedLookup:
     def test_lookup_stays_case_insensitive(self) -> None:
         cfb = self._cfb_with_duplicate_stream_names()
         assert cfb.get_stream_in_storage("storea", "DUP") == b"content-a"
+
+
+# ---------------------------------------------------------------------------
+# Path-addressed navigation
+# ---------------------------------------------------------------------------
+
+class TestCFBPathNavigation:
+    """A UserForm's nested storages repeat names -- two forms each own an
+    ``i06`` holding an ``f`` -- so navigating by name alone finds the
+    wrong one.  These walk from the root instead."""
+
+    @staticmethod
+    def _nested_cfb() -> CFB:
+        import zipfile
+        from pathlib import Path
+
+        live = Path(__file__).parent / "live_excel_testing" / "nested_form.xlsm"
+        if not live.exists():
+            pytest.skip("nested form fixture not available")
+        with zipfile.ZipFile(live) as zf:
+            return CFB.from_bytes(zf.read("xl/vbaProject.bin"))
+
+    def test_empty_path_lists_the_root(self) -> None:
+        cfb = self._nested_cfb()
+        assert set(cfb.list_storages_at()) == {"VBA", "FrmNested"}
+        assert "PROJECT" in cfb.list_streams_at()
+
+    def test_walks_into_nested_storages(self) -> None:
+        cfb = self._nested_cfb()
+        assert cfb.list_storages_at(["FrmNested"]) == ["i02", "i06"]
+        assert cfb.list_storages_at(["FrmNested", "i06"]) == ["i08", "i09"]
+
+    def test_same_named_streams_at_different_depths_stay_distinct(self) -> None:
+        cfb = self._nested_cfb()
+        outer = cfb.get_stream_at(["FrmNested"], "f")
+        page = cfb.get_stream_at(["FrmNested", "i06", "i08"], "f")
+        assert outer != page
+        assert len(outer) > len(page)
+
+    def test_a_step_that_is_not_a_child_raises(self) -> None:
+        """``i08`` exists, but not directly under the form."""
+        cfb = self._nested_cfb()
+        with pytest.raises(KeyError, match="i08"):
+            cfb.list_streams_at(["FrmNested", "i08"])
+
+    def test_missing_stream_names_the_path(self) -> None:
+        cfb = self._nested_cfb()
+        with pytest.raises(KeyError, match="FrmNested/i06"):
+            cfb.get_stream_at(["FrmNested", "i06"], "nosuchstream")
+
+    def test_a_storage_is_not_returned_as_a_stream(self) -> None:
+        cfb = self._nested_cfb()
+        assert "i06" not in cfb.list_streams_at(["FrmNested"])
+        assert "f" not in cfb.list_storages_at(["FrmNested"])
+
+    def test_lookup_is_case_insensitive(self) -> None:
+        cfb = self._nested_cfb()
+        assert cfb.get_stream_at(["frmnested", "I06"], "F") == cfb.get_stream_at(
+            ["FrmNested", "i06"], "f"
+        )
+
+
+class TestCFBPathEditing:
+    """Creating a UserForm container means creating a storage with the
+    right CLSID; removing one means removing it and everything under it,
+    because a child storage no site claims makes the next read refuse."""
+
+    @staticmethod
+    def _nested_cfb() -> CFB:
+        import zipfile
+        from pathlib import Path
+
+        live = Path(__file__).parent / "live_excel_testing" / "nested_form.xlsm"
+        if not live.exists():
+            pytest.skip("nested form fixture not available")
+        with zipfile.ZipFile(live) as zf:
+            return CFB.from_bytes(zf.read("xl/vbaProject.bin"))
+
+    _FRAME_CLSID = bytes.fromhex("2020186e60f4ce119bcd00aa00608e01")
+
+    @staticmethod
+    def _clsid_of(raw: bytes, name: str) -> bytes:
+        """Find a directory entry in serialized bytes and read its CLSID.
+
+        Read from the output rather than the model, so this checks what
+        actually lands on disk.  Entries are 128 bytes and sector-aligned,
+        with a UTF-16LE name at offset 0 and the CLSID at 80.
+        """
+        needle = name.encode("utf-16-le") + b"\x00\x00"
+        for offset in range(0, len(raw) - 128, 128):
+            entry = raw[offset:offset + 128]
+            if entry[:len(needle)] == needle and entry[64] == len(needle):
+                return entry[80:96]
+        raise AssertionError(f"no directory entry named {name!r}")
+
+    def test_a_new_storage_keeps_its_clsid_through_a_round_trip(self) -> None:
+        cfb = self._nested_cfb()
+        cfb.add_substorage_at(["FrmNested"], "i99", self._FRAME_CLSID)
+        cfb.add_stream_at(["FrmNested", "i99"], "f", b"payload")
+        raw = cfb.to_bytes()
+        out = CFB.from_bytes(raw)
+        assert "i99" in out.list_storages_at(["FrmNested"])
+        assert out.get_stream_at(["FrmNested", "i99"], "f") == b"payload"
+        assert self._clsid_of(raw, "i99") == self._FRAME_CLSID
+
+    def test_removing_a_storage_takes_its_subtree(self) -> None:
+        cfb = self._nested_cfb()
+        # i06 is the MultiPage: it owns i08 and i09.
+        cfb.remove_storage_at(["FrmNested"], "i06")
+        out = CFB.from_bytes(cfb.to_bytes())
+        assert out.list_storages_at(["FrmNested"]) == ["i02"]
+        # The sibling that was not removed is still intact.
+        assert len(out.get_stream_at(["FrmNested", "i02"], "f")) == 208
+
+    def test_a_duplicate_storage_name_is_refused(self) -> None:
+        cfb = self._nested_cfb()
+        with pytest.raises(ValueError, match="already exists"):
+            cfb.add_substorage_at(["FrmNested"], "i02")
+
+    def test_a_duplicate_stream_name_is_refused(self) -> None:
+        cfb = self._nested_cfb()
+        with pytest.raises(ValueError, match="already exists"):
+            cfb.add_stream_at(["FrmNested"], "f", b"")
+
+    def test_removing_something_that_is_not_there_raises(self) -> None:
+        cfb = self._nested_cfb()
+        with pytest.raises(KeyError, match="i99"):
+            cfb.remove_storage_at(["FrmNested"], "i99")
+
+    def test_a_clsid_of_the_wrong_length_is_refused(self) -> None:
+        cfb = self._nested_cfb()
+        with pytest.raises(ValueError, match="16 bytes"):
+            cfb.add_substorage_at(["FrmNested"], "i99", b"\x00" * 8)
+
+
+class TestCFBPastTheHeaderDIFAT:
+    """The header lists 109 FAT sectors, which map about 7.1 MB of 512-byte
+    sectors; a larger file lists the rest of its FAT in DIFAT sectors
+    ([MS-CFB] 2.5).  The writer used to refuse such a file, so no
+    vbaProject.bin, .xls or .doc past 7.1 MB could be saved."""
+
+    _ENDOFCHAIN = 0xFFFFFFFE
+
+    @staticmethod
+    def _saved(size: int) -> tuple[bytes, bytes]:
+        cfb = CFB.from_bytes(_make_minimal_cfb())
+        blob = bytes(range(256)) * (size // 256)
+        cfb.add_stream_at((), "Big", blob)
+        return cfb.to_bytes(), blob
+
+    @staticmethod
+    def _header(raw: bytes) -> tuple[int, int, int]:
+        """The FAT sector count, the first DIFAT sector and the DIFAT sector count."""
+        n_fat = struct.unpack_from("<I", raw, 44)[0]
+        first_difat, n_difat = struct.unpack_from("<II", raw, 68)
+        return n_fat, first_difat, n_difat
+
+    @staticmethod
+    def _sector(raw: bytes, index: int) -> bytes:
+        return raw[512 + index * 512:512 + (index + 1) * 512]
+
+    def test_a_file_the_header_can_map_has_no_difat(self) -> None:
+        raw, blob = self._saved(6_900_000)
+        n_fat, first_difat, n_difat = self._header(raw)
+        assert n_fat <= 109
+        assert (first_difat, n_difat) == (self._ENDOFCHAIN, 0)
+        assert CFB.from_bytes(raw).get_stream("Big") == blob
+
+    def test_past_109_fat_sectors_the_rest_are_listed_in_a_difat_sector(self) -> None:
+        raw, blob = self._saved(7_300_000)
+        n_fat, first_difat, n_difat = self._header(raw)
+        assert n_fat > 109 and n_difat == 1
+        listed = struct.unpack_from("<128I", self._sector(raw, first_difat))
+        fat_sectors = [*struct.unpack_from("<109I", raw, 76), *(s for s in listed[:127] if s != 0xFFFFFFFF)]
+        assert len(fat_sectors) == n_fat
+        # The last DIFAT sector ends the chain where the next one's number would go.
+        assert listed[127] == self._ENDOFCHAIN
+        fat = b"".join(self._sector(raw, sector) for sector in fat_sectors)
+        entries = struct.unpack_from(f"<{len(fat) // 4}I", fat)
+        assert all(entries[sector] == 0xFFFFFFFD for sector in fat_sectors)  # FATSECT
+        assert entries[first_difat] == 0xFFFFFFFC  # DIFSECT
+        assert CFB.from_bytes(raw).get_stream("Big") == blob
+
+    def test_difat_sectors_chain_to_each_other(self) -> None:
+        raw, blob = self._saved(24_500_000)
+        n_fat, first_difat, n_difat = self._header(raw)
+        assert n_difat == -(-(n_fat - 109) // 127) >= 2
+        chain = [first_difat]
+        for _ in range(n_difat - 1):
+            chain.append(struct.unpack_from("<I", self._sector(raw, chain[-1]), 508)[0])
+        assert struct.unpack_from("<I", self._sector(raw, chain[-1]), 508)[0] == self._ENDOFCHAIN
+        assert CFB.from_bytes(raw).get_stream("Big") == blob
+
+    def test_windows_reads_what_the_writer_wrote(self, tmp_path: Path) -> None:
+        # Windows' own compound-file implementation, where pywin32 is installed.
+        pythoncom = pytest.importorskip("pythoncom")
+        raw, blob = self._saved(7_300_000)
+        path = tmp_path / "large.bin"
+        path.write_bytes(raw)
+        storage = pythoncom.StgOpenStorage(str(path), None, 0x10)  # STGM_READ | STGM_SHARE_EXCLUSIVE
+        stream = storage.OpenStream("Big", None, 0x10, 0)
+        read = bytearray()
+        while chunk := stream.Read(1 << 20):
+            read += chunk
+        assert bytes(read) == blob
+
+
+class TestCFBStorageTrees:
+    """A storage's children form a red-black tree ([MS-CFB] 2.6.4), and the
+    colours are not decoration: Windows' compound-file code inserts into
+    the tree it reads and refuses (STG_E_DOCFILECORRUPT) on runs of red
+    entries.  The writer used to leave every entry it placed red, so Excel's
+    editor gave "Device I/O error" adding a module to a project of 66
+    sheets the in-memory Excel had saved."""
+
+    #: The streams Excel's editor adds when the harness runs code in a workbook, and a few more.
+    _MODULES = ("PyVbaUserCode", "PyVbaHarnessRunner", "PyVbaHarnessCall", "Extra1", "Extra2", "Extra3")
+
+    @staticmethod
+    def _project(sheets: int) -> CFB:
+        """A project laid out as Excel's is for a workbook of ``sheets`` sheets and one module."""
+        cfb = CFB.from_bytes(_make_minimal_cfb())
+        cfb.add_stream_at((), "PROJECT", b"ID=")
+        cfb.add_stream_at((), "PROJECTwm", b"\x00\x00")
+        cfb.add_substorage_at((), "VBA")
+        for name in ["_VBA_PROJECT", "dir", "ThisWorkbook", "Module1", *(f"Sheet{k}" for k in range(1, sheets + 1))]:
+            cfb.add_stream_at(("VBA",), name, b"source")
+        return cfb
+
+    def test_every_tree_the_writer_builds_keeps_the_rules(self) -> None:
+        cfb = self._project(1)
+        for sheet in range(2, 301):
+            cfb.add_stream_at(("VBA",), f"Sheet{sheet}", b"source")
+            assert tree_problems(cfb.to_bytes()) == [], f"{sheet} sheets"
+        assert CFB.from_bytes(cfb.to_bytes()).get_stream_at(("VBA",), "Sheet300") == b"source"
+
+    def test_removing_and_renaming_keep_the_rules(self) -> None:
+        cfb = self._project(66)
+        for sheet in range(2, 67, 3):
+            cfb.remove_stream_in_storage("VBA", f"Sheet{sheet}")
+        cfb.rename_stream_in_storage("VBA", "Module1", "Renamed")
+        assert tree_problems(cfb.to_bytes()) == []
+
+    def test_a_tree_read_with_broken_colours_is_mended_on_save(self) -> None:
+        raw = bytearray(self._project(66).to_bytes())
+        # Every entry red, as this writer used to leave the ones it placed.  It writes its directory in one run.
+        start = (struct.unpack_from("<I", raw, 48)[0] + 1) * 512
+        for at in range(start, start + 128 * len(directory(bytes(raw))), 128):
+            if raw[at + 66] in (1, 2):
+                raw[at + 67] = 0
+        assert tree_problems(bytes(raw))
+        read = CFB.from_bytes(bytes(raw))
+        mended = read.to_bytes()
+        assert tree_problems(mended) == []
+        out = CFB.from_bytes(mended)
+        assert sorted(out.list_streams_at(("VBA",))) == sorted(read.list_streams_at(("VBA",)))
+
+    def test_a_tree_office_wrote_is_written_as_it_was(self) -> None:
+        live = Path(__file__).parent / "live_excel_testing" / "test_macro_workbook.xlsm"
+        with zipfile.ZipFile(live) as package:
+            raw = package.read("xl/vbaProject.bin")
+        assert tree_problems(raw) == []
+        written = [entry for entry in directory(CFB.from_bytes(raw).to_bytes()) if entry[1]]
+        assert written == [entry for entry in directory(raw) if entry[1]]
+
+    def test_words_all_black_tree_is_written_as_word_wrote_it(self) -> None:
+        # Word leaves every entry black, so paths down hold different numbers of black entries.  Windows adds to
+        # such a tree, so the writer keeps it: only a red entry under a red one is mended.
+        raw = (Path(__file__).parent / "fixtures" / "no_vba" / "document.doc").read_bytes()
+        assert tree_problems(raw) == ["Root Entry: paths down hold [2, 3] black entries"]
+        written = [entry for entry in directory(CFB.from_bytes(raw).to_bytes()) if entry[1]]
+        assert written == [entry for entry in directory(raw) if entry[1]]
+
+    @pytest.mark.skipif(sys.platform != "win32", reason="ole32 is Windows'")
+    @pytest.mark.parametrize("sheets", [1, 66, 100, 255])
+    def test_windows_adds_modules_to_a_project_the_writer_built(self, tmp_path: Path, sheets: int) -> None:
+        path = tmp_path / "vbaProject.bin"
+        path.write_bytes(self._project(sheets).to_bytes())
+        assert windows_adds_modules(path, self._MODULES) == ""

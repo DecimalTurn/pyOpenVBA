@@ -1,0 +1,546 @@
+"""Formula2's @: where a formula written through Range.Formula cuts cells to one value.
+
+A formula Range.Formula writes is worked out as Excel worked formulas out
+before dynamic arrays: where one value is wanted, a range is cut to the
+formula's own row or column and an array to its first item. Formula2
+reads such a formula back with an @ at each place that happens, which is
+how the same formula is written for dynamic arrays. Measured in live
+Excel (scripts/measure_implicit_intersection.py,
+tests/fixtures/implicit_intersection.json): each of Excel's functions
+written with each argument a cell, a range, and an operation on a range,
+with its optional and repeating arguments too, and 150 formulas besides.
+
+What can give several values: a range of more than one cell as written,
+A1:A1 among them, a whole column or row, a range or an intersection the
+operators make, a defined name for such cells, an array or a formula, an
+array constant, a call of one of the functions that give arrays -- FILTER,
+SEQUENCE, TRANSPOSE, INDIRECT, IFS and the rest -- and of a function
+Excel has not got or a name defines, and some calls by what they are
+given: INDEX without a row and column that are numbers other than 0,
+OFFSET of a range or with a height or width other than 1, XLOOKUP
+returning more than one cell, IF, CHOOSE and IFERROR choosing among such,
+LET ending in one, ROW, COLUMN, ISFORMULA and FORMULATEXT of a range.
+
+Where one value is wanted, such a thing takes the @: the whole formula,
+an operand of an operator, and an argument a function takes as one value.
+A function takes each argument in one of three ways, measured function by
+function: as one value (ABS, a lookup's value); as a range, which takes
+cells whole but cuts an operation on them (SUM, COUNT, MATCH's range):
+SUM(@A1:A3*2); or whole, cutting nothing inside (SUMPRODUCT, MMULT and
+the functions that give arrays). IF, CHOOSE, IFERROR and IFNA hand a
+choice on untouched, and so do LET for what it binds and returns and a
+LAMBDA for its result, a name they bind standing for what it is given.
+A name the workbook does not define could be such cells, and takes one.
+
+An @ written in a formula is a call of SINGLE, which takes what it holds
+as a range: =@(A1:A3*2) cuts the operation inside, =@(@A1:A3*2). Written
+through Range.Formula, an @ standing where the formula cuts anyway is
+that cut and is left out, =@A1:A3 being =A1:A3, but not one over
+something in brackets, @(A1:A3); any other is kept, and then Range.Formula
+reads the formula back with every @ Formula2 shows: =@A1+A1:A3 is
+=@A1+@A1:A3 (tests/fixtures/at_sign.json, see :func:`written`).
+"""
+
+from __future__ import annotations
+
+from collections.abc import Callable
+from dataclasses import dataclass, field
+from typing import Final
+
+from pyopenvba.formula._calc import functions as functions  # imported to register every function
+from pyopenvba.formula._calc.catalog import is_excel_function
+from pyopenvba.formula._calc.nodes import function_key
+from pyopenvba.formula._calc.registry import FUNCTIONS
+from pyopenvba.formula._deep import deep
+from pyopenvba.formula._parse import (ArrayLiteral, Binary, Call, FormulaError, Invoke, Literal, NameNode, Node, is_one_cell,
+                                      Reference, Structured, Unary, parse, parse_placed, tokenize)
+from pyopenvba.formula._prefixes import at_kept, intersected
+
+#: How a function takes each argument, by position, where it is not as one value (V) throughout: R as a range, A
+#: whole. Past the last position given the last ones repeat, as many as the function's repeating arguments.
+_ROLES: Final[dict[str, str]] = {
+    "ACCRINT": "RRRRRRRR", "ACCRINTM": "RRRRR", "AGGREGATE": "VVARR", "AMORDEGRC": "RRRRRRR",
+    "AMORLINC": "RRRRRRR", "AND": "RRR", "AREAS": "R", "ARRAYTOTEXT": "AV", "AVEDEV": "RRR", "AVERAGE": "RRR",
+    "AVERAGEA": "RRR", "AVERAGEIF": "RVR", "AVERAGEIFS": "RRVRVRV", "BESSELI": "RR", "BESSELJ": "RR",
+    "BESSELK": "RR", "BESSELY": "RR", "BIN2DEC": "R", "BIN2HEX": "RR", "BIN2OCT": "RR", "BYCOL": "AV",
+    "BYROW": "AV", "CELL": "VR", "CHISQ.TEST": "AA", "CHITEST": "AA", "CHOOSE": "VRRR", "CHOOSECOLS": "AVVV",
+    "CHOOSEROWS": "AVVV", "COLUMN": "R", "COLUMNS": "A", "COMPLEX": "RRR", "CONCAT": "RRR", "CONVERT": "RRR",
+    "CORREL": "AA", "COUNT": "RRR", "COUNTA": "RRR", "COUNTBLANK": "R", "COUNTIF": "RV", "COUNTIFS": "RVRVRV",
+    "COUPDAYBS": "RRRR", "COUPDAYS": "RRRR", "COUPDAYSNC": "RRRR", "COUPNCD": "RRRR", "COUPNUM": "RRRR",
+    "COUPPCD": "RRRR", "COVAR": "AA", "COVARIANCE.P": "AA", "COVARIANCE.S": "AA", "CUBEMEMBER": "VR",
+    "CUBESET": "VR", "CUMIPMT": "RRRRRR", "CUMPRINC": "RRRRRR", "DAVERAGE": "RRR", "DCOUNT": "RRR",
+    "DCOUNTA": "RRR", "DEC2BIN": "RR", "DEC2HEX": "RR", "DEC2OCT": "RR", "DELTA": "RR", "DEVSQ": "RRR",
+    "DGET": "RRR", "DISC": "RRRRR", "DMAX": "RRR", "DMIN": "RRR", "DOLLARDE": "RR", "DOLLARFR": "RR",
+    "DPRODUCT": "RRR", "DROP": "AVV", "DSTDEV": "RRR", "DSTDEVP": "RRR", "DSUM": "RRR", "DURATION": "RRRRRR",
+    "DVAR": "RRR", "DVARP": "RRR", "EDATE": "RR", "EFFECT": "RR", "EOMONTH": "RR", "ERF": "RR", "ERF.PRECISE": "R",
+    "ERFC": "R", "ERFC.PRECISE": "R", "EXPAND": "AVVV", "F.TEST": "AA", "FACTDOUBLE": "R", "FILTER": "AAV",
+    "FORECAST": "VAA", "FORECAST.ETS": "VAA", "FORECAST.ETS.CONFINT": "VAA", "FORECAST.ETS.SEASONALITY": "AA",
+    "FORECAST.ETS.STAT": "AAV", "FORECAST.LINEAR": "VAA", "FORMULATEXT": "R", "FREQUENCY": "AA", "FTEST": "AA",
+    "FVSCHEDULE": "RR", "GCD": "RRR", "GEOMEAN": "RRR", "GESTEP": "RR", "GETPIVOTDATA": "RRVV", "GROUPBY": "AAA",
+    "GROWTH": "AAA", "HARMEAN": "RRR", "HEX2BIN": "RR", "HEX2DEC": "R", "HEX2OCT": "RR", "HLOOKUP": "VRVV",
+    "HSTACK": "AAA", "IF": "VRR", "IFERROR": "VR", "IFNA": "VR", "IFS": "VRVRVR", "IMABS": "R", "IMAGINARY": "R",
+    "IMARGUMENT": "R", "IMCONJUGATE": "R", "IMCOS": "R", "IMCOSH": "R", "IMCOT": "R", "IMCSC": "R", "IMCSCH": "R",
+    "IMDIV": "RR", "IMEXP": "R", "IMLN": "R", "IMLOG10": "R", "IMLOG2": "R", "IMPOWER": "RR", "IMPRODUCT": "RRR",
+    "IMREAL": "R", "IMSEC": "R", "IMSECH": "R", "IMSIN": "R", "IMSINH": "R", "IMSQRT": "R", "IMSUB": "RR",
+    "IMSUM": "RRR", "IMTAN": "R", "INDEX": "AVV", "INTERCEPT": "AA", "INTRATE": "RRRRR", "IRR": "AV", "ISEVEN": "R",
+    "ISFORMULA": "R", "ISODD": "R", "ISOMITTED": "R", "ISREF": "R", "KURT": "RRR", "LAMBDA": "RR", "LARGE": "RV",
+    "LCM": "RRR", "LET": "RR", "LINEST": "AAR", "LOGEST": "AAR", "LOOKUP": "VAA", "MAKEARRAY": "VVR", "MAP": "ARR",
+    "MATCH": "VRR", "MAX": "RRR", "MAXA": "RRR", "MAXIFS": "RRVRVRV", "MDETERM": "A", "MDURATION": "RRRRRR",
+    "MEDIAN": "RRR", "MIN": "RRR", "MINA": "RRR", "MINIFS": "RRVRVRV", "MINVERSE": "A", "MIRR": "AVV", "MMULT": "AA",
+    "MODE": "AAA", "MODE.MULT": "AAA", "MODE.SNGL": "AAA", "MROUND": "RR", "MULTINOMIAL": "RRR", "N": "R",
+    "NETWORKDAYS": "RRR", "NETWORKDAYS.INTL": "RRVR", "NOMINAL": "RR", "NPV": "VRRR", "OCT2BIN": "RR",
+    "OCT2DEC": "R", "OCT2HEX": "RR", "OFFSET": "RVVVV", "OR": "RRR", "PEARSON": "AA", "PERCENTILE": "RV",
+    "PERCENTILE.EXC": "RV", "PERCENTILE.INC": "RV", "PERCENTOF": "RR", "PERCENTRANK": "RVV",
+    "PERCENTRANK.EXC": "RVV", "PERCENTRANK.INC": "RVV", "PHONETIC": "R", "PIVOTBY": "AAAA", "PRICE": "RRRRRRR",
+    "PRICEDISC": "RRRRR", "PRICEMAT": "RRRRRR", "PROB": "AAVV", "PRODUCT": "RRR", "QUARTILE": "RV",
+    "QUARTILE.EXC": "RV", "QUARTILE.INC": "RV", "QUOTIENT": "RR", "RANDBETWEEN": "RR", "RANK": "VRV",
+    "RANK.AVG": "VRV", "RANK.EQ": "VRV", "RECEIVED": "RRRRR", "REDUCE": "RAV", "ROW": "R", "ROWS": "A", "RSQ": "AA",
+    "SCAN": "RAV", "SERIESSUM": "RRRR", "SHEET": "R", "SHEETS": "A", "SINGLE": "R", "SKEW": "RRR", "SKEW.P": "RRR",
+    "SLOPE": "AA", "SMALL": "RV", "SORT": "AAA", "SORTBY": "AA", "SQRTPI": "R", "STDEV": "RRR", "STDEV.P": "RRR",
+    "STDEV.S": "RRR", "STDEVA": "RRR", "STDEVP": "RRR", "STDEVPA": "RRR", "STEYX": "AA", "SUBTOTAL": "VRRR",
+    "SUM": "RRR", "SUMIF": "RVR", "SUMIFS": "RRVRVRV", "SUMPRODUCT": "AAA", "SUMSQ": "RRR", "SUMX2MY2": "AA",
+    "SUMX2PY2": "AA", "SUMXMY2": "AA", "SWITCH": "VVRVRVR", "T": "R", "T.TEST": "AAVV", "TAKE": "AVV",
+    "TBILLEQ": "RRR", "TBILLPRICE": "RRR", "TBILLYIELD": "RRR", "TEXTJOIN": "RVRRR", "TOCOL": "AVV", "TOROW": "AVV",
+    "TREND": "AAA", "TRIMMEAN": "RV", "TRIMRANGE": "AVV", "TTEST": "AAVV", "UNIQUE": "AVV", "VAR": "RRR",
+    "VAR.P": "RRR", "VAR.S": "RRR", "VARA": "RRR", "VARP": "RRR", "VARPA": "RRR", "VLOOKUP": "VRVV",
+    "VSTACK": "AAA", "WEEKNUM": "RR", "WORKDAY": "RRR", "WORKDAY.INTL": "RRVR", "WRAPCOLS": "AVV",
+    "WRAPROWS": "AVV", "XIRR": "RRR", "XLOOKUP": "VAARV", "XMATCH": "VAVV", "XNPV": "RRR", "XOR": "RRR",
+    "YEARFRAC": "RRR", "YIELD": "RRRRRRR", "YIELDDISC": "RRRRR", "YIELDMAT": "RRRRRR", "Z.TEST": "RVV",
+    "ZTEST": "RVV",
+}
+#: The functions whose call can always give several values.
+_ARRAYS: Final = frozenset("""
+BYCOL BYROW CELL CHOOSECOLS CHOOSEROWS DROP EUROCONVERT EXPAND FILTER FILTERXML FREQUENCY GROUPBY GROWTH HSTACK IFS
+INDIRECT LAMBDA LINEST LOGEST MAKEARRAY MAP MINVERSE MMULT MODE.MULT MUNIT PIVOTBY RANDARRAY REDUCE REGEXEXTRACT
+SCAN SEQUENCE SORT SORTBY STOCKHISTORY SWITCH TAKE TEXTSPLIT TOCOL TOROW TRANSPOSE TREND TRIMRANGE UNIQUE VSTACK
+WRAPCOLS WRAPROWS
+""".split())
+#: The functions that hand some of their arguments on untouched, and which: CHOOSE's from the second on.
+_CHOICES: Final[dict[str, Callable[[int], bool]]] = {
+    "IF": lambda index: index in (1, 2), "IFERROR": lambda index: index == 1, "IFNA": lambda index: index == 1,
+    "CHOOSE": lambda index: index > 0, "XLOOKUP": lambda index: index == 3,
+}
+
+#: Where a thing stands: one value wanted, a range taken, taken whole, or handed on untouched.
+VALUE, RANGE, WHOLE, HANDED = "V", "R", "A", "H"
+
+
+class UnreadFormula2Error(FormulaError):
+    """A formula whose Formula2 the model does not work out."""
+
+
+def _is_at(node: Node | None) -> bool:
+    """Whether ``node`` is an @, or the call of SINGLE that is the same thing."""
+    return isinstance(node, Unary) and node.op == "@" or isinstance(node, Call) and function_key(node.name) == "SINGLE"
+
+
+@dataclass
+class _Walk:
+    starts: dict[int, int]
+    #: A defined name's formula, or None for a name the workbook does not define.
+    named: Callable[[str], str | None]
+    marks: set[int] = field(default_factory=lambda: set())
+    #: What each name a LET or a LAMBDA binds stands for: whether it can give several values.
+    bound: list[dict[str, bool]] = field(default_factory=lambda: [])
+    #: How many calls the walk is inside.
+    calls: int = 0
+    #: The formula's text after its =, and whether the walk looks for the @ Range.Formula leaves out, which it notes
+    #: in ``merged`` by where each stands (see :func:`written`).
+    body: str = ""
+    merging: bool = False
+    merged: set[int] = field(default_factory=lambda: set())
+    #: Whether a table's reference may stand here, as it may in what Range.Formula keeps (see :func:`written`).
+    tables: bool = False
+    reference_handoff: int = 0
+    array_evaluation: bool = False
+
+    def visit(self, node: Node | None, where: str) -> bool:
+        """Mark where ``node`` takes an @ standing ``where``, and say whether it can give several values then."""
+        many = self._many(node, where)
+        if many and where == VALUE and self._takes(node):
+            self.marks.add(self.starts[id(node)])
+            return False
+        return many
+
+    def _takes(self, node: Node | None) -> bool:
+        """Whether a thing that can give several values takes an @ where one is wanted: all but a union, or an intersection
+        with one cell, which is one value already, unless its other side is a name or a call that may give several
+        (tests/fixtures/value_gaps.json)."""
+        if isinstance(node, Binary) and node.op == " ":
+            sides = (node.left, node.right)
+            one_cell = any(isinstance(side, Reference) and ":" not in side.text
+                           or isinstance(side, Structured) and is_one_cell(side) for side in sides)
+            return not one_cell or any(self._may_give_many(side) for side in sides)
+        return not (isinstance(node, Binary) and node.op == ",")
+
+    def _may_give_many(self, node: Node | None) -> bool:
+        if isinstance(node, NameNode):
+            return True
+        if not isinstance(node, Call) or function_key(node.name) in _CHOICES:
+            return False
+        marks, merged = set(self.marks), set(self.merged)
+        many = self._many(node, VALUE)
+        self.marks, self.merged = marks, merged
+        return many
+
+    def _many(self, node: Node | None, where: str) -> bool:
+        if node is None or isinstance(node, Literal):
+            return False
+        if isinstance(node, Reference):
+            # A sheet's name cannot hold a colon: one there is a 3D reference's, cells on several sheets. Another
+            # workbook's path holds its drive's, C:\dir\[Book.xlsx]Sheet1, which is one sheet's
+            # (tests/fixtures/workbook_links.json).
+            return ":" in node.text or ":" in node.sheet.rpartition("]")[2]
+        if isinstance(node, Structured):
+            if is_one_cell(node):
+                return False
+            if self.merging:
+                # Written through Range.Formula, an @ on a table's cells goes as one on any other cells does
+                # (tests/fixtures/formula_reads.json).
+                return True
+            if not self.tables:
+                raise UnreadFormula2Error("Formula2 of a formula with a structured reference is not implemented")
+            return True
+        if isinstance(node, ArrayLiteral):
+            for row in node.rows:
+                for item in row:
+                    self.visit(item, WHOLE)
+            return True
+        if isinstance(node, NameNode):
+            return self._name(node)
+        if isinstance(node, Unary):
+            if node.op == "@":
+                return self._at(node, where)
+            if node.op == "#":
+                # What spilled from a cell, E1#, is cut at the formula's top, =E1#+1 reading back =@E1#+1, and in no
+                # function's argument: SUM(E1#*2) and TRANSPOSE(E1#) take none (tests/fixtures/implicit_intersection.json).
+                self.visit(node.operand, WHOLE)
+                return self.calls == 0
+            return self.visit(node.operand, WHOLE if where == WHOLE else VALUE) and where == WHOLE
+        if isinstance(node, Binary):
+            if node.op in (":", " ", ","):
+                left = self.visit(node.left, WHOLE)
+                self.visit(node.right, WHOLE)
+                if _is_at(node.left) and node.op == " ":
+                    # An @ on the left is enough for an intersection too: =@D2:D3 (A1:A3,A1).
+                    return False
+                if _is_at(node.right) and node.op != ":":
+                    # =A1 @A2 and =A1,@A2 read back as they are; =A1:@A2 is a range all the same, and =SUM(A1:A2) @A2 as its
+                    # left is (tests/fixtures/value_gaps.json).
+                    unknown = isinstance(node.left, NameNode) or isinstance(node.left, Call) and function_key(node.left.name) not in _CHOICES
+                    return left and node.op == " " and unknown
+                return True
+            inside = WHOLE if where == WHOLE else VALUE
+            left = self.visit(node.left, inside)
+            right = self.visit(node.right, inside)
+            return where == WHOLE and (left or right)
+        if isinstance(node, Invoke):
+            return self._invoke(node)
+        if isinstance(node, Call):
+            return self._call(node, where)
+        return False
+
+    def _at(self, node: Unary, where: str) -> bool:
+        """An @, a call of SINGLE: one value, from what it holds taken as a range. Merging, an @ standing where one
+        value is wanted, over something the formula cuts there anyway and not in brackets, is noted as that cut."""
+        if self.merging and where == VALUE and (not self.body[self.starts[id(node)] + 1:].lstrip().startswith("(")
+                                                 or isinstance(node.operand, Binary) and node.operand.op == " " and not node.operand.grouped):
+            marks, merged = set(self.marks), set(self.merged)
+            operand = node.operand
+            on_at = isinstance(operand, Binary) and operand.op != ":" and _is_at(operand.right)
+            if self._many(operand, VALUE) and self._takes(operand) and not on_at:
+                self.merged.add(self.starts[id(node)])
+                return False
+            # Kept: what it holds is walked again, as SINGLE takes it.
+            self.marks, self.merged = marks, merged
+        self.visit(node.operand, RANGE)
+        return False
+
+    def _name(self, node: NameNode) -> bool:
+        key = node.name.upper()
+        if not node.sheet:
+            for scope in reversed(self.bound):
+                if key in scope:
+                    return scope[key]
+        formula = self.named(node.name if not node.sheet else f"{node.sheet}!{node.name}")
+        if formula is None:
+            # What a name the workbook does not define stands for is not known (tests/fixtures/at_sign.json).
+            return True
+        try:
+            tree = parse(formula)
+        except FormulaError:
+            return True
+        if isinstance(tree, Literal):
+            return False
+        if isinstance(tree, Reference):
+            return ":" in tree.text
+        return not (isinstance(tree, Call) and function_key(tree.name) == "LAMBDA")
+
+    def _invoke(self, node: Invoke) -> bool:
+        target = node.target
+        if isinstance(target, Call) and function_key(target.name) == "LAMBDA":
+            self._lambda(target)
+        else:
+            self.visit(target, WHOLE)
+        for argument in node.args:
+            # Handed on to the parameters as it is; only an operation on cells is cut: (@A1:A2*1).
+            self.visit(argument, HANDED)
+        return True
+
+    def _lambda(self, node: Call) -> None:
+        """A LAMBDA's parameters stand for what it is given, cells or an array: its body cuts them."""
+        *parameters, body = node.args or [None]
+        names = [one.name for one in parameters if isinstance(one, NameNode)]
+        # A parameter a call may leave out is written in brackets, [y].
+        names += [one.first for one in parameters if isinstance(one, Structured) and one.first is not None]
+        self.bound.append({name.upper(): True for name in names})
+        try:
+            self.visit(body, HANDED)
+        finally:
+            self.bound.pop()
+
+    def _let(self, node: Call) -> bool:
+        scope: dict[str, bool] = {}
+        self.bound.append(scope)
+        try:
+            *pairs, result = node.args or [None]
+            for index in range(0, len(pairs) - 1, 2):
+                name = pairs[index]
+                many = self.visit(pairs[index + 1], HANDED)
+                if isinstance(name, NameNode):
+                    scope[name.name.upper()] = many
+            return self.visit(result, HANDED)
+        finally:
+            self.bound.pop()
+
+    def _call(self, node: Call, where: str) -> bool:
+        self.calls += 1
+        try:
+            return self._called(node, where)
+        finally:
+            self.calls -= 1
+
+    def _called(self, node: Call, where: str) -> bool:
+        key = function_key(node.name)
+        if key == "LET":
+            return self._let(node)
+        if key == "LAMBDA":
+            # A LAMBDA given to MAP and the like is one function, not several values.
+            self._lambda(node)
+            return False
+        if not is_excel_function(key) or self._defined(node.name):
+            # A function Excel has not got, or one a name defines: what it gives is not known.
+            for argument in node.args:
+                self.visit(argument, WHOLE)
+            return True
+        chosen = _CHOICES.get(key)
+        entry = FUNCTIONS.get(key)
+        many: list[bool] = []
+        handed = False
+        for index, argument in enumerate(node.args):
+            if key == 'GETPIVOTDATA' and index == 0:
+                if isinstance(argument, NameNode):
+                    self.array_evaluation |= _value_array(argument, self.named)
+                source = FUNCTIONS.get(function_key(argument.name)) if isinstance(argument, Call) else None
+                if source is not None and source.reference_result:
+                    self.array_evaluation |= _value_array(argument, self.named)
+                    self.reference_handoff += 1
+                    try:
+                        many.append(self.visit(argument, WHOLE))
+                    finally:
+                        self.reference_handoff -= 1
+                    continue
+                if isinstance(argument, Call):
+                    self.reference_handoff += 1
+                    try:
+                        many.append(self.visit(argument, WHOLE if where == WHOLE else VALUE))
+                    finally:
+                        self.reference_handoff -= 1
+                    continue
+            if chosen is not None and chosen(index):
+                handed = self.visit(argument, HANDED) or handed
+                many.append(False)
+                continue
+            role = {"V": VALUE, "R": RANGE, "A": WHOLE}[_role(key, index)]
+            if key == 'GETPIVOTDATA' and index == 0 and isinstance(argument, (ArrayLiteral, Call)):
+                # References in the data-field position are rejected unchanged;
+                # literal value arrays are cut as scalars by legacy formulas.
+                role = VALUE
+            if key == 'GETPIVOTDATA' and index == 0 and where == WHOLE:
+                role = WHOLE
+            if self.reference_handoff:
+                role = WHOLE
+            if where == WHOLE and role == VALUE and not _as_cell(entry, index):
+                # Worked out whole, a function runs over an array given where it takes one value, as ABS does
+                # inside SUMPRODUCT; only the places a legacy formula cuts even there take an @.
+                role = WHOLE
+            many.append(self.visit(argument, role))
+        return handed or key in _ARRAYS or self._many_by_arguments(key, node.args, many)
+
+    def _defined(self, name: str) -> bool:
+        return self.named(name) is not None and not is_excel_function(function_key(name))
+
+    def _many_by_arguments(self, key: str, args: list[Node], many: list[bool]) -> bool:
+        """Whether a function that gives several values only when given them does so here; ``many`` says which
+        arguments can give several."""
+        if key == "INDEX":
+            if not args or not isinstance(args[0], (Reference, NameNode, Structured)):
+                return True
+            return any(not _whole_number(argument) for argument in args[1:3])
+        if key == "OFFSET":
+            return bool(many and many[0]) or any(not _is_one(argument) for argument in args[3:5])
+        if key in ("ROW", "COLUMN", "ISFORMULA", "FORMULATEXT"):
+            return bool(many and many[0])
+        if key == "XLOOKUP":
+            return _xlookup_many(args)
+        return False
+
+
+def _role(key: str, index: int) -> str:
+    roles = _ROLES.get(key)
+    if not roles:
+        return "V"
+    if index < len(roles):
+        return roles[index]
+    entry = FUNCTIONS.get(key)
+    repeat = max(1, entry.repeat if entry is not None else 1)
+    tail = roles[-repeat:]
+    return tail[(index - len(roles)) % len(tail)]
+
+
+def _value_array(node: Node | None, named: Callable[[str], str | None] | None = None,
+                 seen: frozenset[str] = frozenset()) -> bool:
+    """Whether a reference-capable expression can hand on an array of values.
+
+    GETPIVOTDATA needs array evaluation for these even where Formula and
+    Formula2 have identical text. Raw reference results remain #REF!.
+    """
+    if isinstance(node, ArrayLiteral):
+        return True
+    if isinstance(node, NameNode) and named is not None:
+        key = node.name if not node.sheet else f'{node.sheet}!{node.name}'
+        if key.casefold() in seen:
+            return False
+        formula = named(key)
+        if formula is None:
+            return False
+        try:
+            return _value_array(parse(formula), named, seen | {key.casefold()})
+        except FormulaError:
+            return False
+    if isinstance(node, Call):
+        key = function_key(node.name)
+        if key == 'INDEX':
+            return bool(node.args and _value_array(node.args[0], named, seen) and
+                        any(not _whole_number(argument) for argument in node.args[1:3]))
+        if key == 'IF':
+            return any(_value_array(argument, named, seen) for argument in node.args)
+        if key == 'CHOOSE':
+            return any(_value_array(argument, named, seen) for argument in node.args)
+        return key in _ARRAYS and key not in ('INDIRECT', 'OFFSET')
+    if isinstance(node, Binary) and node.op not in (':', ' ', ','):
+        return _value_array(node.left, named, seen) or _value_array(node.right, named, seen) or any(
+            isinstance(side, Reference) and ':' in side.text for side in (node.left, node.right))
+    return False
+
+
+def array_evaluation(formula: str, named: Callable[[str], str | None]) -> bool:
+    """Array evaluation needed independently of implicit-intersection spelling."""
+    if 'GETPIVOTDATA' not in formula.upper():
+        return False
+    def inspect() -> bool:
+        tree, starts = parse_placed(formula)
+        walk = _Walk(starts, named)
+        walk.visit(tree, VALUE)
+        return walk.array_evaluation
+    return deep(inspect)
+
+
+def _as_cell(entry: object, index: int) -> bool:
+    """Whether a legacy formula cuts an argument to one value even inside one worked out whole: the engine's
+    legacy_first and legacy_cell places, and the functions that work their arguments out as a cell does."""
+    from pyopenvba.formula._calc.registry import Function
+
+    if not isinstance(entry, Function):
+        return False
+    return entry.legacy_as_cell or index in entry.legacy_first or index in entry.legacy_cell
+
+
+def _whole_number(node: Node | None) -> bool:
+    """A row or column INDEX takes as one cell: a number other than 0 written out."""
+    return isinstance(node, Literal) and isinstance(node.value, float) and node.value != 0.0
+
+
+def _is_one(node: Node | None) -> bool:
+    return isinstance(node, Literal) and node.value == 1.0
+
+
+def _shape(node: Node | None) -> tuple[int, int] | None:
+    """The rows and columns of a range written as one, or None."""
+    from pyopenvba._a1 import parse_area
+
+    if not isinstance(node, Reference):
+        return None
+    try:
+        area = parse_area(node.text, sheet="")
+    except ValueError:
+        return None
+    return area.rows, area.columns
+
+
+def _xlookup_many(args: list[Node]) -> bool:
+    """XLOOKUP gives several values when what it returns is not a range, is wider than one cell across the way it
+    looks, or when what it gives when nothing is found can be several."""
+    if len(args) < 3:
+        return False
+    back = _shape(args[2])
+    if back is None:
+        return True
+    looked = _shape(args[1])
+    across = back[1] if looked is None or looked[1] == 1 else back[0]
+    return across > 1
+
+
+def formula2(formula: str, named: Callable[[str], str | None], *, whole: bool = False) -> str:
+    """``formula``, as Range.Formula spells it, as Formula2 reads it back: with an @ where it cuts cells to one
+    value. ``named`` gives a defined name's formula, or None; ``whole`` for an array formula, worked out whole,
+    which cuts nothing at its top."""
+    return deep(lambda: _formula2(formula, named, whole=whole))
+
+
+def _formula2(formula: str, named: Callable[[str], str | None], *, whole: bool, tables: bool = False) -> str:
+    tree, starts = parse_placed(formula)
+    walk = _Walk(starts, named, tables=tables)
+    walk.visit(tree, WHOLE if whole else VALUE)
+    body = formula[1:] if formula.startswith("=") else formula
+    for start in sorted(walk.marks, reverse=True):
+        # An @ stands in front of the spaces before what it cuts: = A1:A3 reads back =@ A1:A3
+        # (tests/fixtures/at_sign.json).
+        while start and body[start - 1].isspace():
+            start -= 1
+        body = body[:start] + "@" + body[start:]
+    return "=" + body
+
+
+def written(formula: str, named: Callable[[str], str | None]) -> str:
+    """``formula``, as Range.Formula is given it, as Range.Formula writes it and reads it back: a call of SINGLE
+    written as an @; an @ standing where the formula cuts anyway left out, =@A1:A3 written =A1:A3; and where an @
+    is kept, =@A1+A1:A3, every @ Formula2 shows written out, =@A1+@A1:A3. ``named`` as for :func:`formula2`."""
+    formula = at_kept(formula)
+    if not intersected(formula):
+        return formula
+    return deep(lambda: _written(formula, named))
+
+
+def _written(formula: str, named: Callable[[str], str | None]) -> str:
+    tree, starts = parse_placed(formula)
+    body = formula[1:] if formula.startswith("=") else formula
+    walk = _Walk(starts, named, body=body, merging=True)
+    walk.visit(tree, VALUE)
+    tokens = tokenize(body, spaces=True)
+    kept = "=" + "".join(token.text for token in tokens
+                         if not (token.kind == "op" and token.text == "@" and token.at in walk.merged))
+    return _formula2(kept, named, whole=False, tables=True) if intersected(kept) else kept
+
+
+__all__ = ["UnreadFormula2Error", "formula2", "written"]

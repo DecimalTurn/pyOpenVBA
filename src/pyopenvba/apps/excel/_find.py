@@ -1,0 +1,303 @@
+"""Range.Find, FindNext, FindPrevious and Replace, and the search settings they share.
+
+Find looks in one area. Among formulas it reads a formula's text and a
+constant's text as the formula bar shows it; among values, what the cell
+shows. Replace always edits that formula-bar text (scripts/measure_replace.py):
+
+- ``?`` is any one character, ``*`` any run of them -- as short as will
+  match, except at the end of what is sought, where it runs to the end --
+  and ``~`` takes the next character as it is. A ``~`` with nothing after
+  it is dropped, and a search for nothing replaces nothing.
+- Every match in a cell is replaced, left to right, and what is left is
+  typed again as Replace types it (see ``_typing.replaced``). A formula
+  Excel cannot read stops the Replace at that cell, the cells before it
+  changed and none after.
+- By rows the cells are taken area by area, row by row, from the first;
+  by columns, column by column, starting after the first cell of the
+  first area and coming back to it last. A cell two areas share is
+  replaced twice.
+- Replace always answers True. It leaves its LookAt, SearchOrder,
+  MatchCase and what it sought for the next Find and FindNext, and takes
+  LookAt and SearchOrder from the last one; MatchCase is False unless it
+  is given.
+"""
+from __future__ import annotations
+
+import re
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
+
+from pyopenvba._a1 import Area
+from pyopenvba.apps.excel._method_arguments import look_at_number, search_number, search_switch
+from pyopenvba.apps.excel._visible import visible
+from pyopenvba.exceptions import VBAUnsupportedError
+from pyopenvba.interpreter._values import EMPTY, MISSING, NOTHING, NULL, error, to_bool, to_integer, to_text
+
+if TYPE_CHECKING:
+    from pyopenvba.apps.excel._model import Range, Worksheet
+
+
+@dataclass
+class FindState:
+    look_in: int = -4123
+    look_at: int = 2
+    order: int = 1
+    what: object = MISSING
+    match_case: bool = False
+    #: The properties Application.FindFormat and ReplaceFormat set, by path, as Font.Bold (see _cell_format).
+    find_format: dict[str, object] = field(default_factory=dict[str, object])
+    replace_format: dict[str, object] = field(default_factory=dict[str, object])
+
+
+def _parts(text: str) -> list[str]:
+    """What is sought, as pieces of a regular expression; a star at the end runs to the end of the text."""
+    parts: list[str] = []
+    index = 0
+    while index < len(text):
+        char = text[index]
+        if char == "~":
+            if index + 1 == len(text):
+                break
+            index += 1
+            parts.append(re.escape(text[index]))
+        else:
+            parts.append(".*?" if char == "*" else "." if char == "?" else re.escape(char))
+        index += 1
+    if parts and parts[-1] == ".*?":
+        parts[-1] = ".*"
+    return parts
+
+
+def _pattern(text: str, whole: bool, match_case: bool) -> re.Pattern[str]:
+    body = "".join(_parts(text))
+    if whole:
+        body = r"\A(?:" + body + r")\Z"
+    return re.compile(body, re.DOTALL | (0 if match_case else re.IGNORECASE))
+
+
+def _sought(value: object) -> str:
+    """What to look for or put in: Null is nothing, and a range of several cells its first cell's value
+    (tests/fixtures/range_methods_search.json)."""
+    from pyopenvba.apps.excel._model import Range
+
+    if value is NULL:
+        return ""
+    if isinstance(value, Range) and not value.single:
+        first = value.first
+        value = Range(value.sheet, [Area(first.top, first.left, first.top, first.left, value.sheet.name)]).vba_value()
+    return ("TRUE" if value else "FALSE") if isinstance(value, bool) else to_text(value)
+
+
+def find(target: Range, what: object, after: object = MISSING, look_in: object = MISSING,
+         look_at: object = MISSING, order: object = MISSING, direction: object = MISSING,
+         match_case: object = MISSING, match_byte: object = MISSING,
+         search_format: object = MISSING, *, again: bool = False) -> object:
+    from pyopenvba.apps.excel._model import Range
+    from pyopenvba.apps.excel._typing import edit_text
+
+    # MatchByte tells full-width letters from others, which text of ASCII alone has none of
+    # (tests/fixtures/range_areas.json).
+    if match_byte is not MISSING and to_bool(match_byte) and not (what is not MISSING and _sought(what).isascii()):
+        raise VBAUnsupportedError("Range.Find MatchByte=True is not implemented")
+    state = target.sheet.book.application.find_state
+    # FindNext and FindPrevious leave the format out (tests/fixtures/find_format.json).
+    wanted = state.find_format if not again and search_format is not MISSING and to_bool(search_format) else {}
+    source = state.look_in if look_in is MISSING else search_number(look_in)
+    whole = state.look_at if look_at is MISSING else look_at_number(look_at)
+    traversal = state.order if order is MISSING else search_number(order)
+    if source in {-4144, -4184} and not target.sheet.notes:
+        # Nothing to look in finds nothing (tests/fixtures/range_methods_search.json).
+        return NOTHING
+    if source == -4184:
+        raise VBAUnsupportedError("Range.Find in threaded comments is not implemented")
+    if source not in {-4123, -4163, -4144} or whole not in {1, 2} or traversal not in {1, 2}:
+        raise error(9)
+    areas = target.areas
+    anchor = (areas[0].top, areas[0].left)
+    if again and after is NULL:
+        after = MISSING
+    if after is not MISSING:
+        # FindNext and FindPrevious refuse with 1004 where Find does with 13 (tests/fixtures/range_methods_search.json).
+        refused = error(1004) if again else error(13)
+        if not isinstance(after, Range) or not after.single or after.sheet is not target.sheet:
+            raise refused
+        anchor = (after.first.top, after.first.left)
+        if not any(area.contains(*anchor) for area in areas):
+            raise refused
+    if again:
+        what, case = state.what, state.match_case
+        if what is MISSING:
+            return NOTHING
+    else:
+        case = False if match_case is MISSING else search_switch(match_case)
+    text = _sought(what)
+    if len(text) > 255:
+        raise error(13)
+    pattern = _pattern(text, whole == 1, case)
+    state.look_in, state.look_at, state.order = source, whole, traversal
+    state.what, state.match_case = what, case
+    if text == "~":
+        # Excel's empty escaped pattern returns After itself, without moving.
+        row, column = anchor
+        return Range(target.sheet, [Area(row, column, row, column, target.sheet.name)])
+    backwards = direction is not MISSING and int(to_integer(direction, "Long")) == 2
+    step = -1 if backwards else 1
+    # The areas in the order they were given, whichever way the search goes (tests/fixtures/range_areas.json).
+    sizes = [area.rows * area.columns for area in areas]
+    total = sum(sizes)
+
+    def ordinal(position: tuple[int, int]) -> int:
+        row, column = position
+        before = 0
+        for area, size in zip(areas, sizes):
+            if area.contains(row, column):
+                if traversal == 1:
+                    return before + (row - area.top) * area.columns + column - area.left
+                return before + (column - area.left) * area.rows + row - area.top
+            before += size
+        raise AssertionError(position)
+
+    def position(index: int) -> tuple[int, int]:
+        for area, size in zip(areas, sizes):
+            if index < size:
+                if traversal == 1:
+                    row, column = divmod(index, area.columns)
+                else:
+                    column, row = divmod(index, area.rows)
+                return area.top + row, area.left + column
+            index -= size
+        raise AssertionError(index)
+
+    start = ordinal(anchor)
+    from pyopenvba.apps.excel._cell_format import MOST_CELLS, holds
+
+    # Nonempty searches examine only stored cells, even on whole-sheet ranges.
+    # Blank searches walk lazily from After and stop at the first empty cell; with a format, at the first cell in it.
+    if text == "":
+        if wanted and total > MOST_CELLS:
+            raise VBAUnsupportedError("searching more than a million cells for a format is not implemented")
+        positions = (position((start + step * distance) % total) for distance in range(1, total + 1))
+    else:
+        held = target.sheet.notes if source == -4144 else target.sheet.cells_
+        candidates = [pos for pos in held if any(area.contains(*pos) for area in areas)]
+        candidates.sort(key=lambda pos: (step * (ordinal(pos) - start) - 1) % total)
+        positions = iter(candidates)
+    for row, column in positions:
+        cell = target.sheet.cell(row, column)
+        found = Range(target.sheet, [Area(row, column, row, column, target.sheet.name)])
+        if wanted and not holds(target.sheet, row, column, wanted):
+            continue
+        if wanted and text == "":
+            return found
+        if source == -4144:
+            note = target.sheet.notes.get((row, column))
+            value = note.text if note is not None else ""
+        elif cell is not None and source == -4123:
+            # Among formulas a constant reads as the formula bar shows it: 1234 in #,##0 is 1234, not 1,234.
+            value = cell.formula or edit_text(cell.value, cell.number_format, epoch_1904=target.sheet.book.epoch_1904)
+        else:
+            value = to_text(found.Text())
+            if cell is not None and isinstance(cell.value, bool):
+                value = "TRUE" if cell.value else "FALSE"
+        matches = value == "" if text == "" else bool(value and pattern.search(value))
+        if matches:
+            return found
+    return NOTHING
+
+
+def replace(target: Range, what: object, replacement: object, look_at: object = MISSING,
+            order: object = MISSING, match_case: object = MISSING, match_byte: object = MISSING,
+            search_format: object = MISSING, replace_format: object = MISSING,
+            formula_version: object = MISSING, *, calculated: set[Worksheet] | None = None) -> object:
+    from pyopenvba.apps.excel._typing import edit_text
+
+    if what is MISSING or replacement is MISSING:
+        raise error(450)
+    if match_byte is not MISSING and to_bool(match_byte) and not _sought(what).isascii():
+        raise VBAUnsupportedError("Range.Replace MatchByte=True is not implemented")
+    if formula_version is not MISSING and int(to_integer(formula_version, "Long")) != 0:
+        raise VBAUnsupportedError("Range.Replace with Formula2 semantics is not implemented")
+    state = target.sheet.book.application.find_state
+    whole = state.look_at if look_at is MISSING else look_at_number(look_at)
+    traversal = state.order if order is MISSING else search_number(order)
+    if whole not in {1, 2} or traversal not in {1, 2}:
+        raise error(9)
+    case = False if match_case is MISSING else search_switch(match_case)
+    text, new = _sought(what), _sought(replacement)
+    if len(text) > 255 or len(new) > 255:
+        raise error(13)
+    state.look_in, state.look_at, state.order, state.what, state.match_case = -4123, whole, traversal, what, case
+    from pyopenvba.apps.excel._cell_format import holds, put_in
+
+    wanted = state.find_format if search_format is not MISSING and to_bool(search_format) else {}
+    given = state.replace_format if replace_format is not MISSING and to_bool(replace_format) else {}
+    if not _parts(text):
+        if wanted or given:
+            _replace_formats(visible(target), new, wanted, given, traversal)
+        return True
+    pattern = _pattern(text, whole == 1, case)
+    # On a filtered sheet only the visible cells change, as _visible has it.
+    target = visible(target)
+    sheet = target.sheet
+    from pyopenvba.apps.excel._arrays import array_at
+
+    cells: list[tuple[int, int]] = []
+    for area in target.areas:
+        inside = [position for position in sheet.cells_ if area.contains(*position)
+                  and ((array := array_at(sheet, *position)) is None or array[0] == position)]
+        inside.sort(key=(lambda position: position) if traversal == 1 else (lambda position: position[::-1]))
+        cells += inside
+    first = (target.first.top, target.first.left)
+    if traversal == 2 and cells and cells[0] == first:
+        # By columns Excel starts after the first cell and comes back to it last.
+        cells.append(cells.pop(0))
+    for row, column in cells:
+        cell = sheet.cells_.get((row, column))
+        if cell is None:
+            continue
+        before = cell.formula or edit_text(cell.value, cell.number_format, epoch_1904=sheet.book.epoch_1904)
+        after = _substituted(pattern, before, new) if before else None
+        if after is not None and (not wanted or holds(sheet, row, column, wanted)):
+            if not target.replaced_in(row, column, after):
+                break
+            if given:
+                put_in(sheet, row, column, given)
+            current = sheet.cells_.get((row, column))
+            if current is not None and current.formula and calculated is not None:
+                calculated.add(sheet)
+    return True
+
+
+def _replace_formats(target: Range, new: str, wanted: dict[str, object], given: dict[str, object],
+                     traversal: int) -> None:
+    """Replace with nothing sought: with a format to find, each cell in it takes the replacement as its text, where
+    that is not empty, and the format to put in; with none, each blank cell takes the format to put in
+    (tests/fixtures/find_format.json)."""
+    from pyopenvba.apps.excel._cell_format import every_cell, holds, put_in
+
+    sheet = target.sheet
+    for row, column in every_cell(target, traversal):
+        cell = sheet.cells_.get((row, column))
+        blank = cell is None or (not cell.formula and (cell.value is EMPTY or cell.value == ""))
+        if not (holds(sheet, row, column, wanted) if wanted else blank):
+            continue
+        if new:
+            if blank:
+                raise VBAUnsupportedError("Range.Replace of nothing sought into a blank cell is not implemented")
+            if not target.replaced_in(row, column, new):
+                return
+        if given:
+            put_in(sheet, row, column, given)
+
+
+def _substituted(pattern: re.Pattern[str], text: str, replacement: str) -> str | None:
+    """``text`` with every match of ``pattern`` replaced, left to right, or None where nothing matches."""
+    pieces: list[str] = []
+    at = 0
+    while at < len(text):
+        found = pattern.search(text, at)
+        if found is None or found.end() == found.start():
+            break
+        pieces += [text[at:found.start()], replacement]
+        at = found.end()
+    return "".join(pieces) + text[at:] if pieces else None

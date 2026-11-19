@@ -9,14 +9,21 @@ under test (`pyopenvba.access_read`) is pure Python with no third-party deps.
 
 from __future__ import annotations
 
+import shutil
 from pathlib import Path
 
 import pytest
 
+from pyopenvba.access import AccessDatabase
+from pyopenvba.access._lval import LVAL_INLINE_MAX, LVAL_SINGLE_MAX
 from pyopenvba.access_read import (
     ACE_PAGE_SIZE,
+    MSYS_TYPE_FORM,
+    MSYS_TYPE_MACRO,
+    MSYS_TYPE_REPORT,
     PAGE_TYPE_DB_DEF,
     PAGE_TYPE_LVAL,
+    AccessError,
     AccessReader,
     SourceRow,
 )
@@ -29,6 +36,115 @@ requires_live = pytest.mark.skipif(
     not ACCDB.exists(),
     reason="live .accdb fixture not present",
 )
+
+# Two standard modules that Access happened to store on the same LVAL
+# page: ModA computes 2 * 3, ModB computes 5 + 1.
+TWO_MODULES = FIXTURES / "two_modules_one_page.accdb"
+
+requires_two_modules = pytest.mark.skipif(
+    not TWO_MODULES.exists(),
+    reason="two-module .accdb fixture not present",
+)
+
+
+# One module too large for a 4 KiB page, so Access chained its stream
+# across several LVAL rows. BigCalc sums 2*i-1 for i in 1..120 = 14400.
+SPANNING = FIXTURES / "module_spanning_pages.accdb"
+
+requires_spanning = pytest.mark.skipif(
+    not SPANNING.exists(),
+    reason="page-spanning .accdb fixture not present",
+)
+
+TEMPLATE = (
+    Path(__file__).parents[1]
+    / "src"
+    / "pyopenvba"
+    / "_templates"
+    / "blank_files"
+    / "blank_database.accdb"
+)
+
+
+def test_create_new_writes_a_usable_blank_database(tmp_path: Path) -> None:
+    """create_new() produces a database with a fillable VBA project."""
+    target = tmp_path / "fresh.accdb"
+    db = AccessReader.create_new(target)
+
+    assert target.stat().st_size % ACE_PAGE_SIZE == 0
+    assert [m.name for m in db.iter_vba_modules()] == ["Module1"]
+    # A procedure must already exist: neither a VBA project nor a
+    # procedure can be synthesised from nothing.
+    source = db.read_vba_module("Module1")
+    assert "Function Main()" in source
+    assert [s.name for s in db.find_module_streams()] == ["Module1"]
+    assert db.disassemble_module("Module1").num_lines > 0
+
+
+def test_create_new_overwrites_an_existing_file(tmp_path: Path) -> None:
+    target = tmp_path / "fresh.accdb"
+    target.write_bytes(b"not a database")
+    AccessReader.create_new(target)
+    assert AccessReader(target).format == "ace"
+
+
+@requires_spanning
+def test_module_spanning_pages_yields_one_module() -> None:
+    """A chained module is one module, not one per row it touches."""
+    with AccessReader(SPANNING) as db:
+        assert [m.name for m in db.iter_vba_modules()] == ["M"]
+        assert [s.name for s in db.find_module_streams()] == ["M"]
+
+
+@requires_spanning
+def test_module_spanning_pages_decodes_all_pcode() -> None:
+    """The stream is the assembled chain, not just its head row."""
+    with AccessReader(SPANNING) as db:
+        stream = db.find_module_streams()[0]
+        # The head row alone is one page; the real stream is far bigger.
+        assert len(stream.raw) > ACE_PAGE_SIZE
+        module = db.disassemble_module("M")
+        with_pcode = [ln for ln in module.lines if ln.instructions]
+        assert len(with_pcode) > 100
+        literals = [
+            value
+            for line in module.lines
+            for instruction in line.instructions
+            if instruction.mnemonic == "LitDI2"
+            for _, value in instruction.operands
+        ]
+        # The final statement is `tally = tally + 120 * 2 - 1`.
+        assert literals[-4:] == [1, 120, 2, 1]
+
+
+@requires_two_modules
+def test_module_streams_are_found_per_module_not_per_page() -> None:
+    """Modules sharing an LVAL page each get their own carrier row."""
+    with AccessReader(TWO_MODULES) as db:
+        names = sorted(m.name for m in db.iter_vba_modules())
+        assert names == ["ModA", "ModB"]
+        streams = db.find_module_streams()
+        assert sorted(s.name for s in streams) == ["ModA", "ModB"]
+        # Same page, distinct rows -- the case that page-keyed lookup lost.
+        assert len({s.page for s in streams}) == 1
+        assert len({s.slot for s in streams}) == 2
+
+
+@requires_two_modules
+def test_disassemble_module_picks_the_named_module() -> None:
+    """Each module disassembles to its own p-code, not a page neighbour's."""
+    with AccessReader(TWO_MODULES) as db:
+        def literals(name: str) -> list[int]:
+            return [
+                value
+                for line in db.disassemble_module(name).lines
+                for instruction in line.instructions
+                if instruction.mnemonic == "LitDI2"
+                for _, value in instruction.operands
+            ]
+
+        assert literals("ModA") == [2, 3]
+        assert literals("ModB") == [5, 1]
 
 
 @requires_live
@@ -193,3 +309,364 @@ def test_read_vba_module_unknown_name_raises() -> None:
     with AccessReader(ACCDB) as db, pytest.raises(AccessError):
         db.read_vba_module("DoesNotExist_zzzzz")
 
+
+# ---------------------------------------------------------------------------
+# Modules are found as Access finds them (GitHub issue #33)
+#
+# The reader once scanned the long-value pages for anything that
+# decompressed to `Attribute VB_Name`, decoded it as latin-1 and kept the
+# first copy it met.  Those pages keep copies Access has let go of, a
+# stream of 64 bytes or fewer is on none of them, and a dir stream longer
+# than one page is a chain the scan never followed.  The reader now goes
+# through MSysAccessStorage, as the engine does.
+# ---------------------------------------------------------------------------
+
+SAMPLE = "em dash — euro €"
+
+
+@pytest.fixture
+def written(tmp_path: Path) -> Path:
+    """The template after the engine rewrote its Module1 and added a
+    one-line module and a fifty-line one, all carrying cp1252
+    punctuation."""
+    target = tmp_path / "written.accdb"
+    shutil.copyfile(Path(__file__).parent / "fixtures" / "access_compiled_blank.accdb", target)
+    db = AccessDatabase(target)
+    db.set_module_source("Module1", f"' edited: {SAMPLE}\r\n")
+    db.add_module("Short", f"' {SAMPLE}\r\n")
+    db.add_module("Long", "".join(f"' {SAMPLE} {i}\r\n" for i in range(50)))
+    db.save()
+    return target
+
+
+def test_the_reader_reads_what_the_engine_reads(written: Path) -> None:
+    reader = AccessReader(written)
+    assert reader.vba_module_names() == ["Module1", "Short", "Long"]
+    assert reader.vba_modules() == {m.name: m.source for m in AccessDatabase(written).modules()}
+    assert reader.read_vba_module("Long").startswith(f"' {SAMPLE} 0\r\n")
+
+
+def test_an_edited_module_reads_as_its_new_text(written: Path) -> None:
+    """Module1's old source is still in the file: a replaced chain's pages
+    are released with their bytes in place, by Access and by the engine,
+    and the last of them, where the source sits, is not taken again."""
+    original = AccessDatabase(Path(__file__).parent / "fixtures" / "access_compiled_blank.accdb")
+    old = next(s for s in original.module_streams() if s.name == "Module1")
+    assert old.data[old.offset :] in written.read_bytes()
+    assert AccessReader(written).read_vba_module("Module1") == f"' edited: {SAMPLE}\r\n"
+
+
+def test_a_module_kept_inside_its_row_is_found(written: Path) -> None:
+    """A stream of 64 bytes or fewer sits in its storage row, on no
+    long-value page."""
+    short = next(s for s in AccessDatabase(written).module_streams() if s.name == "Short")
+    assert len(short.data) <= LVAL_INLINE_MAX
+    assert AccessReader(written).read_vba_module("Short") == f"' {SAMPLE}\r\n"
+
+
+def test_pull_writes_utf8_and_export_the_project_s_code_page(written: Path, tmp_path: Path) -> None:
+    reader = AccessReader(written)
+    pulled = reader.pull_modules(tmp_path / "pulled")
+    exported = reader.export_modules(tmp_path / "exported")
+    assert [p.name for p in pulled] == ["Module1.bas", "Short.bas", "Long.bas"]
+    assert [p.name for p in exported] == ["Module1.bas", "Short.bas", "Long.bas"]
+    assert (tmp_path / "pulled" / "Short.bas").read_bytes() == f"' {SAMPLE}\r\n".encode()
+    assert (tmp_path / "exported" / "Short.bas").read_bytes() == f"' {SAMPLE}\r\n".encode("cp1252")
+
+
+def test_a_project_longer_than_one_long_value_row_reads(tmp_path: Path) -> None:
+    """Forty modules take the dir stream past one long-value row; stored
+    as a chain, it opens with a pointer, not the stream."""
+    target = tmp_path / "large.accdb"
+    shutil.copyfile(TEMPLATE, target)
+    db = AccessDatabase(target)
+    names = [f"M{i}" for i in range(40)]
+    for name in names:
+        db.add_module(name, "Option Compare Database")
+    db.save()
+
+    stored = next(
+        row["Lv"]
+        for row in AccessDatabase(target).table("MSysAccessStorage").rows()
+        if str(row["Name"]) == "dir"
+    )
+    assert isinstance(stored, bytes) and len(stored) > LVAL_SINGLE_MAX
+    reader = AccessReader(target)
+    assert [m.name for m in reader.read_project_info().modules] == ["Module1", *names]
+    assert reader.vba_module_names() == ["Module1", *names]
+
+
+@pytest.mark.parametrize("layout", ["no storage table", "no dir stream"])
+def test_a_database_with_no_project_reads_as_empty(tmp_path: Path, layout: str) -> None:
+    """A database Access made and never gave code keeps its storage but no
+    dir stream (measured); one without Access's objects has no storage
+    table at all."""
+    target = tmp_path / "plain.accdb"
+    if layout == "no storage table":
+        shutil.copyfile(FIXTURES / "complex_columns.accdb", target)
+    else:
+        shutil.copyfile(TEMPLATE, target)
+        db = AccessDatabase(target)
+        storage = db.table("MSysAccessStorage")
+        storage.delete_row(next(rid for rid, row in storage.rows_with_ids() if str(row["Name"]) == "dir"))
+        db.save()
+
+    assert not AccessDatabase(target).has_vba_project()
+    reader = AccessReader(target)
+    assert list(reader.iter_vba_modules()) == []
+    assert reader.vba_module_names() == []
+    assert reader.find_module_streams() == ()
+    assert reader.pull_modules(tmp_path / "pulled") == []
+    with pytest.raises(AccessError, match="holds no VBA project"):
+        reader.read_project_info()
+
+
+# ---------------------------------------------------------------------------
+# The catalog and the compiled streams go through the engine too
+#
+# The reader's own MSysObjects decoder skipped a row moved to an overflow
+# page, cut some names short and dropped others.  Its page scans read a
+# deleted long-value row as live, so it came back as a copy of the row
+# beside it; they missed a stream longer than one page; and they found
+# values Access had let go of.
+# ---------------------------------------------------------------------------
+
+AUTHORED = [
+    "designs_every.accdb",
+    "folders_past_nine.accdb",
+    "form_with_code.accdb",
+    "form_with_controls.accdb",
+    "macros.accdb",
+    "New Microsoft Access Database.accdb",
+]
+
+
+@pytest.mark.parametrize("name", AUTHORED)
+def test_msys_objects_lists_every_catalog_row_whole(name: str) -> None:
+    path = FIXTURES / name
+    expected = {(e.id & 0xFFFFFFFF, e.name, e.type) for e in AccessDatabase(path).catalog()}
+    assert {(o.id_, o.name, o.type_) for o in AccessReader(path).msys_objects()} == expected
+
+
+def test_msys_objects_names_what_access_made() -> None:
+    """Rows the old decoder dropped (`Every`, `M1Beep`, `Macro9`) or read
+    a character short (`EveryR`, `M2Twice`, `Macro10`)."""
+
+    def named(name: str, type_: int) -> set[str]:
+        return {o.name for o in AccessReader(FIXTURES / name).msys_objects() if o.type_ == type_}
+
+    assert named("designs_every.accdb", MSYS_TYPE_FORM) == {
+        "Every", "EveryAdd", "EveryDel", "EveryRen", "Hdr", "Nest",
+    }
+    assert named("designs_every.accdb", MSYS_TYPE_REPORT) == {"EveryR", "RHdr", "TwoGroups"}
+    assert named("macros.accdb", MSYS_TYPE_MACRO) == {"M1Beep", "M2Twice", "M3Msg", "M4Echo", "M5Mixed"}
+    assert named("folders_past_nine.accdb", MSYS_TYPE_MACRO) == {f"Macro{i}" for i in range(1, 12)}
+    assert "Table2" in {o.name for o in AccessReader(FIXTURES / "New Microsoft Access Database.accdb").msys_objects()}
+
+
+def test_a_report_s_type_is_the_one_access_writes() -> None:
+    """`MSYS_TYPE_REPORT` was the macro type, so it found macros."""
+    assert AccessReader(FIXTURES / "report.accdb").find_msys_object("Sheet", type_=MSYS_TYPE_REPORT)
+    assert not [
+        o for o in AccessReader(FIXTURES / "macros.accdb").msys_objects() if o.type_ == MSYS_TYPE_REPORT
+    ]
+
+
+def test_identifiers_read_a_vba_project_longer_than_one_row() -> None:
+    """The scan looked for a row opening with `CC 61`, and a chain's first
+    row opens with a pointer."""
+    path = FIXTURES / "form_with_code.accdb"
+    project = next(value for name, value, _home in AccessDatabase(path).project_streams() if name == "_VBA_PROJECT")
+    assert len(project) > LVAL_SINGLE_MAX
+    assert {"Module1", "Form_Coded"} <= {i.name for i in AccessReader(path).identifiers()}
+
+
+def test_pcode_streams_are_the_ones_the_project_holds() -> None:
+    """Thirteen compiled modules give 27 p-code streams, 13 of them
+    module-active; the scan returned 72 rows and 22 active ones."""
+    path = FIXTURES / "folders_past_nine.accdb"
+    held = sorted(
+        (home.page, home.slot)
+        for _name, value, home in AccessDatabase(path).project_streams()
+        if value.startswith(b"rU@\x00")
+    )
+    reader = AccessReader(path)
+    streams = reader.iter_pcode_streams()
+    assert sorted((s.page, s.slot) for s in streams) == held
+    assert len(held) == 27
+    assert sum(1 for s in streams if s.raw[10] == 0x40) == 13
+    with pytest.raises(AccessError, match="found 13"):
+        reader.read_module_pcode_stream()
+
+
+def test_interned_strings_are_the_project_s_own() -> None:
+    """The fixture's pages still hold the literals of a module deleted
+    while it was built; none of them is the project's."""
+    path = FIXTURES / "form_with_code.accdb"
+    assert "PyVbaUserCode.MakeFormWithCode".encode("utf-16-le") in path.read_bytes()
+    found = {s.value for s in AccessReader(path).find_interned_strings()}
+    assert "PyVbaUserCode.MakeFormWithCode" not in found
+
+
+def test_interned_strings_are_the_table_access_compiles() -> None:
+    """Compiling, Access writes a record for each literal into __SRP_0: a
+    doubled quote made one, a character past ASCII, three from one line,
+    one from a class module, a MsgBox prompt and a Variant.  The empty
+    literal's record holds no bytes and is not reported, and a comment's
+    quoted text is no literal (tests/live_access_test/_string_literals.ps1)."""
+    path = FIXTURES / "string_literals.accdb"
+    found = AccessReader(path).find_interned_strings()
+    assert [s.value for s in found] == [
+        "Hello", 'say "hi"', "caf\xe9", "a", "bc", "def", "hello", "from the class", "variant",
+    ]
+    table = next(home for name, _value, home in AccessDatabase(path).project_streams() if name == "__SRP_0")
+    assert {(s.page, s.slot) for s in found} == {(table.page, table.slot)}
+
+
+def test_a_project_saved_without_its_srp_streams_has_no_literal_table() -> None:
+    """Its literals are in its modules' own p-code alone, as LitStr."""
+    path = FIXTURES / "New Microsoft Access Database.accdb"
+    assert not [name for name, _value, _home in AccessDatabase(path).project_streams() if name.startswith("__SRP")]
+    reader = AccessReader(path)
+    assert reader.find_interned_strings() == ()
+    literals = [
+        instruction.payload
+        for module in reader.disassemble_all_modules().values()
+        for instruction in module.iter_instructions()
+        if instruction.mnemonic == "LitStr"
+    ]
+    assert literals == [
+        b"This is a test", b"This is a test", b"This is a test 1", b"This is a test 2", b"This is a test 3",
+    ]
+
+
+# ---------------------------------------------------------------------------
+# Non-ASCII source text and identifiers
+#
+# Access stores VBA source lines and identifier names MBCS-encoded in the
+# project's code page, not as ASCII. Decoding them as ASCII raised
+# UnicodeDecodeError on any accented or non-Latin text, and the byte
+# filters that guard both scanners rejected every byte above 0x7E, so such
+# rows and identifiers were silently dropped before they could be decoded.
+# These tests pin the code-page behaviour; they need no fixture database.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize(
+    ("code_page", "text"),
+    [
+        (1252, "Betr\u00e4ge pr\u00fcfen"),      # German, Latin-1
+        (1252, "caf\u00e9 na\u00efve"),          # French accents
+        (1251, "\u041f\u0440\u0438\u0432\u0435\u0442"),   # Cyrillic
+        (1253, "\u0393\u03b5\u03b9\u03b1"),      # Greek
+        (1252, "plain ascii comment"),           # unchanged behaviour
+    ],
+)
+def test_source_row_decodes_with_project_code_page(
+    code_page: int, text: str
+) -> None:
+    """A comment row round-trips through its code page, apostrophe restored."""
+    from pyopenvba.access_read import SourceRow
+
+    raw = text.encode(f"cp{code_page}")
+    row = SourceRow(
+        offset=0, row_type="comment", length=len(raw), text=raw,
+        code_page=code_page,
+    )
+    assert row.to_source_line() == "'" + text
+
+
+def test_source_row_code_page_defaults_to_1252() -> None:
+    """Constructing without a code page keeps the pre-existing signature."""
+    from pyopenvba.access_read import SourceRow
+
+    row = SourceRow(0, "comment", 5, b"hello")
+    assert row.code_page == 1252
+    assert row.to_source_line() == "'hello"
+
+
+def _identifier_record(name: str, code_page: int, type_byte: int = 0x04) -> bytes:
+    body = name.encode(f"cp{code_page}")
+    return bytes((len(body), type_byte)) + body + b"\x00\x00\x10\x00"
+
+
+@pytest.mark.parametrize(
+    ("code_page", "names"),
+    [
+        (1252, ["Modul", "Betr\u00e4ge", "Wert"]),
+        (1251, ["Modul", "\u041c\u043e\u0434\u0443\u043b\u044c"]),
+    ],
+)
+def test_identifier_table_keeps_non_ascii_names(
+    code_page: int, names: list[str]
+) -> None:
+    """Identifiers outside ASCII survive the scan and decode correctly."""
+    from pyopenvba import access_read as _access
+
+    parse = getattr(_access, "_parse_vba_project_identifiers")
+
+    stream = b"\x02\x00\x06\x04Access"
+    for name in names:
+        stream += _identifier_record(name, code_page)
+    stream += b"\x02\xff\xff\x01\x01"
+
+    parsed = parse(stream, code_page)
+    assert [i.name for i in parsed] == ["Access", *names]
+
+
+def _slotted_identifier_record(name: str, slot: int) -> bytes:
+    """An identifier record that carries its own operand slot.
+
+    Access emits this form for a few names that bind to a pre-existing
+    low-numbered slot instead of being appended positionally. Layout,
+    measured from Access-built databases::
+
+        00 00 <u16 slot> <u8 len> 80 10 00 ff 03 00 00 <name>
+
+    It has no trailing id/``10 00`` pair, which is what makes the
+    canonical record walker reject it.
+    """
+    body = name.encode("cp1252")
+    return (b"\x00\x00" + slot.to_bytes(2, "little") + bytes((len(body), 0x80))
+            + b"\x10\x00\xff\x03\x00\x00" + body)
+
+
+def test_identifier_table_parses_explicitly_slotted_record() -> None:
+    """A slotted record is surfaced, not swallowed into the next prefix."""
+    from pyopenvba import access_read as _access
+
+    parse = getattr(_access, "_parse_vba_project_identifiers")
+
+    stream = (b"\x02\x00\x06\x04Access"
+              + _slotted_identifier_record("b", 11)
+              + _identifier_record("VBA", 1252)
+              + b"\x02\xff\xff\x01\x01")
+
+    parsed = parse(stream, 1252)
+    assert [i.name for i in parsed] == ["Access", "b", "VBA"]
+    slotted = next(i for i in parsed if i.name == "b")
+    assert slotted.slot == 11
+    # It must not be absorbed as opaque bytes on the following record.
+    assert next(i for i in parsed if i.name == "VBA").prefix == b""
+
+
+def test_slotted_identifier_does_not_shift_positional_indices() -> None:
+    """Positional indices skip slotted records.
+
+    p-code addresses positional identifiers as ``524 + 2*index``, so
+    counting a slotted record would misname every identifier after it.
+    A slotted record carries its own operand (``2*slot + 2``) instead.
+    """
+    from pyopenvba import access_read as _access
+
+    parse = getattr(_access, "_parse_vba_project_identifiers")
+
+    stream = (b"\x02\x00\x06\x04Access"
+              + _slotted_identifier_record("b", 11)
+              + _identifier_record("VBA", 1252)
+              + _identifier_record("zz", 1252)
+              + b"\x02\xff\xff\x01\x01")
+
+    parsed = parse(stream, 1252)
+    positional = {i.name: i.index for i in parsed if i.slot is None}
+    assert positional == {"Access": 0, "VBA": 1, "zz": 2}
+    assert next(i for i in parsed if i.name == "b").index == -1

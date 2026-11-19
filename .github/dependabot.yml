@@ -1,0 +1,42 @@
+# Dependabot keeps the pinned tools current: the workflows' actions, each
+# pinned to a commit with its release named in a comment, and the pip pins
+# in .github/requirements. The YARA-X engine and the YARA Forge rules are
+# release downloads Dependabot cannot follow; update-yara-rules.yml
+# proposes those. GitHub refuses Dependabot's image updates, so
+# update-images.yml proposes new ClamAV and Semgrep images. The package
+# itself depends on nothing, and its development tools are minimum
+# versions that CI installs at their latest.
+#
+# A release waits a week before it is proposed, long enough for most
+# hijacked or broken releases to be found and pulled first. Security
+# updates do not wait.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    commit-message:
+      prefix: ci
+    groups:
+      actions:
+        patterns: ["*"]
+        update-types: [minor, patch]
+
+  # The build tools and pywin32 the workflows install, pinned in
+  # .github/requirements.
+  - package-ecosystem: pip
+    directory: /.github/requirements
+    schedule:
+      interval: daily
+    cooldown:
+      default-days: 7
+      exclude: [pyopenvba, pyofficeeditor, pyprettyvba, vba-reference, pyvbaanalysis, pyvbaharness, xlide-mcp]
+    commit-message:
+      prefix: ci
+    groups:
+      minor-and-patch:
+        patterns: ["*"]
+        update-types: [minor, patch]

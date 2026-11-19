@@ -196,15 +196,18 @@ class TestGate01_HostPackage:
                     continue
                 assert before.read(name) == after.read(name)
 
-    def test_xlsm_without_vba_project_raises_cleanly(
+    def test_xlsm_without_vba_project_opens_and_refuses_cleanly(
         self, live_empty_xlsm_path: Path
     ) -> None:
-        """An xlsm whose VBA project has never been initialised must raise
-        a structured ``VBAProjectError`` (not a bare ``KeyError`` from the
-        underlying ZIP layer)."""
-        from pyopenvba.exceptions import VBAProjectError
-        with pytest.raises(VBAProjectError, match=r"vbaProject\.bin"):
-            ExcelFile(live_empty_xlsm_path)
+        """An xlsm whose VBA project has never been initialised opens with
+        no project, and a read that needs one raises a structured
+        ``NoVBAProjectError`` (not a bare ``KeyError`` from the underlying
+        ZIP layer)."""
+        from pyopenvba.exceptions import NoVBAProjectError
+        with ExcelFile(live_empty_xlsm_path) as wb:
+            assert not wb.has_vba_project()
+            with pytest.raises(NoVBAProjectError):
+                wb.vba_project()
 
     def test_xlsb_round_trip_preserves_all_non_vba_entries(
         self, live_xlsb_path: Path, tmp_path: Path
@@ -379,7 +382,7 @@ class TestGate04_Compression:
 # ===========================================================================
 
 class TestGate05_PerformanceCache:
-    """Performance cache is preserved verbatim and never consulted for source."""
+    """Unedited module caches are preserved and never consulted for source."""
 
     def test_module_prefix_preserved_across_unedited_save(
         self, live_xlsm_path: Path, tmp_path: Path
@@ -406,6 +409,10 @@ class TestGate05_PerformanceCache:
             wb.save(out)
         with ExcelFile(out) as wb2:
             for m in wb2.vba_project().modules:
+                if m.name == "Module1":
+                    assert m.prefix_bytes == b""
+                    assert m.text_offset == 0
+                    continue
                 assert m.prefix_bytes == before[m.name], (
                     f"non-target module {m.name!r} had cache prefix mutated"
                 )
@@ -760,16 +767,15 @@ class TestGate12_ModuleStream:
                 f"module {m.name!r} source missing VB_Name attribute"
             )
 
-    def test_rebuild_module_stream_preserves_prefix(
+    def test_rebuild_module_stream_drops_prefix(
         self, live_vba_bin: bytes
     ) -> None:
         cfb = CFB.from_bytes(live_vba_bin)
         proj = parse_vba_project(cfb)
         m = proj.get_module("Module1")
         new_stream = rebuild_module_stream(m, proj.code_page)
-        assert new_stream.startswith(m.prefix_bytes), (
-            "rebuilt module stream must preserve the cache-prefix bytes verbatim"
-        )
+        assert m.prefix_bytes  # Exercise a genuinely compiled module.
+        assert decompress(new_stream).decode("cp1252") == m.source
 
     def test_write_back_then_reparse_yields_same_source(
         self, live_xlsm_path: Path, tmp_path: Path
@@ -1724,6 +1730,21 @@ class TestGate23_Fuzz:
                 parse_projectwm(data)
             except (VBAProjectError, UnicodeDecodeError):
                 pass
+        elif target == "mashup":
+            from pyopenvba.exceptions import PowerQueryError
+            from pyopenvba.powerquery._mashup import Mashup
+
+            try:
+                Mashup.parse(data)
+            except PowerQueryError:
+                pass
+        elif target == "mformula":
+            from pyopenvba.mlang._parse import MSyntaxError, parse
+
+            try:
+                parse(data.decode("utf-8", errors="replace"))
+            except MSyntaxError:
+                pass
         else:
             raise AssertionError(
                 f"unknown fuzz target {target!r} (add a dispatch branch)"
@@ -1735,7 +1756,7 @@ class TestGate23_Fuzz:
             f"fuzz corpus directory missing: {self._CORPUS_DIR}.  "
             f"Run: python scripts/seed_fuzz_corpus.py"
         )
-        expected = {"cfb", "decompress", "dir", "project", "projectwm"}
+        expected = {"cfb", "decompress", "dir", "project", "projectwm", "mashup", "mformula"}
         present = {
             p.name
             for p in self._CORPUS_DIR.iterdir()

@@ -4,38 +4,57 @@ This roadmap tracks pyOpenVBA's progress against the 26 hard gates defined in
 [`xlsm_feature_completeness_gates.md`](xlsm_feature_completeness_gates.md).
 Per-gate status keys:
 
-- **PASS** — implemented; gate tests in [`tests/test_gates.py`](../tests/test_gates.py) pass.
-- **PARTIAL** — minimum bar met; secondary assertions are `xfail`.
-- **TODO** — not implemented; gate tests are `xfail(strict=True)`.
-- **VERBATIM** — bytes are preserved through round-trip but not interpreted.
-- **OUT OF SCOPE** — explicitly excluded from current development; tests are `skip` with a reason.
+- **PASS**: implemented; gate tests in [`tests/test_gates.py`](../tests/test_gates.py) pass.
+- **PARTIAL**: minimum bar met; secondary assertions are `xfail`.
+- **TODO**: not implemented; gate tests are `xfail(strict=True)`.
+- **VERBATIM**: bytes are preserved through round-trip but not interpreted.
+- **OUT OF SCOPE**: explicitly excluded from current development; tests are `skip` with a reason.
 
 ## Current scope declaration
 
-pyOpenVBA today is best described as:
-
-> **"MS-OVBA round-tripper with module source reader/writer (.xlsm focus)."**
+pyOpenVBA reads and writes the VBA project of Excel, Word, PowerPoint and
+Access files, and the design of their forms, with the same API on each
+host. The gates below are the MS-OVBA gates the Excel work was built
+against; the Access host is tracked phase by phase in
+[`access_engine.md`](access_engine.md), whose table ends with what is
+done and what is not.
 
 ### Supported
 - `.xlsm`, `.xlsb`, `.xlam` (OOXML ZIP containers with `xl/vbaProject.bin`).
-- `.xls` (legacy BIFF8 — vbaProject.bin is the entire file).
+- `.docm`, `.dotm`, `.doc` and `.pptm`, `.potm`, `.ppt` through the same
+  host pipeline.
+- `.accdb` and `.mdb`: modules read and written, added, renamed and
+  deleted; forms and reports read and edited; the same `pull` / `push`
+  workflow (`pull_access`, `push_access`, `access-pull`, `access-push`).
+- `.xls` (legacy BIFF8; vbaProject.bin is the entire file).
 - Read all VBA module sources (standard, class, document, designer code-behind).
 - Replace source of any existing module.
 - **Disk-based push/pull** (`pyopenvba.pull` / `pyopenvba.push`, and
-  `python -m pyopenvba {pull,push,ls}`) — export modules to `.bas` / `.cls`
+  `python -m pyopenvba {pull,push,ls}`): export modules to `.bas` / `.cls`
   files for use with any text editor / version control, then push edits back
   into the workbook.
 - No-op round-trip preservation of every non-VBA ZIP entry.
 - No-op round-trip preservation of every module's performance-cache prefix.
+- **Creating and editing a UserForm's design surface**: the control
+  tree, its nesting, each control's named properties, adding and
+  removing controls, Frames, MultiPages and their pages, and composing
+  a whole form from nothing (`host.add_form()`, `host.forms()`,
+  `form.add_control()`, `form.add_page()`, `control.set_property()`,
+  `python -m pyopenvba forms`).  Writing is lossless: an unedited form
+  saves back byte for byte.
+- **Running the VBA**: a VBA interpreter and in-memory Excel, Word and
+  PowerPoint object models, so a macro can be executed against a loaded
+  file and the result written back out. Excel also supports creating a
+  workbook from nothing. Behavior is held to measurements from the
+  corresponding Office application; see
+  [`vba_runtime.md`](vba_runtime.md).
 - Pure Python 3.10+, zero runtime dependencies.
 
 ### Unsupported (today)
-- UserForm layout / Office Forms editing (form layout bytes survive
-  verbatim through the CFB round-trip but the library does not interpret
-  them).
 - ActiveX license editing (PROJECTlk). ActiveX controls are deprecated; license bytes are round-tripped verbatim.
 - Project password / protection editing (parsing-only; save refuses to mutate protected projects unless `allow_protected=True`).
-- Digital signature re-signing (out of scope; stale signature streams are dropped on mutating save with a `UserWarning`).
+- Digital signature re-signing (out of scope; a stale signature is dropped on mutating save with a `UserWarning`).
+- Detecting or dropping a VBA signature in a binary `.xls`, `.doc` or `.ppt` file, which keeps it in property sets or a string table; no signed binary file has been measured.
 - Office-compatible V3 / agile content-hash recomputation (a stable
   pyOpenVBA-internal digest is available via `compute_v3_content_hash`).
 - Non-ASCII module identifiers (Excel's VBA IDE does not permit them; the parser nevertheless round-trips Latin-1 supplement names through cp1252).
@@ -45,7 +64,7 @@ pyOpenVBA today is best described as:
 | Gate | Title | Status | Notes |
 |------|-------|--------|-------|
 | 0 | Scope Declaration | PASS | `ExcelFile` rejects unsupported hosts; CFB and VBA layers separated; `vba_project_bytes()` exposes raw `vbaProject.bin`. |
-| 1 | Host Package | PASS | No-op + single-module-edit save preserves every other ZIP entry on both xlsm and xlsb. `xlsm` workbooks that have never had a VBA project initialised raise a structured `VBAProjectError` at open. "Opens in Excel without repair" is verified manually against the live corpus. |
+| 1 | Host Package | PASS | No-op + single-module-edit save preserves every other ZIP entry on both xlsm and xlsb. A file saved before its first macro opens with no project: `has_vba_project()` is False, listing reads answer empty, and a read or write that needs the project raises a structured `NoVBAProjectError`. "Opens in Excel without repair" is verified manually against the live corpus. |
 | 2 | OLE/CFB Container | PASS | Reader + writer round-trip; case-insensitive lookup; `CFB.remove_stream` / `drop_streams_in_storage` / `rename_stream_in_storage` / `add_stream_to_storage` all rebuild the directory subtree; SRP streams are auto-dropped on `ExcelFile.save`. |
 | 3 | Binary Parsing Discipline | PASS | Bounds-checked, signature-checked; `decompress()` carries `stream_name` + byte offset in `VBAProjectError` messages. |
 | 4 | Compression / Decompression | PASS | Spec-compliant chunk-based codec; randomized round-trips up to 32 KB. |
@@ -54,14 +73,14 @@ pyOpenVBA today is best described as:
 | 7 | PROJECTwm | PASS | `parse_projectwm()` + `serialize_projectwm()` round-trip the live fixture byte-for-byte; `ExcelFile.save()` rebuilds `PROJECTwm` whenever the module set changes (add / rename / delete). |
 | 8 | PROJECTlk | PASS | `parse_projectlk()` + `serialize_projectlk()` round-trip `LicenseInfoRecord`s; `ExcelFile.save()` preserves PROJECTlk bytes verbatim until ActiveX license editing is required. |
 | 9 | dir Project Information | PASS | All PROJECTINFORMATION records decoded: code page, name, SysKind, LCID(invoke), DocString, HelpFile, HelpContext, LibFlags, Version, Constants, CompatVersion. |
-| 10 | dir References | PASS | REFERENCENAME / REFERENCEREGISTERED / REFERENCEPROJECT / REFERENCECONTROL / REFERENCEORIGINAL records exposed as `VBAReference` entries on `VBAProject.references`. |
+| 10 | dir References | PASS | Reference records are exposed as `VBAReference` entries. All four file facades share library listing/addition/removal, Office presets and custom registered references; removals preserve adjacent project/control groups. Reference-only saves invalidate compiled state and pass native Excel/Word/PowerPoint gates. |
 | 11 | dir Module Records | PASS | Module name (MBCS + Unicode), stream name (MBCS + Unicode), offset, type, read-only, private, doc-string (MBCS + Unicode), help-context, cookie all decoded. `serialize_dir_modules_section()` re-emits the full block. |
 | 12 | Module Stream | PASS | Source decompressed from `MODULEOFFSET`; replacement preserves cache prefix; reparse yields identical source. |
 | 13 | Module Mutation | PASS | Replace, add, rename, and delete all persist end-to-end (CFB stream create/rename/remove + dir rewrite + PROJECT rewrite). |
-| 14 | Designer / UserForm | PASS | UserForm sub-storage and all four designer child streams (`f`, `o`, `\x01CompObj`, `\x03VBFrame`) survive a no-op save byte-for-byte on the live xlsm fixture (`test_designer_storage_preserved`). Generic sub-storage round-trip is also covered (`test_synthetic_substorage_round_trips_through_cfb`). |
+| 14 | Designer / UserForm | PASS | The designer streams are read, edited and written ([`forms.py`](../src/pyopenvba/forms.py)): control tree, nesting, named properties, control/container/page add and remove, and composing a form from nothing. Lossless is the gate -- an unedited form serializes to the bytes it was read from across every fixture, and a no-op save leaves all four designer child streams byte-for-byte identical. Verified against live Excel and live PowerPoint (`test_live_forms_gate.py`, `test_live_powerpoint_forms_gate.py`, opt-in). |
 | 15 | Content Hash / Integrity | OUT OF SCOPE | `compute_v3_content_hash()` provides a stable SHA-1 digest over normalized module sources for internal use. The Office-compatible V3 / agile content hash (host-specific tokenization that matches Excel's signature payload) is intentionally out of scope; reaching parity would require Excel-side reference vectors and only matters for re-signing (also out of scope, see Gate 17). |
 | 16 | Protection / Encryption / Password | PASS | `ProjectProtection` exposes raw obfuscated CMG/DPB/GC plus `has_password`. A real password-protected fixture (`workbook_with_password_protected_vba_modules.xlsm`) is parsed end-to-end. `ExcelFile.save()` refuses to mutate a protected project unless `allow_protected=True`; with the opt-in, the password material is preserved verbatim. Password decryption / re-encryption is intentionally out of scope. |
-| 17 | Digital Signature | OUT OF SCOPE | `detect_signature()` identifies legacy / agile / V3 signature streams. `ExcelFile.save()` drops stale signature streams when the project is mutated and emits a `UserWarning` (silenced with `allow_invalidate_signature=True`). Re-signing modified projects with PKCS#7 / VBA digital signatures is intentionally out of scope. |
+| 17 | Digital Signature | OUT OF SCOPE | `vba_signature()` reads the legacy / agile / V3 signature from the parts Excel, Word and PowerPoint keep beside `vbaProject.bin`, and `detect_signature()` any signature streams inside the project. `save()` drops a stale signature when the project is mutated, as the three applications do (measured live), and emits a `UserWarning` (silenced with `allow_invalidate_signature=True`). Re-signing modified projects with PKCS#7 / VBA digital signatures is intentionally out of scope, and so are signatures in binary files. |
 | 18 | Encoding | PASS | Latin-1 supplement module names + source round-trip end-to-end on a cp1252 project (`test_latin1_supplement_module_name_round_trip`). Non-cp1252 module identifiers are not exercised because Excel's VBA IDE does not permit them (out of scope). |
 | 19 | Cross-Structure Consistency | PASS | `VBAProject.validate(cfb)` reports duplicates and missing streams. |
 | 20 | Round-Trip Preservation | PASS | No-op parse-write-reopen preserves every module source, every ZIP entry, and every module-stream cache prefix. Manual Excel verification covers no-op, source-edit, add, rename, and delete on xlsm; no-op and source-edit on xlsb; and no-op + opt-in source-edit on the password-protected fixture (9/9 open in Excel with no repair dialog; see `scripts/build_excel_verification_set.py`). |
@@ -71,17 +90,82 @@ pyOpenVBA today is best described as:
 | 24 | API Contract | PASS | Layered modules: `pyopenvba.cfb`, `pyopenvba.vba`, `pyopenvba.excel`. Mutation surface (`add_module`/`rename_module`/`delete_module`) persists end-to-end through `save()`. |
 | 25 | Documentation | PASS | `README.md` carries the scope statement, supported formats, push/pull workflow, and safety-guard summary; `docs/roadmap.md` tracks per-gate status. |
 
+## Shape support in both libraries
+
+Shapes belong in both pyOpenVBA and pyOfficeEditor. Each library will
+continue to develop shape support through its own supported public API.
+Consumers may choose either library for the workflow they need. This
+resolves the exclusive-ownership question in
+[issue #24](https://github.com/WilliamSmithEdward/pyOpenVBA/issues/24).
+
+In pyOpenVBA, shapes serve the VBA host models and the Python API.
+The drawing readers and writers under `shapes/_xlsx.py`, `_docx.py`
+and `_pptx.py` remain private implementation details; the public
+file-editing surface is exposed through `ExcelApplication.sheet()` and
+its `SheetView` shape methods. Reading snapshots, creating AutoShapes,
+text boxes and nine Forms control types, and common edits and deletion
+are implemented. Checkbox, list and numeric control values, A1 bindings
+and workbook/local named bindings (including `CHOOSE`, `IF`, single-area `INDEX`, `OFFSET`
+and A1/absolute-R1C1 `INDIRECT`)
+have measured support, including multi/extended list rebinding and radio
+selection, shared links, deletion and non-overlapping interleaved regrouping.
+Overlapping and nested box additions also have measured link-transfer
+support. Remaining shape kinds and settings still need implementation
+and conformance evidence.
+Resolving ownership does not mark that work complete.
+
+The public API work must cover reading, creating, editing and deleting
+shapes, form-control details (including linked cells, list ranges and
+values), and setting or clearing a macro where the host supports it.
+Mutations must keep the drawing, control records, VML, content types
+and relationships consistent while preserving unrelated content.
+Both libraries should be checked against the same Office-authored
+fixtures and measured behavior. pyOpenVBA keeps its contract of zero
+runtime dependencies; supporting shapes in both libraries does not
+require consumers to import either library's private modules.
+
+The corresponding pyOfficeEditor API work remains tracked in
+[pyOfficeEditor #1](https://github.com/WilliamSmithEdward/pyOfficeEditor/issues/1).
+That issue is not a duplicate of the ownership decision.
+
 ## Near-term roadmap (in priority order)
 
-_No open near-term items: all in-scope gates are PASS. See the "Out of scope" section below for explicitly deferred work._
+The development order is **Excel, then Word, then PowerPoint**, covering
+the whole headless library. The scope,
+acceptance criteria and initial audit are in
+[`host_completeness.md`](host_completeness.md). Access runtime expansion
+follows those hosts. Existing functionality in every host remains
+supported.
+
+1. Complete the public shape API work described above, starting with
+   Excel and keeping the remaining gaps explicit.
+2. Expand Excel's feature-completeness checklist to individual operations,
+   then implement and verify its gaps before moving to Word. The MS-OVBA
+   gates above cover
+   VBA project file editing; their in-scope passes do not establish
+   completeness of the Excel object model or runtime.
+3. Complete Word against its own checklist and live measurements.
+4. Complete PowerPoint against its own checklist and live measurements.
+5. Add the Access object model, bridge and measured probe file using the
+   pattern established by the other hosts.
+
+Known Excel gaps include broader event signatures and sources, general
+calculation scheduling and iterative calculation, mixed-feature array edits,
+external workbook/project links, pivot tables and caches, grouping and
+pictures, richer imported-chart editing and formatting, and the unimplemented
+portions of the M library. WithEvents, document events, dynamic spills and
+basic chart creation have measured support; their remaining limits are
+recorded in [`vba_runtime.md`](vba_runtime.md) and the operation checklist.
+These are starting points for the completeness audit, not an exhaustive
+list or a claim of feature completeness.
 
 ## Out of scope (no current plans)
 
 - Re-signing modified projects with arbitrary PKCS#7 / VBA digital signatures (Gate 17).
-- Office-compatible V3 / agile content-hash recomputation (Gate 15) — only meaningful as a prerequisite for re-signing.
+- Office-compatible V3 / agile content-hash recomputation (Gate 15), only meaningful as a prerequisite for re-signing.
 - Breaking, removing, or bypassing project protection passwords.
-- Editing UserForm layout (controls, positions, properties). Form layout
-  bytes will continue to be round-tripped verbatim.
+- Editing the design of a form whose streams this cannot parse: it raises
+  rather than guessing, which is deliberate.
 - Editing ActiveX licenses beyond preserving `PROJECTlk` verbatim.
 - BIFF8 record-level editing of legacy `.xls` workbooks (only the embedded
   CFB / VBA project is supported; the workbook stream is treated as opaque).

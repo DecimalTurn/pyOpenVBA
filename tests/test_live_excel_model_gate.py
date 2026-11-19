@@ -1,0 +1,3107 @@
+"""Live Excel gate for the in-memory workbook (opt-in).
+
+Two things only real Excel can answer.  First, that a file this wrote
+opens without a repair prompt and holds what the macro put in it: the
+offline tests prove the bytes are what we meant, not that Excel agrees.
+Second, that a macro run here and the same macro run in Excel leave the
+same cells behind.
+
+Opt-in: set ``RUN_LIVE_EXCEL=1`` on a Windows machine with desktop Excel
+installed.  Skipped everywhere else, including CI.
+"""
+
+from __future__ import annotations
+
+import datetime
+import os
+import re
+import shutil
+import sys
+from pathlib import Path
+
+import pytest
+
+from pyopenvba.apps.excel import ExcelApplication
+
+pytestmark = pytest.mark.skipif(
+    os.environ.get("RUN_LIVE_EXCEL") != "1" or sys.platform != "win32",
+    reason="live Excel gate: set RUN_LIVE_EXCEL=1 on Windows with Excel installed",
+)
+
+FIXTURES = Path(__file__).parent / "fixtures" / "power_query"
+
+#: The macro both sides run.  Everything it touches is something the
+#: model claims to implement.
+MACRO = """
+Sub Fill()
+    Dim r As Long
+    Range("A1").Value = "Item"
+    Range("B1").Value = "Qty"
+    For r = 1 To 5
+        Cells(r + 1, 1).Value = "Item " & r
+        Cells(r + 1, 2).Value = r * 10
+    Next r
+    Range("D1").Value = Application.WorksheetFunction.Sum(Range("B2:B6"))
+    Range("D2").Value = Range("A1").End(xlDown).Address
+    Range("D3").Value = ActiveSheet.UsedRange.Address
+    Range("D4").Value = Range("B2:B6").Count
+End Sub
+"""
+
+
+def _excel_says(source: str, macro: str) -> dict[str, object]:
+    """Run the macro in real Excel and read the cells back."""
+    harness = pytest.importorskip("pyvbaharness")
+
+    reader = (
+        "Public Function Report() As String\n"
+        "    Fill\n"
+        '    Report = Range("D1").Value & "|" & Range("D2").Value & "|" & _\n'
+        '        Range("D3").Value & "|" & Range("D4").Value & "|" & _\n'
+        '        Range("A6").Value & "|" & TypeName(Range("B2").Value)\n'
+        "End Function\n"
+    )
+    with harness.ExcelSession() as excel:
+        excel.new_document()
+        result = excel.run_vba(macro + reader, "Report", timeout=120.0)
+        assert result.ok, f"{result.outcome}: {result.message}"
+        pieces = str(result.value).split("|")
+    return dict(zip(("total", "end", "used", "count", "a6", "type"), pieces))
+
+
+def _model_says(macro: str) -> dict[str, object]:
+    app = ExcelApplication()
+    app.add_workbook()
+    app.add_module(macro, name="Module1")
+    app.run("Fill")
+    sheet = app.sheet(1)
+    return {
+        "total": app.evaluate('CStr(Range("D1").Value)'),
+        "end": sheet.value("D2"),
+        "used": sheet.value("D3"),
+        "count": app.evaluate('CStr(Range("D4").Value)'),
+        "a6": sheet.value("A6"),
+        "type": app.evaluate('TypeName(Range("B2").Value)'),
+    }
+
+
+def test_the_model_and_excel_agree_on_what_the_macro_did() -> None:
+    assert _model_says(MACRO) == _excel_says("", MACRO)
+
+
+def test_a_workbook_this_wrote_opens_in_excel(tmp_path: Path) -> None:
+    harness = pytest.importorskip("pyvbaharness")
+
+    app = ExcelApplication()
+    app.add_workbook()
+    app.add_module(MACRO, name="Module1")
+    app.run("Fill")
+    out = tmp_path / "written.xlsx"
+    app.save(out)
+
+    with harness.ExcelSession() as excel:
+        excel.open_document(out)
+        result = excel.run_vba(
+            "Public Function Report() As String\n"
+            '    Report = ActiveSheet.Range("A1").Value & "|" & _\n'
+            '        CStr(ActiveSheet.Range("B6").Value) & "|" & _\n'
+            '        ActiveSheet.UsedRange.Address\n'
+            "End Function\n",
+            "Report",
+            timeout=120.0,
+        )
+        assert result.ok, f"{result.outcome}: {result.message}"
+        assert str(result.value) == "Item|50|$A$1:$D$6"
+
+
+#: A workbook of formulas, built here and recalculated by Excel.
+FORMULAS = """
+Sub Build()
+    Dim r As Long
+    For r = 1 To 5
+        Cells(r, 1).Value = r
+        Cells(r, 2).Value = r * 1.5
+    Next r
+    Range("C1:C5").Formula = "=A1*B1"
+    Range("E1").Formula = "=SUM(C1:C5)"
+    Range("E2").Formula = "=ROUND(AVERAGE(B1:B5),2)"
+    Range("E3").Formula = "=IF(E1>20,""over"",""under"")"
+    Range("E4").Formula = "=COUNTIF(A1:A5,"">2"")"
+    Range("E5").Formula = "=VLOOKUP(3,A1:C5,3,FALSE)"
+    Range("E6").Formula = "=TEXT(E1,""#,##0.00"")"
+    Range("E7").Formula = "=A1&""-""&B1"
+    Range("E8").Formula = "=IFERROR(1/0,""caught"")"
+    Range("E9").Formula = "=MOD(-7,3)"
+    Range("E10").Formula = "=INDEX(C1:C5,MATCH(4,A1:A5,0))"
+End Sub
+"""
+
+#: Where the answers are read from, on both sides.
+ANSWERS = [f"E{number}" for number in range(1, 11)] + ["C1", "C5"]
+
+
+def test_excel_agrees_with_what_the_engine_calculated(tmp_path: Path) -> None:
+    """The same formulas, worked out here and by Excel, in a file it opened.
+
+    This is the check the offline probes cannot make: that the
+    calculated values survive the save, that Excel accepts the file, and
+    that recalculating there lands on the same numbers.
+    """
+    harness = pytest.importorskip("pyvbaharness")
+
+    app = ExcelApplication()
+    app.add_workbook()
+    app.add_module(FORMULAS, name="Module1")
+    app.run("Build")
+    ours = [str(app.evaluate(f'CStr(Range("{where}").Value)')) for where in ANSWERS]
+
+    out = tmp_path / "formulas.xlsx"
+    app.save(out)
+
+    reader = (
+        "Public Function Report() As String\n"
+        "    Application.CalculateFull\n"
+        "    Dim out As String, i As Long\n"
+        "    Dim cells As Variant\n"
+        f"    cells = Array({', '.join(repr(where).replace(chr(39), chr(34)) for where in ANSWERS)})\n"
+        "    For i = LBound(cells) To UBound(cells)\n"
+        '        out = out & CStr(ActiveSheet.Range(cells(i)).Value) & "|"\n'
+        "    Next i\n"
+        "    Report = out\n"
+        "End Function\n"
+    )
+    with harness.ExcelSession() as excel:
+        excel.open_document(out)
+        result = excel.run_vba(reader, "Report", timeout=120.0)
+        assert result.ok, f"{result.outcome}: {result.message}"
+        theirs = str(result.value).rstrip("|").split("|")
+
+    assert theirs == ours
+
+
+def test_an_edited_workbook_still_opens_with_its_query(tmp_path: Path) -> None:
+    """A Power Query workbook edited here keeps what Excel needs.
+
+    The model has no field for a connection or a query table, so this is
+    the check that not rewriting them was enough.
+    """
+    harness = pytest.importorskip("pyvbaharness")
+
+    copy = tmp_path / "edited.xlsx"
+    shutil.copyfile(FIXTURES / "loaded_to_sheet.xlsx", copy)
+    app = ExcelApplication.open(copy)
+    app.add_module('Sub Touch()\n    Worksheets(1).Range("E1").Value = 99\nEnd Sub\n', name="Module1")
+    app.run("Touch")
+    out = tmp_path / "edited_out.xlsx"
+    app.save(out)
+
+    with harness.ExcelSession() as excel:
+        excel.open_document(out)
+        result = excel.run_vba(
+            "Public Function Report() As String\n"
+            '    Report = CStr(ActiveSheet.Range("E1").Value) & "|" & _\n'
+            "        CStr(ActiveWorkbook.Queries.Count) & \"|\" & _\n"
+            "        CStr(ActiveWorkbook.Connections.Count)\n"
+            "End Function\n",
+            "Report",
+            timeout=120.0,
+        )
+        assert result.ok, f"{result.outcome}: {result.message}"
+        assert str(result.value) == "99|1|1"
+
+
+#: The shapes a macro makes here, which Excel then has to report back
+#: the same way.
+SHAPES = """
+Sub Draw()
+    Dim sh As Object
+    Set sh = ActiveSheet.Shapes.AddShape(1, 10, 20, 100, 50)
+    sh.Name = "Rect"
+    sh.TextFrame.Characters.Text = "Hello"
+    sh.OnAction = "Clicked"
+    Set sh = ActiveSheet.Shapes.AddShape(9, 150, 30, 60, 60)
+    sh.Name = "Oval"
+    Set sh = ActiveSheet.Shapes.AddTextbox(1, 10, 120, 120, 40)
+    sh.Name = "Box"
+    sh.TextFrame.Characters.Text = "Two" & Chr(10) & "lines"
+End Sub
+
+Public Sub Clicked()
+End Sub
+"""
+
+
+def test_excel_opens_the_shapes_this_wrote(tmp_path: Path) -> None:
+    """Shapes made by a macro here, read back by Excel from the file.
+
+    The offline tests prove the drawing markup is what we meant; only
+    Excel can say whether it opens the workbook and sees the same
+    shapes in the same places, with the macro still on the first one.
+    """
+    harness = pytest.importorskip("pyvbaharness")
+
+    app = ExcelApplication()
+    app.add_workbook()
+    app.add_module(SHAPES, name="Module1")
+    app.run("Draw")
+    ours = [
+        str(app.evaluate(f"CStr(ActiveSheet.Shapes({number}).{what})"))
+        for number in (1, 2, 3)
+        for what in ("Name", "Type", "Left", "Top", "Width", "Height", "OnAction")
+    ]
+    text = str(app.evaluate('ActiveSheet.Shapes("Box").TextFrame.Characters.Text'))
+    ours.append(text.replace(chr(10), "/"))
+
+    out = tmp_path / "shapes.xlsm"
+    app.save(out)
+
+    reader = (
+        "Public Function Report() As String\n"
+        "    Dim out As String, i As Long, what As Variant, one As Variant\n"
+        '    what = Array("Name", "Type", "Left", "Top", "Width", "Height", "OnAction")\n'
+        "    For i = 1 To 3\n"
+        "        For Each one In what\n"
+        "            out = out & CStr(CallByName(ActiveSheet.Shapes(i), CStr(one), VbGet)) & vbLf\n"
+        "        Next one\n"
+        "    Next i\n"
+        '    Dim body As String\n'
+        '    body = ActiveSheet.Shapes("Box").TextFrame.Characters.Text\n'
+        '    out = out & Replace(Replace(body, vbCr, "/"), vbLf, "/") & vbLf\n'
+        "    Report = out\n"
+        "End Function\n"
+    )
+    with harness.ExcelSession() as excel:
+        excel.open_document(out)
+        result = excel.run_vba(reader, "Report", timeout=120.0)
+        assert result.ok, f"{result.outcome}: {result.message}"
+        theirs = str(result.value).rstrip("\n").split("\n")
+
+    assert [one.replace("\r", "") for one in theirs] == ours
+
+
+#: A form control, which is four parts of a workbook at once.
+CONTROL = """
+Sub Draw()
+    Dim sh As Object
+    Set sh = ActiveSheet.Shapes.AddFormControl(0, 100, 50, 90, 30)
+    sh.Name = "Go"
+    sh.OnAction = "Clicked"
+    sh.TextFrame.Characters.Text = "Press me"
+End Sub
+
+Public Sub Clicked()
+End Sub
+"""
+
+
+def test_excel_opens_a_form_control_this_made(tmp_path: Path) -> None:
+    """A button built from nothing, and Excel agrees it is one.
+
+    A control is the drawing, the sheet's own record of it, a part
+    saying what kind it is and the VML Excel draws it from.  Any of
+    them wrong and Excel refuses the file rather than saying why, so
+    this gate is the only way to know.
+    """
+    harness = pytest.importorskip("pyvbaharness")
+
+    app = ExcelApplication()
+    app.add_workbook()
+    app.add_module(CONTROL, name="Module1")
+    app.run("Draw")
+    out = tmp_path / "control.xlsm"
+    app.save(out)
+
+    reader = (
+        "Public Function Report() As String\n"
+        "    Dim sh As Object\n"
+        "    Set sh = ActiveSheet.Shapes(1)\n"
+        '    Report = ActiveSheet.StandardHeight & "#" & sh.Name & "|" & CStr(sh.Type) & "|" & sh.OnAction & "|" & _\n'
+        '        CStr(sh.Left) & "|" & CStr(sh.Width) & "|" & sh.TextFrame.Characters.Text & _\n'
+        '        "|" & CStr(sh.FormControlType)\n'
+        "End Function\n"
+    )
+    with harness.ExcelSession() as excel:
+        excel.open_document(out)
+        result = excel.run_vba(reader, "Report", timeout=120.0)
+        assert result.ok, f"{result.outcome}: {result.message}"
+    standard, answer = str(result.value).split("#", 1)
+    left, width = _on_display(standard, 100, 90)
+    assert answer == f"Go|8|control.xlsm!Clicked|{left}|{width}|Press me|0"
+
+
+#: A query that does enough to be worth comparing: a group, a sort, a
+#: derived column and a rounding, all of which the M tests measure one
+#: at a time.
+QUERY = """let
+    Source = #table({"Region", "Amount"}, {{"West", 10}, {"East", 20}, {"West", 5}}),
+    Grouped = Table.Group(Source, {"Region"}, {{"Total", each List.Sum([Amount])}}),
+    Sorted = Table.Sort(Grouped, {{"Region", Order.Ascending}}),
+    Final = Table.AddColumn(Sorted, "Share", each Number.Round([Total] / 35, 3))
+in
+    Final"""
+
+#: The block the query fills, headers included.
+LANDED = ("A1", "B1", "C1", "A2", "B2", "C2", "A3", "B3", "C3")
+
+
+def test_the_refresh_lands_what_power_query_lands(tmp_path: Path) -> None:
+    """The same query, refreshed here and by Excel, fills the same cells.
+
+    The probe file holds the evaluator to Power Query expression by
+    expression.  This is the other half: that a whole query, loaded to a
+    sheet, puts the same values in the same places as the engine does.
+    """
+    harness = pytest.importorskip("pyvbaharness")
+
+    from pyopenvba import PowerQueryWorkbook
+    from pyopenvba.excel import ExcelFile
+
+    seed = tmp_path / "seed.xlsm"
+    source = tmp_path / "query.xlsm"
+    ExcelFile.create_new(seed)
+    book = PowerQueryWorkbook(seed)
+    book.add_query("Summary", QUERY)
+    book.load_to_sheet("Summary", ["Region", "Total", "Share"])
+    book.save(source)
+
+    app = ExcelApplication.open(source)
+    app.refresh_query("Summary")
+    ours = [str(app.evaluate(f'CStr(Worksheets(1).Range("{where}").Value)')) for where in LANDED]
+
+    reader = (
+        "Public Function Report() As String\n"
+        "    Dim c As WorkbookConnection\n"
+        "    For Each c In ActiveWorkbook.Connections\n"
+        "        On Error Resume Next\n"
+        "        c.OLEDBConnection.BackgroundQuery = False\n"
+        "        On Error GoTo 0\n"
+        "    Next c\n"
+        "    ActiveWorkbook.RefreshAll\n"
+        "    Application.CalculateUntilAsyncQueriesDone\n"
+        "    Dim out As String, i As Long, cells As Variant\n"
+        f"    cells = Array({', '.join(chr(34) + where + chr(34) for where in LANDED)})\n"
+        "    For i = LBound(cells) To UBound(cells)\n"
+        '        out = out & CStr(Worksheets(1).Range(cells(i)).Value) & "|"\n'
+        "    Next i\n"
+        "    Report = out\n"
+        "End Function\n"
+    )
+    with harness.ExcelSession() as excel:
+        excel.open_document(source)
+        result = excel.run_vba(reader, "Report", timeout=300.0)
+        assert result.ok, f"{result.outcome}: {result.message}"
+        theirs = str(result.value).rstrip("|").split("|")
+
+    assert ours == theirs
+
+
+def test_excel_opens_public_python_shape_edits(tmp_path: Path) -> None:
+    """Creation, edits and control removal through Python agree with live Excel."""
+    harness = pytest.importorskip("pyvbaharness")
+    source = Path(__file__).parent / "fixtures" / "shapes" / "excel_shapes.xlsm"
+    app = ExcelApplication.open(source, with_vba=False)
+    sheet = app.sheet(1)
+    sheet.update_shape("Button1", new_name="Run", left=40, top=60, width=110, height=35,
+                       text="Changed\nCaption", macro="")
+    sheet.remove_shape("Drop1")
+    sheet.add_button(name="New", left=300, top=220, text="New button", macro="Clicked")
+    out = tmp_path / "python_shapes.xlsm"
+    app.save(out)
+    reader = (
+        "Public Function Report() As String\n"
+        "    Dim sh As Object\n"
+        '    Set sh = ActiveSheet.Shapes("Run")\n'
+        '    Report = ActiveSheet.StandardHeight & "#" & CStr(ActiveSheet.Shapes.Count) & "|" & sh.Name & "|" & _\n'
+        '        CStr(sh.Left) & "|" & CStr(sh.Top) & "|" & CStr(sh.Width) & "|" & _\n'
+        '        CStr(sh.Height) & "|" & Replace(Replace(sh.TextFrame.Characters.Text, vbCr, ""), vbLf, "/") & "|" & _\n'
+        '        sh.OnAction & "|" & ActiveSheet.Shapes("New").TextFrame.Characters.Text & "|" & _\n'
+        '        CStr(ActiveSheet.Shapes("Check1").Type)\n'
+        "End Function\n"
+    )
+    with harness.ExcelSession() as excel:
+        excel.open_document(out)
+        result = excel.run_vba(reader, "Report", timeout=120.0)
+        assert result.ok, f"{result.outcome}: {result.message}"
+    standard, answer = str(result.value).split("#", 1)
+    left, width = _on_display(standard, 40, 110)
+    top, height = _on_display(standard, 60, 35)
+    assert answer == f"9|Run|{left}|{top}|{width}|{height}|Changed/Caption||New button|8"
+
+
+def _on_display(standard_height: str, start: float, size: float) -> tuple[str, str]:
+    """Where Excel puts a shape's edges once it loads them from the anchor, as CStr spells them.
+
+    Excel rounds each edge to a whole pixel of its display: 0.75pt at
+    96 DPI, where a standard row is 15pt, and 0.5pt at 144 DPI, where it
+    is 14.5pt. So a button written at 40pt reads 39.75 on the first and
+    40 on the second.
+    """
+    pixel = {"15": 0.75, "14.5": 0.5}.get(standard_height)
+    if pixel is None:
+        pytest.skip(f"no pixel grid measured for a display whose standard row is {standard_height}pt")
+    first = round(start / pixel) * pixel
+    last = round((start + size) / pixel) * pixel
+
+    def spelled(value: float) -> str:
+        return f"{value:.15g}"
+
+    return spelled(first), spelled(last - first)
+
+
+def test_excel_opens_after_last_public_button_is_deleted(tmp_path: Path) -> None:
+    harness = pytest.importorskip("pyvbaharness")
+    app = ExcelApplication()
+    app.add_workbook()
+    sheet = app.sheet(1)
+    sheet.add_button(name="Gone", text="Delete me")
+    out = tmp_path / "deleted_button.xlsm"
+    app.save(out)
+    sheet.remove_shape("Gone")
+    app.save(out)
+    with harness.ExcelSession() as excel:
+        excel.open_document(out)
+        result = excel.run_vba(
+            "Public Function Report() As String\n"
+            "    Report = CStr(ActiveSheet.Shapes.Count)\nEnd Function\n",
+            "Report", timeout=120.0,
+        )
+        assert result.ok, f"{result.outcome}: {result.message}"
+        assert str(result.value) == "0"
+
+
+def test_excel_vba_default_shape_name_can_duplicate_a_manual_name() -> None:
+    harness = pytest.importorskip("pyvbaharness")
+    app = ExcelApplication()
+    app.add_workbook()
+    source = (
+        "Public Function Report() As String\n"
+        '    ActiveSheet.Shapes.AddShape(1, 0, 0, 100, 50).Name = "Rectangle 2"\n'
+        "    Report = ActiveSheet.Shapes.AddShape(1, 0, 0, 100, 50).Name\n"
+        "End Function\n"
+    )
+    app.add_module(source, name="NameProbe")
+    ours = app.run("Report")
+    with harness.ExcelSession() as excel:
+        excel.new_document()
+        result = excel.run_vba(
+            source, "Report", timeout=120.0,
+        )
+        assert result.ok, f"{result.outcome}: {result.message}"
+        assert str(result.value) == ours
+
+
+@pytest.mark.parametrize("clear", [False, True])
+def test_excel_reads_python_control_bindings(tmp_path: Path, clear: bool) -> None:
+    harness = pytest.importorskip("pyvbaharness")
+    source = Path(__file__).parent / "fixtures" / "shapes" / "excel_shapes.xlsm"
+    app = ExcelApplication.open(source, with_vba=False)
+    sheet = app.sheet(1)
+    sheet.update_control("Check1", linked_cell="" if clear else "$K$2")
+    sheet.update_control("Drop1", linked_cell="" if clear else "$K$3",
+                         list_range="" if clear else "$J$2:$J$3")
+    out = tmp_path / "bindings.xlsm"
+    app.save(out)
+    with harness.ExcelSession() as excel:
+        excel.open_document(out)
+        result = excel.run_vba(
+            'Public Function Report() As String\n'
+            'Report = ActiveSheet.Shapes("Check1").ControlFormat.LinkedCell & "|" & _\n'
+            'ActiveSheet.Shapes("Drop1").ControlFormat.LinkedCell & "|" & _\n'
+            'ActiveSheet.Shapes("Drop1").ControlFormat.ListFillRange\nEnd Function\n',
+            "Report", timeout=120.0,
+        )
+        assert result.ok, f"{result.outcome}: {result.message}"
+        assert str(result.value) == ("||" if clear else "$K$2|$K$3|$J$2:$J$3")
+
+
+@pytest.mark.parametrize("value", [-4146, 1, 2])
+def test_excel_reads_python_checkbox_values(tmp_path: Path, value: int) -> None:
+    harness = pytest.importorskip("pyvbaharness")
+    source = Path(__file__).parent / "fixtures" / "shapes" / "excel_shapes.xlsm"
+    app = ExcelApplication.open(source, with_vba=False)
+    sheet = app.sheet(1)
+    sheet.set_control_value("Check1", 1)
+    sheet.set_control_value("Check1", value)
+    out = tmp_path / "checkbox.xlsm"
+    app.save(out)
+    with harness.ExcelSession(harness.HarnessConfig(lock_wait_s=45.0)) as excel:
+        excel.open_document(out)
+        result = excel.run_vba(
+            'Public Function Report() As String\n'
+            'Report = CStr(ActiveSheet.Shapes("Check1").ControlFormat.Value) & "|" & _\n'
+            'CStr(Range("H1").Value)\nEnd Function\n', "Report", timeout=120.0,
+        )
+        assert result.ok, f"{result.outcome}: {result.message}"
+        expected = "Error 2042" if value == 2 else str(value == 1)
+        assert str(result.value) == f"{value}|{expected}"
+
+
+def test_excel_reads_checkbox_created_by_headless_vba(tmp_path: Path) -> None:
+    harness = pytest.importorskip("pyvbaharness")
+    app = ExcelApplication()
+    app.add_workbook()
+    app.add_module('''Public Sub Build()
+Dim sh As Object
+Set sh = ActiveSheet.Shapes.AddFormControl(1, 0, 0, 90, 20)
+sh.Name = "Created"
+sh.ControlFormat.LinkedCell = "$H$1"
+sh.ControlFormat.Value = 2
+End Sub''', name="Builder")
+    app.run("Build")
+    out = tmp_path / "created_checkbox.xlsm"
+    app.save(out)
+    with harness.ExcelSession() as excel:
+        excel.open_document(out)
+        result = excel.run_vba(
+            'Public Function Report() As String\n'
+            'Report = CStr(ActiveSheet.Shapes("Created").FormControlType) & "|" & _\n'
+            'CStr(ActiveSheet.Shapes("Created").ControlFormat.Value) & "|" & _\n'
+            'CStr(Range("H1").Value)\nEnd Function\n', "Report", timeout=120.0,
+        )
+        assert result.ok, f"{result.outcome}: {result.message}"
+        assert str(result.value) == "1|2|Error 2042"
+
+
+@pytest.mark.parametrize("kind", [2, 6])
+def test_excel_reads_headless_list_selection(tmp_path: Path, kind: int) -> None:
+    harness = pytest.importorskip("pyvbaharness")
+    app = ExcelApplication()
+    app.add_workbook()
+    app.add_module(f'''Public Sub Build()
+Dim sh As Object
+Range("J1").Value = "a"
+Range("J2").Value = "b"
+Range("J3").Value = "c"
+Set sh = ActiveSheet.Shapes.AddFormControl({kind}, 0, 0, 90, 60)
+sh.Name = "Choices"
+sh.ControlFormat.ListFillRange = "$J$1:$J$3"
+sh.ControlFormat.LinkedCell = "$H$1"
+sh.ControlFormat.Value = 2
+End Sub''', name="Builder")
+    app.run("Build")
+    out = tmp_path / "choices.xlsm"
+    app.save(out)
+    # Reopen and edit, to exercise existing-part persistence too.
+    app = ExcelApplication.open(out, with_vba=False)
+    app.sheet(1).set_control_value("Choices", 3)
+    app.save(out)
+    with harness.ExcelSession() as excel:
+        excel.open_document(out)
+        result = excel.run_vba(
+            'Public Function Report() As String\n'
+            'Report = CStr(ActiveSheet.Shapes("Choices").FormControlType) & "|" & _\n'
+            'CStr(ActiveSheet.Shapes("Choices").ControlFormat.Value) & "|" & _\n'
+            'CStr(ActiveSheet.Shapes("Choices").ControlFormat.ListCount) & "|" & _\n'
+            'CStr(Range("H1").Value)\nEnd Function\n', "Report", timeout=120.0,
+        )
+        assert result.ok, f"{result.outcome}: {result.message}"
+        assert str(result.value) == f"{kind}|3|3|3"
+
+
+@pytest.mark.parametrize("mode", [1, 2, 3])
+def test_excel_reads_inline_items_and_multi_selection(tmp_path: Path, mode: int) -> None:
+    harness = pytest.importorskip("pyvbaharness")
+    app = ExcelApplication()
+    app.add_workbook()
+    app.add_module('''Public Sub Build()
+Dim sh As Object
+Set sh = ActiveSheet.Shapes.AddFormControl(6, 0, 0, 90, 60)
+sh.Name = "Choices"
+End Sub''', name="Builder")
+    app.run("Build")
+    sheet = app.sheet(1)
+    for text in ("one", "two & three", "four"):
+        sheet.add_control_item("Choices", text)
+    sheet.set_control_selection_mode("Choices", mode)
+    if mode == 1:
+        sheet.set_control_value("Choices", 2)
+    else:
+        sheet.set_control_selection("Choices", [1, 3])
+    out = tmp_path / "inline.xlsm"
+    app.save(out)
+    app = ExcelApplication.open(out, with_vba=False)
+    app.sheet(1).update_control_item("Choices", 2, "two & edited")
+    app.save(out)
+    with harness.ExcelSession(harness.HarnessConfig(lock_wait_s=45.0)) as excel:
+        excel.open_document(out)
+        result = excel.run_vba(
+            'Public Function Report() As String\nDim sh As Object\n'
+            'Set sh = ActiveSheet.Shapes("Choices")\n'
+            'Report = CStr(sh.ControlFormat.MultiSelect) & "|" & sh.ControlFormat.List(2) & "|" & _\n'
+            'CStr(sh.DrawingObject.Selected(1)) & "|" & CStr(sh.DrawingObject.Selected(2)) & "|" & _\n'
+            'CStr(sh.DrawingObject.Selected(3))\nEnd Function\n', "Report", timeout=120.0,
+        )
+        assert result.ok, f"{result.outcome}: {result.message}"
+        flags = "False|True|False" if mode == 1 else "True|False|True"
+        native_mode = {1: -4142, 2: -4154, 3: 3}[mode]
+        assert str(result.value) == f"{native_mode}|two & edited|{flags}"
+
+
+@pytest.mark.parametrize("operation", ["replace", "append", "clear", "remove"])
+def test_excel_reads_range_backed_list_edits(tmp_path: Path, operation: str) -> None:
+    harness = pytest.importorskip("pyvbaharness")
+    source = Path(__file__).parent / "fixtures" / "shapes" / "excel_shapes.xlsm"
+    app = ExcelApplication.open(source, with_vba=False)
+    sheet = app.sheet(1)
+    sheet.update_control("Drop1", linked_cell="$H$2")
+    sheet.set_control_value("Drop1", 2)
+    if operation == "replace":
+        app.add_module('''Public Sub ReplaceList()
+ActiveSheet.Shapes("Drop1").ControlFormat.List = Array("x", "y")
+End Sub''', name="Replacement")
+        app.run("ReplaceList")
+    elif operation == "append":
+        sheet.add_control_item("Drop1", "x")
+    elif operation == "clear":
+        sheet.clear_control_items("Drop1")
+    else:
+        with pytest.raises(ValueError):
+            sheet.remove_control_item("Drop1", 2)
+    out = tmp_path / "range_edit.xlsm"
+    app.save(out)
+    with harness.ExcelSession(harness.HarnessConfig(lock_wait_s=45.0)) as excel:
+        excel.open_document(out)
+        result = excel.run_vba(
+            'Public Function Report() As String\nDim cf As Object, i As Long\n'
+            'Set cf = ActiveSheet.Shapes("Drop1").ControlFormat\n'
+            'Report = cf.ListFillRange & "|" & CStr(cf.Value) & "|" & CStr(Range("H2").Value) & "|"\n'
+            'For i = 1 To cf.ListCount\nReport = Report & cf.List(i) & ";"\nNext i\n'
+            'Report = Report & "|" & Range("J1").Value & ";" & Range("J2").Value\nEnd Function\n',
+            "Report", timeout=120.0,
+        )
+        assert result.ok, f"{result.outcome}: {result.message}"
+        expected = {"replace": "|0|0|x;y;|a;b", "append": "|0|0|x;|a;b",
+                    "clear": "|0|0||a;b", "remove": "$J$1:$J$3|2|2|a;b;;|a;b"}
+        assert str(result.value) == expected[operation]
+
+
+def test_excel_opens_issue25_control_types_and_defaults(tmp_path: Path) -> None:
+    harness = pytest.importorskip("pyvbaharness")
+    app = ExcelApplication()
+    app.add_workbook()
+    app.add_module('''Public Sub Build()
+ActiveSheet.Shapes.AddFormControl(7, 0, 0, 90, 30).Name = "Radio"
+ActiveSheet.Shapes.AddFormControl(9, 0, 40, 90, 30).Name = "Spin"
+ActiveSheet.Shapes.AddFormControl(8, 0, 80, 90, 30).Name = "Scroll"
+ActiveSheet.Shapes.AddFormControl(4, 0, 120, 90, 30).Name = "Group"
+End Sub''', name="Builder")
+    app.run("Build")
+    out = tmp_path / "issue25.xlsm"
+    app.save(out)
+    with harness.ExcelSession(harness.HarnessConfig(lock_wait_s=45.0)) as excel:
+        excel.open_document(out)
+        result = excel.run_vba('''Public Function Report() As String
+Dim s As Object
+Set s = ActiveSheet.Shapes
+s("Spin").ControlFormat.Value = 7
+s("Scroll").ControlFormat.Value = 25
+Report = CStr(s("Radio").FormControlType) & "|" & CStr(s("Radio").ControlFormat.Value) & "|" & _
+CStr(s("Spin").FormControlType) & "|" & CStr(s("Spin").ControlFormat.Max) & "|" & CStr(s("Spin").ControlFormat.Value) & "|" & _
+CStr(s("Scroll").FormControlType) & "|" & CStr(s("Scroll").ControlFormat.Max) & "|" & CStr(s("Scroll").ControlFormat.Value) & "|" & _
+CStr(s("Group").FormControlType)
+End Function''', "Report", timeout=120.0)
+        assert result.ok, f"{result.outcome}: {result.message}"
+        assert str(result.value) == "7|-4146|9|30000|7|8|100|25|4"
+
+
+def test_excel_reads_numeric_control_edits(tmp_path: Path) -> None:
+    harness = pytest.importorskip("pyvbaharness")
+    app = ExcelApplication.open(Path(__file__).parent / "fixtures/shapes/all_controls.xlsm", with_vba=False)
+    app.add_module('''Public Sub Edit()
+Dim sh As Object
+For Each sh In ActiveSheet.Shapes
+If sh.Name = "Step" Or sh.Name = "Slide" Then
+sh.ControlFormat.Min = 5
+sh.ControlFormat.Max = 45
+sh.ControlFormat.SmallChange = 2
+sh.ControlFormat.Value = 13
+End If
+Next sh
+End Sub''', name="Editor")
+    app.run("Edit")
+    out = tmp_path / "numeric_edits.xlsm"
+    app.save(out)
+    with harness.ExcelSession(harness.HarnessConfig(lock_wait_s=45.0)) as excel:
+        excel.open_document(out)
+        result = excel.run_vba('''Public Function Report() As String
+Dim sh As Object, cf As Object
+For Each sh In ActiveSheet.Shapes
+If sh.Name = "Step" Or sh.Name = "Slide" Then
+Set cf = sh.ControlFormat
+Report = Report & CStr(cf.Value) & "|" & CStr(cf.Min) & "|" & CStr(cf.Max) & "|" & CStr(cf.SmallChange) & ";"
+End If
+Next sh
+End Function''', "Report", timeout=120.0)
+        assert result.ok, f"{result.outcome}: {result.message}"
+        assert str(result.value) == "13|5|45|2;13|5|45|2;"
+
+
+def test_excel_reads_public_control_creation_and_rebinding(tmp_path: Path) -> None:
+    harness = pytest.importorskip("pyvbaharness")
+    app = ExcelApplication()
+    app.add_workbook()
+    sheet = app.sheet(1)
+    kinds = [0, 1, 2, 4, 5, 6, 7, 8, 9]
+    for kind in kinds:
+        sheet.add_form_control(kind, name=f"Control{kind}", top=kind * 40, text=f"Caption {kind}")
+    sheet.set_control_items("Control6", ["a", "b", "c"])
+    sheet.set_control_selection_mode("Control6", 2)
+    sheet.set_control_selection("Control6", [1, 3])
+    sheet.set_control_selection_mode("Control6", 3)
+    sheet.set_value("J1", "x")
+    sheet.set_value("J2", "y")
+    sheet.update_control("Control6", list_range="$J$1:$J$2")
+    path = tmp_path / "public_controls.xlsm"
+    app.save(path)
+    with harness.ExcelSession(harness.HarnessConfig(lock_wait_s=45.0)) as excel:
+        excel.open_document(path)
+        result = excel.run_vba('''Public Function Report() As String
+Dim sh As Object
+For Each sh In ActiveSheet.Shapes
+Report = Report & sh.Name & ":" & CStr(sh.FormControlType) & ";"
+Next sh
+Set sh = ActiveSheet.Shapes("Control6")
+Report = Report & "|" & CStr(sh.ControlFormat.MultiSelect) & "|" & sh.ControlFormat.ListFillRange & "|" & _
+CStr(sh.ControlFormat.ListCount) & "|" & CStr(sh.DrawingObject.Selected(1)) & "|" & CStr(sh.DrawingObject.Selected(2))
+End Function''', "Report", timeout=120.0)
+        assert result.ok, f"{result.outcome}: {result.message}"
+        expected = "".join(f"Control{kind}:{kind};" for kind in kinds) + "|3|$J$1:$J$2|2|True|False"
+        assert str(result.value) == expected
+
+
+@pytest.mark.parametrize("layout,reverse", [("overlap", False), ("overlap", True),
+                                           ("nested", False), ("nested", True)])
+def test_excel_reads_overlapping_radio_groups(tmp_path: Path, layout: str, reverse: bool) -> None:
+    import json
+
+    harness = pytest.importorskip("pyvbaharness")
+    records = json.loads((Path(__file__).parent / "fixtures/shapes/radio_overlap.json").read_text())
+    record = next(r for r in records if r["layout"] == layout and r["reverse"] == reverse and r["operation"] == "select")
+    app = ExcelApplication()
+    app.add_workbook()
+    app.add_module('Public Function Report() As String\nDim sh As Object, box1 As Object, box2 As Object\n'
+                   + record["body"] + 'End Function\n', name="Builder")
+    assert app.run("Report") == record["reported"]
+    path = tmp_path / "overlapping.xlsm"
+    app.save(path)
+    app = ExcelApplication.open(path, with_vba=False)
+    inspect = '''Public Function Inspect() As String
+Dim sh As Object
+Inspect = CStr(Range("H1").Value) & ":" & CStr(Range("H2").Value) & ":" & CStr(Range("H3").Value) & "|"
+For Each sh In ActiveSheet.Shapes
+If Left(sh.Name, 5) = "Radio" Then
+Inspect = Inspect & sh.Name & ":" & CStr(sh.ControlFormat.Value) & ":" & sh.ControlFormat.LinkedCell & ";"
+End If
+Next sh
+End Function'''
+    app.add_module(inspect, name="Inspector")
+    assert app.run("Inspect") == record["reported"]
+    app.sheet(1).set_control_value("Radio2", 0)
+    app.sheet(1).set_control_value("Radio2", 1)
+    expected = app.run("Inspect")
+    app.save(path)
+    with harness.ExcelSession(harness.HarnessConfig(lock_wait_s=45.0)) as excel:
+        excel.open_document(path)
+        result = excel.run_vba(inspect, "Inspect", timeout=120.0)
+        assert result.ok, f"{result.outcome}: {result.message}"
+        assert str(result.value) == expected
+
+
+def test_excel_reads_headless_radio_groups(tmp_path: Path) -> None:
+    harness = pytest.importorskip("pyvbaharness")
+    app = ExcelApplication()
+    app.add_workbook()
+    sheet = app.sheet(1)
+    sheet.add_form_control(4, width=150, height=100)
+    sheet.add_form_control(7, name="First", left=10, top=10, width=90, height=20)
+    sheet.add_form_control(7, name="Second", left=10, top=40, width=90, height=20)
+    sheet.add_form_control(7, name="Outside", left=200, top=10, width=90, height=20)
+    sheet.update_control("Second", linked_cell="$H$1")
+    sheet.set_control_value("Second", 1)
+    sheet.set_control_value("Outside", 1)
+    path = tmp_path / "radio_groups.xlsm"
+    app.save(path)
+    # Exercise both newly generated and existing supporting control parts.
+    app = ExcelApplication.open(path, with_vba=False)
+    app.sheet(1).set_control_value("First", 1)
+    app.save(path)
+    with harness.ExcelSession(harness.HarnessConfig(lock_wait_s=45.0)) as excel:
+        excel.open_document(path)
+        result = excel.run_vba('''Public Function Report() As String
+Dim a As Object, b As Object, c As Object
+Set a = ActiveSheet.Shapes("First").ControlFormat
+Set b = ActiveSheet.Shapes("Second").ControlFormat
+Set c = ActiveSheet.Shapes("Outside").ControlFormat
+Report = CStr(a.Value) & "|" & CStr(b.Value) & "|" & CStr(c.Value) & "|" & CStr(Range("H1").Value) & "|" & b.LinkedCell
+b.Value = 1
+Report = Report & "|" & CStr(a.Value) & "|" & CStr(b.Value) & "|" & CStr(c.Value) & "|" & CStr(Range("H1").Value)
+End Function''', "Report", timeout=120.0)
+        assert result.ok, f"{result.outcome}: {result.message}"
+        assert str(result.value) == "1|-4146|1|1|$H$1|-4146|1|1|2"
+
+
+@pytest.mark.parametrize("operation", ["add", "delete"])
+def test_excel_reads_regrouped_radios(tmp_path: Path, operation: str) -> None:
+    import json
+
+    harness = pytest.importorskip("pyvbaharness")
+    records = json.loads((Path(__file__).parent / "fixtures/shapes/radio_regrouping.json").read_text())
+    record = next(r for r in records if r["operation"] == operation and r["chosen"] == 2 and r["outside"])
+    app = ExcelApplication()
+    app.add_workbook()
+    app.add_module('Public Function Report() As String\nDim a As Object, b As Object, c As Object, box As Object\n'
+                   + record["body"] + 'End Function\n', name="Builder")
+    assert app.run("Report") == record["reported"]
+    path = tmp_path / "regrouped.xlsm"
+    app.save(path)
+    with harness.ExcelSession(harness.HarnessConfig(lock_wait_s=45.0)) as excel:
+        excel.open_document(path)
+        result = excel.run_vba('''Public Function Inspect() As String
+Dim a As Object, b As Object, c As Object
+Set a = ActiveSheet.Shapes("First").ControlFormat
+Set b = ActiveSheet.Shapes("Second").ControlFormat
+Set c = ActiveSheet.Shapes("Third").ControlFormat
+Inspect = CStr(a.Value) & ":" & a.LinkedCell & ";" & CStr(b.Value) & ":" & b.LinkedCell & ";" & _
+CStr(c.Value) & ":" & c.LinkedCell & ";" & CStr(Range("H1").Value) & ":" & CStr(Range("H2").Value)
+End Function''', "Inspect", timeout=120.0)
+        assert result.ok, f"{result.outcome}: {result.message}"
+        assert str(result.value) == record["reported"].split("|")[-1]
+
+
+@pytest.mark.parametrize("local", [False, True])
+def test_excel_reads_named_control_bindings(tmp_path: Path, local: bool) -> None:
+    harness = pytest.importorskip("pyvbaharness")
+    app = ExcelApplication()
+    app.add_workbook()
+    local_name = 'ActiveWorkbook.Names.Add "Sheet1!Target", "=Sheet1!$H$2"\n' if local else ""
+    app.add_module('Public Sub Build()\n'
+                   'ActiveWorkbook.Names.Add "Target", "=Sheet1!$H$1"\n'
+                   'ActiveWorkbook.Names.Add "Choices", "=Sheet1!$J$1:$J$3"\n'
+                   + local_name + 'End Sub\n', name="Builder")
+    app.run("Build")
+    sheet = app.sheet(1)
+    for row, value in enumerate(["a", "b", "c"], 1):
+        sheet.set_value(f"J{row}", value)
+    sheet.add_form_control(6, name="Picker")
+    sheet.update_control("Picker", linked_cell="=target", list_range="choices")
+    sheet.set_control_value("Picker", 2)
+    path = tmp_path / "named_controls.xlsm"
+    app.save(path)
+    app = ExcelApplication.open(path, with_vba=False)
+    app.sheet(1).set_control_value("Picker", 3)
+    app.save(path)
+    with harness.ExcelSession(harness.HarnessConfig(lock_wait_s=45.0)) as excel:
+        excel.open_document(path)
+        result = excel.run_vba('''Public Function Inspect() As String
+Dim cf As Object
+Set cf = ActiveSheet.Shapes("Picker").ControlFormat
+Inspect = cf.LinkedCell & "|" & cf.ListFillRange & "|" & CStr(cf.Value) & "|" & CStr(cf.ListCount) & "|" & _
+CStr(Range("H1").Value) & "|" & CStr(Range("H2").Value) & "|" & cf.List(2)
+End Function''', "Inspect", timeout=120.0)
+        assert result.ok, f"{result.outcome}: {result.message}"
+        assert str(result.value) == ("Target|Choices|3|3||3|b" if local else "Target|Choices|3|3|3||b")
+
+
+@pytest.mark.parametrize("layout", ["identical", "nested", "outer", "partial"])
+def test_excel_reads_late_overlapping_boxes(tmp_path: Path, layout: str) -> None:
+    import json
+
+    harness = pytest.importorskip("pyvbaharness")
+    records = json.loads((Path(__file__).parent / "fixtures/shapes/radio_late_boxes.json").read_text())
+    record = next(r for r in records if r["layout"] == layout and r["links"] == "inside" and r["chosen"] == 1)
+    app = ExcelApplication()
+    app.add_workbook()
+    app.add_module('Public Function Report() As String\nDim a As Object, b As Object, c As Object\n'
+                   + record["body"] + 'End Function\n', name="Builder")
+    assert app.run("Report") == record["reported"]
+    path = tmp_path / "late_boxes.xlsm"
+    app.save(path)
+    inspect = '''Public Function Inspect() As String
+Dim a As Object, b As Object, c As Object
+Set a = ActiveSheet.Shapes("First").ControlFormat
+Set b = ActiveSheet.Shapes("Second").ControlFormat
+Set c = ActiveSheet.Shapes("Third").ControlFormat
+Inspect = CStr(a.Value) & ":" & a.LinkedCell & ";" & CStr(b.Value) & ":" & b.LinkedCell & ";" & _
+CStr(c.Value) & ":" & c.LinkedCell & ";" & CStr(Range("H1").Value) & ":" & CStr(Range("H2").Value)
+End Function'''
+    reopened = ExcelApplication.open(path, with_vba=False)
+    reopened.add_module(inspect, name="Inspector")
+    assert reopened.run("Inspect") == record["reported"].split("|")[-1]
+    with harness.ExcelSession(harness.HarnessConfig(lock_wait_s=45.0)) as excel:
+        excel.open_document(path)
+        result = excel.run_vba(inspect, "Inspect", timeout=120.0)
+        assert result.ok, f"{result.outcome}: {result.message}"
+        assert str(result.value) == record["reported"].split("|")[-1]
+
+
+@pytest.mark.parametrize("operation", ["select", "delete_first_box"])
+def test_excel_reads_interleaved_radio_groups(tmp_path: Path, operation: str) -> None:
+    import json
+
+    harness = pytest.importorskip("pyvbaharness")
+    records = json.loads((Path(__file__).parent / "fixtures/shapes/radio_interleaving.json").read_text())
+    record = next(r for r in records if r["boxes"] == 2 and r["order"] == "ABCABC" and r["operation"] == operation)
+    app = ExcelApplication()
+    app.add_workbook()
+    app.add_module('Public Function Report() As String\nDim sh As Object, box1 As Object, box2 As Object\n'
+                   + record["body"] + 'End Function\n', name="Builder")
+    assert app.run("Report") == record["reported"]
+    path = tmp_path / "interleaved.xlsm"
+    app.save(path)
+    app = ExcelApplication.open(path, with_vba=False)
+    inspect = '''Public Function Inspect() As String
+Dim sh As Object
+Inspect = CStr(Range("H1").Value) & ":" & CStr(Range("H2").Value) & "|"
+For Each sh In ActiveSheet.Shapes
+If Left(sh.Name, 5) = "Radio" Then
+Inspect = Inspect & sh.Name & ":" & CStr(sh.ControlFormat.Value) & ":" & sh.ControlFormat.LinkedCell & ";"
+End If
+Next sh
+End Function'''
+    app.add_module(inspect, name="Inspector")
+    assert app.run("Inspect") == record["reported"]
+    app.sheet(1).set_control_value("Radio4", 1)
+    expected = app.run("Inspect")
+    app.save(path)
+    with harness.ExcelSession(harness.HarnessConfig(lock_wait_s=45.0)) as excel:
+        excel.open_document(path)
+        result = excel.run_vba(inspect, "Inspect", timeout=120.0)
+        assert result.ok, f"{result.outcome}: {result.message}"
+        assert str(result.value) == expected
+
+
+@pytest.mark.parametrize("formula", ["OFFSET(Sheet1!$J$1,0,0,Sheet1!$K$1,1)",
+                                    'INDIRECT(Sheet1!$K$2)'])
+def test_excel_reads_dynamic_named_controls(tmp_path: Path, formula: str) -> None:
+    harness = pytest.importorskip("pyvbaharness")
+    app = ExcelApplication()
+    app.add_workbook()
+    app.add_module(f'''Public Sub Build()
+ActiveWorkbook.Names.Add "Dynamic", "={formula}"
+ActiveWorkbook.Names.Add "Target", "=OFFSET(Sheet1!$H$1,1,0)"
+End Sub''', name="Builder")
+    app.run("Build")
+    sheet = app.sheet(1)
+    sheet.set_value("J1", "a")
+    sheet.set_value("J2", "b")
+    sheet.set_value("J3", "c")
+    sheet.set_value("K1", 3)
+    sheet.set_value("K2", "Sheet1!$J$1:$J$3")
+    sheet.add_form_control(6, name="Picker")
+    sheet.update_control("Picker", list_range="Dynamic", linked_cell="Target")
+    sheet.set_control_value("Picker", 3)
+    path = tmp_path / "dynamic_names.xlsm"
+    app.save(path)
+    app = ExcelApplication.open(path, with_vba=False)
+    sheet = app.sheet(1)
+    sheet.set_value("K1", 2)
+    sheet.set_value("K2", "Sheet1!$J$1:$J$2")
+    sheet.set_control_value("Picker", 1)
+    sheet.set_control_value("Picker", 2)
+    assert sheet.control_items("Picker") == ["a", "b"]
+    assert sheet.value("H2") == 2
+    app.save(path)
+    inspect = '''Public Function Inspect() As String
+Dim cf As Object
+Set cf = ActiveSheet.Shapes("Picker").ControlFormat
+Inspect = cf.ListFillRange & "|" & cf.LinkedCell & "|" & CStr(cf.ListCount) & "|" & CStr(cf.Value) & "|" & CStr(Range("H2").Value)
+Range("K1").Value = 3
+Range("K2").Value = "Sheet1!$J$1:$J$3"
+cf.Value = 3
+Inspect = Inspect & "|" & CStr(cf.ListCount) & "|" & cf.List(3) & "|" & CStr(Range("H2").Value)
+End Function'''
+    with harness.ExcelSession(harness.HarnessConfig(lock_wait_s=45.0)) as excel:
+        excel.open_document(path)
+        result = excel.run_vba(inspect, "Inspect", timeout=120.0)
+        assert result.ok, f"{result.outcome}: {result.message}"
+        assert str(result.value) == "Dynamic|Target|2|2|2|3|c|3"
+
+
+@pytest.mark.parametrize("reference", ["index", "choose", "if", "indirect_r1c1"])
+def test_excel_reads_branching_named_controls(tmp_path: Path, reference: str) -> None:
+    harness = pytest.importorskip("pyvbaharness")
+    app = ExcelApplication()
+    app.add_workbook()
+    sources = {
+        "index": "INDEX(Sheet1!$J$1:$K$3,0,Sheet1!$M$1)",
+        "choose": "CHOOSE(Sheet1!$M$1,Sheet1!$J$1:$J$3,Sheet1!$K$1:$K$3)",
+        "if": "IF(Sheet1!$M$1=1,Sheet1!$J$1:$J$3,Sheet1!$K$1:$K$3)",
+        "indirect_r1c1": 'INDIRECT(""Sheet1!R1C""&(9+Sheet1!$M$1)&"":R3C""&(9+Sheet1!$M$1),FALSE)',
+    }
+    targets = {
+        "index": "INDEX(Sheet1!$H$1:$H$2,Sheet1!$M$2)",
+        "choose": "CHOOSE(Sheet1!$M$2,Sheet1!$H$1,Sheet1!$H$2)",
+        "if": "IF(Sheet1!$M$2=1,Sheet1!$H$1,Sheet1!$H$2)",
+        "indirect_r1c1": 'INDIRECT(""Sheet1!R""&Sheet1!$M$2&""C8"",FALSE)',
+    }
+    app.add_module(f'''Public Sub Build()
+ActiveWorkbook.Names.Add "Choices", "={sources[reference]}"
+ActiveWorkbook.Names.Add "Target", "={targets[reference]}"
+End Sub''', name="Builder")
+    app.run("Build")
+    sheet = app.sheet(1)
+    for address, value in {"J1": "a", "J2": "b", "J3": "c", "K1": "x", "K2": "y", "K3": "z",
+                           "M1": 1, "M2": 1}.items():
+        sheet.set_value(address, value)
+    sheet.add_form_control(6, name="Picker")
+    sheet.update_control("Picker", list_range="Choices", linked_cell="Target")
+    sheet.set_control_value("Picker", 3)
+    path = tmp_path / "branching_names.xlsm"
+    app.save(path)
+    app = ExcelApplication.open(path, with_vba=False)
+    sheet = app.sheet(1)
+    sheet.set_value("M1", 2)
+    sheet.set_value("M2", 2)
+    sheet.set_control_value("Picker", 2)
+    assert sheet.control_items("Picker") == ["x", "y", "z"]
+    assert sheet.value("H1") == 3
+    assert sheet.value("H2") == 2
+    app.save(path)
+    inspect = '''Public Function Inspect() As String
+Dim cf As Object
+Set cf = ActiveSheet.Shapes("Picker").ControlFormat
+Inspect = cf.ListFillRange & "|" & cf.LinkedCell & "|" & cf.List(2) & "|" & CStr(cf.Value) & "|" & CStr(Range("H2").Value)
+Range("M1").Value = 1
+Range("M2").Value = 1
+cf.Value = 1
+Inspect = Inspect & "|" & cf.List(2) & "|" & CStr(Range("H1").Value)
+End Function'''
+    with harness.ExcelSession(harness.HarnessConfig(lock_wait_s=45.0)) as excel:
+        excel.open_document(path)
+        result = excel.run_vba(inspect, "Inspect", timeout=120.0)
+        assert result.ok, f"{result.outcome}: {result.message}"
+        assert str(result.value) == "Choices|Target|y|2|2|b|1"
+
+
+def test_excel_find_on_headless_saved_cells(tmp_path: Path) -> None:
+    harness = pytest.importorskip("pyvbaharness")
+    app = ExcelApplication()
+    app.add_workbook()
+    setup = '''Public Sub Build()
+Range("A1").Value = "Alpha"
+Range("B1").Value = "alphabet"
+Range("A2").Value = "alpha"
+Range("C3").Formula = "=1/2"
+Range("C3").NumberFormat = "0%"
+End Sub'''
+    report = '''Public Function Report() As String
+Dim hit As Object
+Set hit = Range("A1:C3").Find("alpha", , xlFormulas, xlPart, xlByRows, xlNext, False, False, False)
+Report = hit.Address
+Set hit = Range("A1:C3").FindNext(hit)
+Report = Report & "|" & hit.Address
+Set hit = Range("A1:C3").Find("50%", LookIn:=xlValues)
+Report = Report & "|" & hit.Address
+End Function'''
+    app.add_module(setup, name="Builder")
+    app.add_module(report, name="Probe")
+    app.run("Build")
+    expected = app.run("Report")
+    assert expected == "$B$1|$A$2|$C$3"
+    path = tmp_path / "find.xlsm"
+    app.save(path)
+    reopened = ExcelApplication.open(path)
+    reopened.add_module(report, name="Probe")
+    assert reopened.run("Report") == expected
+    with harness.ExcelSession(harness.HarnessConfig(lock_wait_s=45.0)) as excel:
+        excel.open_document(path)
+        result = excel.run_vba(report, "Report", timeout=120.0)
+        assert result.ok, result.message
+        assert result.value == expected
+
+
+@pytest.mark.parametrize("across", [False, True])
+@pytest.mark.parametrize("unmerge", [False, True])
+def test_excel_reads_merged_ranges(tmp_path: Path, across: bool, unmerge: bool) -> None:
+    harness = pytest.importorskip("pyvbaharness")
+    app = ExcelApplication()
+    app.add_workbook()
+    app.add_module(f'''Public Sub Build()
+Range("C2").Value = "first"
+Range("B3").Value = "second"
+Range("B2:D4").Merge Across:={str(across)}
+If {str(unmerge)} Then Range("C3").UnMerge
+End Sub''', name="Builder")
+    report = '''Public Function Report() As String
+Report = Range("B2").MergeArea.Address & "|" & Range("C3").MergeArea.Address & "|" & CStr(Range("B2").Value) & "|" & CStr(Range("B3").Value)
+End Function'''
+    app.add_module(report, name="Probe")
+    app.run("Build")
+    expected = app.run("Report")
+    path = tmp_path / "merged_ranges.xlsm"
+    app.save(path)
+    reopened = ExcelApplication.open(path, with_vba=False)
+    reopened.add_module(report, name="Probe")
+    assert reopened.run("Report") == expected
+    with harness.ExcelSession(harness.HarnessConfig(lock_wait_s=45.0)) as excel:
+        excel.open_document(path)
+        result = excel.run_vba(report, "Report", timeout=120.0)
+        assert result.ok, result.message
+        assert result.value == expected
+
+
+def test_excel_reads_r1c1_formulas(tmp_path: Path) -> None:
+    harness = pytest.importorskip("pyvbaharness")
+    app = ExcelApplication()
+    app.add_workbook()
+    app.add_module('''Sub Build()
+Range("A1:A3").Value = 7
+Range("B1:B3").FormulaR1C1 = "=RC[-1]*2+R1C1"
+Application.Calculate
+End Sub''', name="Builder")
+    report = '''Function Report() As String
+Report = Range("B3").Formula & "|" & Range("B3").FormulaR1C1 & "|" & CStr(Range("B3").Value)
+End Function'''
+    app.add_module(report, name="Probe")
+    app.run("Build")
+    expected = app.run("Report")
+    assert expected == "=A3*2+$A$1|=RC[-1]*2+R1C1|21"
+    path = tmp_path / "r1c1.xlsm"
+    app.save(path)
+    with harness.ExcelSession(harness.HarnessConfig(lock_wait_s=45.0)) as excel:
+        excel.open_document(path)
+        result = excel.run_vba(report, "Report", timeout=120.0)
+        assert result.ok, result.message
+        assert result.value == expected
+
+
+@pytest.mark.parametrize("name", ["row_matrix", "tiled", "errors", "lower_bounds"])
+@pytest.mark.parametrize("style", ["a1", "r1c1"])
+def test_excel_reads_formula_arrays(tmp_path: Path, name: str, style: str) -> None:
+    import json
+
+    harness = pytest.importorskip("pyvbaharness")
+    filename = "formula_a1_arrays.json" if style == "a1" else "formula_arrays.json"
+    records = json.loads((Path(__file__).parent / "fixtures" / filename).read_text())
+    record = next(r for r in records if r["name"] == name)
+    app = ExcelApplication()
+    app.add_workbook()
+    body = record["body"]
+    app.add_module('Public Function Build() As String\nDim cell As Object, n As Long\n'
+                   + body.replace("Report", "Build") + 'End Function', name="Builder")
+    assert app.run("Build") == record["reported"]
+    path = tmp_path / "formula_arrays.xlsm"
+    app.save(path)
+    report = ('Public Function Report() As String\nDim cell As Object, n As Long\n'
+              + body[body.index('Report = CStr(n)'):] + 'End Function')
+    with harness.ExcelSession(harness.HarnessConfig(lock_wait_s=45.0)) as excel:
+        excel.open_document(path)
+        result = excel.run_vba(report, "Report", timeout=120.0)
+        assert result.ok, result.message
+        assert result.value == record["reported"]
+
+
+@pytest.mark.parametrize("name", ["overlap_down", "tile", "blank_tail", "tiled_formula", "format"])
+def test_excel_reads_copied_ranges(tmp_path: Path, name: str) -> None:
+    import json
+
+    harness = pytest.importorskip("pyvbaharness")
+    records = json.loads((Path(__file__).parent / "fixtures/range_copy.json").read_text())
+    record = next(r for r in records if r["name"] == name)
+    app = ExcelApplication()
+    app.add_workbook()
+    body = record["body"]
+    app.add_module('Function Build() As String\nDim cell As Object, n As Long\n'
+                   + body.replace("Report", "Build") + 'End Function', name="Builder")
+    assert app.run("Build") == record["reported"]
+    path = tmp_path / "copied_ranges.xlsm"
+    app.save(path)
+    report = ('Function Report() As String\nDim cell As Object, n As Long\n'
+              + body[body.index('Report = CStr(n)'):] + 'End Function')
+    with harness.ExcelSession(harness.HarnessConfig(lock_wait_s=45.0)) as excel:
+        excel.open_document(path)
+        result = excel.run_vba(report, "Report", timeout=120.0)
+        assert result.ok, result.message
+        assert result.value == record["reported"]
+
+
+@pytest.mark.parametrize("name", ["insert_row", "delete_row", "insert_column", "delete_columns"])
+def test_excel_reads_structural_edits(tmp_path: Path, name: str) -> None:
+    import json
+
+    harness = pytest.importorskip("pyvbaharness")
+    records = json.loads((Path(__file__).parent / "fixtures/range_edit.json").read_text())
+    record = next(r for r in records if r["name"] == name)
+    app = ExcelApplication()
+    app.add_workbook()
+    body = record["body"]
+    app.add_module('Function Build() As String\nDim cell As Object, n As Long\n'
+                   + body.replace("Report", "Build") + 'End Function', name="Builder")
+    assert app.run("Build") == record["reported"]
+    path = tmp_path / "structural_edits.xlsm"
+    app.save(path)
+    report = ('Function Report() As String\nDim cell As Object, n As Long\n'
+              + 'Worksheets("Sheet1").Activate\n' + body[body.index('Report = CStr(n)'):] + 'End Function')
+    with harness.ExcelSession(harness.HarnessConfig(lock_wait_s=45.0)) as excel:
+        excel.open_document(path)
+        result = excel.run_vba(report, "Report", timeout=120.0)
+        assert result.ok, result.message
+        assert result.value == record["reported"]
+
+
+@pytest.mark.parametrize("stage", ["created", "updated", "deleted"])
+def test_excel_named_range_crud_persistence(tmp_path: Path, stage: str) -> None:
+    harness = pytest.importorskip("pyvbaharness")
+    app = ExcelApplication()
+    app.add_workbook()
+    app.sheet(1).set_value("A1", 10)
+    app.sheet(1).set_value("B1", 20)
+    app.add_named_range("GlobalName", "=Sheet1!$A$1", visible=False, comment="global")
+    app.sheet(1).add_named_range("LocalName", "=$B$1", comment="local")
+    app.sheet(1).set_value("C1", "=GlobalName+LocalName")
+    path = tmp_path / "named_ranges.xlsm"
+    app.save(path)
+    app = ExcelApplication.open(path, with_vba=False)
+    if stage != "created":
+        app.update_named_range("GlobalName", new_name="RenamedGlobal", refers_to="=Sheet1!$B$1", visible=True, comment="changed")
+        app.sheet(1).update_named_range("LocalName", new_name="RenamedLocal", refers_to="=$A$1", visible=False)
+    if stage == "deleted":
+        app.remove_named_range("RenamedGlobal")
+        app.sheet(1).remove_named_range("RenamedLocal")
+    global_name, local_name = ("GlobalName", "LocalName") if stage == "created" else ("RenamedGlobal", "RenamedLocal")
+    # Excel may create an internal _xlfn.SINGLE compatibility name when it
+    # opens a formula containing a deleted name. Count the user definitions.
+    report = '''Function Report() As String
+Dim nm As Object, userCount As Long
+For Each nm In ThisWorkbook.Names
+If Left(nm.Name, 6) <> "_xlfn." Then userCount = userCount + 1
+Next nm
+Report = CStr(userCount) & "|" & CStr(Worksheets(1).Names.Count) & "|" & Range("C1").Formula & "|" & CStr(Range("C1").Value)
+'''
+    if stage != "deleted":
+        report += f'''Report = Report & "|" & ThisWorkbook.Names("{global_name}").RefersTo & "|" & CStr(ThisWorkbook.Names("{global_name}").Visible) & "|" & ThisWorkbook.Names("{global_name}").Comment
+Report = Report & "|" & Worksheets(1).Names("{local_name}").Name & "|" & Worksheets(1).Names("{local_name}").RefersTo
+'''
+    report += "End Function"
+    app.add_module(report, name="Probe")
+    expected = app.run("Report")
+    app.save(path)
+    with harness.ExcelSession(harness.HarnessConfig(lock_wait_s=45.0)) as excel:
+        excel.open_document(path)
+        result = excel.run_vba(report, "Report", timeout=120.0)
+        assert result.ok, result.message
+        assert result.value == expected
+
+
+@pytest.mark.parametrize("reopen", [False, True])
+def test_excel_cross_workbook_copy_persistence(tmp_path: Path, reopen: bool) -> None:
+    harness = pytest.importorskip("pyvbaharness")
+    app = ExcelApplication()
+    app.add_workbook()
+    source = app.sheet(1)
+    source.set_value("A1", 10)
+    source.set_value("B1", "=A1+1")
+    source.add_named_range("LocalAmount", "=$A$1")
+    destination = app.add_workbook()
+    path = tmp_path / "copied_book.xlsx"
+    if reopen:
+        app.save(path, workbook=destination)
+        destination.Close(SaveChanges=False)
+        destination = app.open_workbook(path)
+    source.copy(after=app.sheet(1, workbook=destination))
+    source.copy_range("A1:B1", app.sheet(1, workbook=destination), "C3")
+    app.save(path, workbook=destination)
+    report = '''Function Report() As String
+Report = CStr(ThisWorkbook.Worksheets.Count) & "|" & Worksheets(2).Name & "|" & CStr(Worksheets(2).Range("B1").Value) & "|" & Worksheets(1).Range("D3").Formula & "|" & CStr(Worksheets(1).Range("D3").Value) & "|" & Worksheets(2).Names("LocalAmount").RefersTo
+End Function'''
+    with harness.ExcelSession(harness.HarnessConfig(lock_wait_s=45.0)) as excel:
+        excel.open_document(path)
+        result = excel.run_vba(report, "Report", timeout=120)
+        assert result.ok, result.message
+        assert result.value == "2|Sheet1 (2)|11|=C3+1|11|='Sheet1 (2)'!$A$1"
+
+
+@pytest.mark.parametrize("local", [False, True])
+def test_excel_range_copy_name_deconfliction(tmp_path: Path, local: bool) -> None:
+    harness = pytest.importorskip("pyvbaharness")
+    app = ExcelApplication()
+    app.add_workbook()
+    source = app.sheet(1)
+    names = source if local else app
+    names.add_named_range("Amount", "=Sheet1!$A$1", visible=False, comment="imported")
+    names.add_named_range("Total", "=Amount")
+    source.set_value("B1", "=Total+Amount")
+    app.add_workbook()
+    destination = app.sheet(1)
+    destination.set_value("A1", 7)
+    app.add_named_range("Amount", "=99")
+    source.copy_range("B1", destination, "D3", name_conflict="rename")
+    path = tmp_path / "deconflicted.xlsx"
+    app.save(path)
+    report = '''Function Report() As String
+Report = Range("D3").Formula & "|" & CStr(Range("D3").Value) & "|" & ThisWorkbook.Names("Amount").RefersTo
+End Function'''
+    with harness.ExcelSession(harness.HarnessConfig(lock_wait_s=45.0)) as excel:
+        excel.open_document(path)
+        result = excel.run_vba(report, "Report", timeout=120)
+        assert result.ok, result.message
+        assert result.value == "=Total+Amount_2|14|=99"
+
+
+@pytest.mark.parametrize("cross_book", [False, True])
+def test_excel_worksheet_move_persistence(tmp_path: Path, cross_book: bool) -> None:
+    harness = pytest.importorskip("pyvbaharness")
+    app = ExcelApplication()
+    app.add_workbook()
+    app.add_module('''Sub Build()
+Dim sh As Object
+Set sh = ThisWorkbook.Worksheets(1)
+sh.Range("A1").Value = 7
+sh.Names.Add "LocalAmount", "=Sheet1!$A$1"
+sh.Range("B1").Formula = "=LocalAmount+1"
+ThisWorkbook.Worksheets.Add(After:=sh).Name = "Other"
+End Sub''', name="Builder")
+    app.run("Build")
+    path = tmp_path / "moved.xlsx"
+    app.save(path)
+    statement = ('Set dst = Workbooks.Add\nThisWorkbook.Worksheets(1).Move After:=dst.Worksheets(1)'
+                 if cross_book else 'ThisWorkbook.Worksheets(1).Move After:=ThisWorkbook.Worksheets(2)')
+    app.add_module('Sub Relocate()\nDim dst As Object\n' + statement + '\nEnd Sub', name="Mover")
+    app.run("Relocate")
+    app.save(path)
+    report = '''Function Report() As String
+Report = Worksheets(1).Name & "|" & Worksheets(2).Name & "|" & CStr(Worksheets(2).Range("B1").Value) & "|" & Worksheets(2).Names("LocalAmount").RefersTo
+End Function'''
+    with harness.ExcelSession(harness.HarnessConfig(lock_wait_s=45.0)) as excel:
+        excel.open_document(path)
+        result = excel.run_vba(report, "Report", timeout=120)
+        assert result.ok, result.message
+        expected = "Sheet1|Sheet1 (2)|8|='Sheet1 (2)'!$A$1" if cross_book else "Other|Sheet1|8|=Sheet1!$A$1"
+        assert result.value == expected
+
+
+def test_excel_reads_model_authored_formats(tmp_path: Path) -> None:
+    """Every formatting case the model writes reads back in Excel as Excel's own file of it does."""
+    import json
+
+    harness = pytest.importorskip("pyvbaharness")
+    fixture = json.loads((Path(__file__).parent / "fixtures" / "format" / "formats_answers.json").read_text())
+    cases: list[str] = fixture["cases"]
+    app = ExcelApplication()
+    app.add_workbook()
+    lines = ["Public Sub Build()", "Dim c As Object"]
+    for row, name in enumerate(cases, start=1):
+        lines += [f'Set c = ActiveSheet.Range("A{row}")', f'ActiveSheet.Range("B{row}").Value = "{name}"']
+        lines += [line.strip() for line in str(fixture["setups"][name]).splitlines()]
+    app.add_module("\n".join([*lines, "End Sub"]) + "\n", name="Builder")
+    app.run("Build")
+    path = tmp_path / "model_formats.xlsx"
+    app.save(path)
+    reader = (fixture["describe"] + "Public Function Report() As String\nDim row As Long\n"
+              f"For row = 1 To {len(cases)}\n"
+              'Report = Report & Describe(ActiveSheet.Cells(row, 1)) & "|"\nNext row\nEnd Function\n')
+    with harness.ExcelSession(harness.HarnessConfig(lock_wait_s=45.0)) as excel:
+        excel.open_document(path)
+        result = excel.run_vba(reader, "Report", timeout=240.0)
+        assert result.ok, result.message
+    reads: list[str] = fixture["reads"]
+    for name, described in zip(cases, str(result.value).split("|")[:-1], strict=True):
+        assert dict(zip(reads, described.split(";")[:-1], strict=True)) == fixture["answers"][name], name
+
+
+def test_excel_reads_model_authored_sizes(tmp_path: Path) -> None:
+    """Every row and column sizing case the model saves reads in Excel as Excel's own file of it does.
+
+    The model sizes rows and columns for a 96-DPI display; on any other
+    Excel rounds to other pixels, so the gate says so rather than fail.
+    """
+    import json
+
+    harness = pytest.importorskip("pyvbaharness")
+    fixture = json.loads((Path(__file__).parent / "fixtures" / "dimensions" / "dimensions_answers.json").read_text())
+    cases: list[dict[str, str]] = fixture["cases"]
+    app = ExcelApplication()
+    app.add_workbook()
+    lines = ["Public Sub Build()", "Dim ws As Object"]
+    for index, case in enumerate(cases):
+        lines.append("Set ws = ActiveWorkbook.Worksheets(1)" if index == 0 else
+                     "Set ws = ActiveWorkbook.Worksheets.Add(After:=ActiveWorkbook.Worksheets"
+                     "(ActiveWorkbook.Worksheets.Count))")
+        lines += [f'ws.Name = "{case["name"]}"', *case["setup"].splitlines()]
+    app.add_module("\n".join([*lines, "ActiveWorkbook.Worksheets(1).Activate", "End Sub"]) + "\n", name="Builder")
+    app.run("Build")
+    path = tmp_path / "model_sizes.xlsx"
+    app.save(path)
+    reader = (fixture["describe"] + "Public Function Report() As String\nDim ws As Object\n"
+              'Report = ActiveSheet.StandardHeight & "#"\n'
+              'For Each ws In ActiveWorkbook.Worksheets\nReport = Report & Describe(ws) & "|"\nNext ws\nEnd Function\n')
+    with harness.ExcelSession(harness.HarnessConfig(lock_wait_s=45.0)) as excel:
+        excel.open_document(path)
+        result = excel.run_vba(reader, "Report", timeout=240.0)
+        assert result.ok, result.message
+    standard, described = str(result.value).split("#", 1)
+    if standard != "15":
+        pytest.skip(f"Excel is on a display whose standard row is {standard}pt; the model emulates 96 DPI (15pt)")
+    for case, answer in zip(cases, described.split("|")[:-1], strict=True):
+        # A recorded_ case rests on row heights only Excel works out; the
+        # model saves those rows without one, and Excel does not always
+        # work it out again when it opens the file.
+        if not case["name"].startswith("recorded_"):
+            assert answer == case["answers"], case["name"]
+
+
+def _row_format_reads(name: str, reads: list[str]) -> str:
+    """The reads scripts/measure_row_formats.py made of one case: the used range first, then each read."""
+    lines = [f"Private Function {name}(ws As Object) As String", "Dim out As String, v As Variant",
+             "On Error Resume Next"]
+    for expression in ["ws.UsedRange.Address", *reads]:
+        lines += ["Err.Clear", "v = Empty", f"v = {expression}",
+                  'If Err.Number <> 0 Then out = out & "E" & Err.Number & ";" Else out = out & Show(v) & ";"']
+    return "\n".join([*lines, "On Error GoTo 0", f"{name} = out", "End Function"]) + "\n"
+
+
+def test_excel_reads_model_authored_row_formats(tmp_path: Path) -> None:
+    """Every row, column and sheet format case the model saves reads in Excel as Excel's own file of it does."""
+    import json
+
+    harness = pytest.importorskip("pyvbaharness")
+    fixture = json.loads((Path(__file__).parent / "fixtures" / "row_formats" / "row_formats.json").read_text())
+    cases = [case for case in fixture["cases"] if not case["name"].startswith("unmeasured_")]
+    app = ExcelApplication()
+    app.add_workbook()
+    lines = ["Public Sub Build()", "Dim ws As Object"]
+    for index, case in enumerate(cases):
+        lines.append("Set ws = ActiveWorkbook.Worksheets(1)" if index == 0 else
+                     "Set ws = ActiveWorkbook.Worksheets.Add(After:=ActiveWorkbook.Worksheets"
+                     "(ActiveWorkbook.Worksheets.Count))")
+        lines += [f'ws.Name = "{case["name"]}"', *case["setup"].splitlines()]
+    app.add_module("\n".join([*lines, "ActiveWorkbook.Worksheets(1).Activate", "End Sub"]) + "\n", name="Builder")
+    app.run("Build")
+    path = tmp_path / "model_row_formats.xlsx"
+    app.save(path)
+    reader = fixture["helper"] + "".join(_row_format_reads(f"Reads{index}", case["reads"])
+                                         for index, case in enumerate(cases))
+    reader += ("Public Function Report() As String\n"
+               + "".join(f'Report = Report & Reads{index}(ActiveWorkbook.Worksheets({index + 1})) & "|"\n'
+                         for index in range(len(cases))) + "End Function\n")
+    with harness.ExcelSession(harness.HarnessConfig(lock_wait_s=45.0)) as excel:
+        excel.open_document(path)
+        result = excel.run_vba(reader, "Report", timeout=240.0)
+        assert result.ok, result.message
+    for case, answer in zip(cases, str(result.value).split("|")[:-1], strict=True):
+        assert answer == case["after"], case["name"]
+
+
+def test_excel_reads_model_typed_cells(tmp_path: Path) -> None:
+    """Cells the model typed read in Excel -- type, number, format, prefix and what shows -- as Excel's own do."""
+    import json
+
+    from pyopenvba.apps.excel import _typing
+
+    harness = pytest.importorskip("pyvbaharness")
+    folder = Path(__file__).parent / "fixtures" / "typing"
+    fixture = json.loads((folder / "typing.json").read_text(encoding="utf-8"))
+    lines = ["Public Sub Build()", "Dim c As Object"]
+    for row, steps in enumerate(fixture["cases"], start=1):
+        lines.append(f"Set c = Cells({row}, 1)")
+        lines += [step if step.startswith("c.") else f"c.Value = {step}" for step in steps]
+    app = ExcelApplication()
+    app.add_workbook()
+    app.add_module("\n".join([*lines, "End Sub"]) + "\n", name="Builder")
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(_typing, "_this_year", lambda: fixture["year"])
+        app.run("Build")
+    path = tmp_path / "model_typing.xlsx"
+    app.save(path)
+    count = len(fixture["cases"])
+    reader = (
+        "Private Function ReadAll(ws As Object) As String\n"
+        "Dim out As String, c As Object, i As Long\n"
+        f"For i = 1 To {count}\n"
+        "Set c = ws.Cells(i, 1)\n"
+        'out = out & TypeName(c.Value) & "~" & CStr(c.Value2) & "~" & c.NumberFormat & "~" & '
+        'c.PrefixCharacter & "~" & c.Text & "|"\n'
+        "Next\nReadAll = out\nEnd Function\n"
+        "Public Function Report() As String\n"
+        "Dim ours As Object, theirs As Object\n"
+        "Application.DisplayAlerts = False\n"
+        "Set ours = ActiveWorkbook\n"
+        f'Set theirs = Workbooks.Open("{folder / "typing.xlsx"}", ReadOnly:=True)\n'
+        'Report = ReadAll(ours.Worksheets(1)) & "<ours|theirs>" & ReadAll(theirs.Worksheets(1))\n'
+        "theirs.Close False\nEnd Function\n"
+    )
+    with harness.ExcelSession(harness.HarnessConfig(lock_wait_s=45.0)) as excel:
+        excel.open_document(path)
+        result = excel.run_vba(reader, "Report", timeout=240.0)
+        assert result.ok, result.message
+    ours, theirs = str(result.value).split("<ours|theirs>", 1)
+    for steps, mine, excels in zip(fixture["cases"], ours.split("|")[:count], theirs.split("|")[:count], strict=True):
+        assert mine == excels, steps
+
+
+def test_excel_reads_the_filters_this_wrote(tmp_path: Path) -> None:
+    """Every kind of filter tests/fixtures/autofilter_file measured, made by the model and opened in Excel."""
+    import json
+
+    harness = pytest.importorskip("pyvbaharness")
+    record = json.loads((Path(__file__).parent / "fixtures" / "autofilter_file" / "autofilter_file.json")
+                        .read_text(encoding="utf-8"))
+    build = ["Public Sub Build()", "Dim wb As Object, ws As Object", "Set wb = ActiveWorkbook"]
+    bodies: list[str] = []
+    for index, case in enumerate(record["cases"]):
+        build += ["Set ws = wb.Worksheets(1)" if index == 0 else
+                  "Set ws = wb.Worksheets.Add(After:=wb.Worksheets(wb.Worksheets.Count))",
+                  f'ws.Name = "{case["name"]}"', f"Case{index} ws"]
+        bodies.append("\n".join([f"Private Sub Case{index}(ws As Object)", "Dim v As Variant",
+                                 *(record["table"] + case["setup"]).splitlines(), "End Sub"]) + "\n")
+    build += ["End Sub"]
+    app = ExcelApplication()
+    app.add_workbook()
+    app.add_module("\n".join(build) + "\n" + "".join(bodies), name="Builder")
+    app.run("Build")
+    path = tmp_path / "filters.xlsx"
+    app.save(path)
+    reader = (record["helper"] + "Public Function Report() As String\nDim ws As Object, out As String\n"
+              "For Each ws In ActiveWorkbook.Worksheets\nout = out & ws.Name & \"^\" & Dump(ws) & \"|\"\nNext\n"
+              "Report = out\nEnd Function\n")
+    with harness.ExcelSession(harness.HarnessConfig(lock_wait_s=45.0)) as excel:
+        excel.open_document(path)
+        result = excel.run_vba(reader, "Report", timeout=240.0)
+        assert result.ok, result.message
+    read = dict(one.split("^", 1) for one in str(result.value).split("|") if one)
+    for case in record["cases"]:
+        assert read[case["name"]] == case["reopened"], case["name"]
+
+
+def test_excel_reads_the_renamed_table_workbooks_this_wrote(tmp_path: Path) -> None:
+    """Every case tests/fixtures/rename_tables.json measured, a sheet renamed in a workbook that holds a table, made by
+    the model and saved: Excel opens each file and reads the sheets, the table and every cell as it read its own."""
+    import json
+
+    harness = pytest.importorskip("pyvbaharness")
+    record = json.loads((Path(__file__).parent / "fixtures" / "rename_tables.json").read_text(encoding="utf-8"))
+    paths: dict[str, Path] = {}
+    for name, case in record["cases"].items():
+        paths[name] = tmp_path / f"{name}.xlsx"
+        app = ExcelApplication()
+        app.add_workbook()
+        app.add_module(case["code"], name="Probe")
+        assert app.run(f"Case_{name}", str(paths[name])) == case["answer"]
+    read: dict[str, str] = {}
+    with harness.ExcelSession(harness.HarnessConfig(lock_wait_s=45.0)) as excel:
+        for name, case in record["cases"].items():
+            reader = (record["helper"] + "Public Function Report() As String\n"
+                      "    Dim wb As Object, ws As Object, other As Object, t As Object, out As String\n"
+                      "    Set wb = ActiveWorkbook\n    Set ws = wb.Worksheets(1)\n    Set other = wb.Worksheets(2)\n"
+                      "    Set t = ws.ListObjects(1)\n"
+                      '    out = ws.Name & "|" & other.Name & "|" & t.Name & "|" & t.Range.Address\n'
+                      + "".join(f'    out = out & "|" & Shown({cell})\n' for cell in case["cells"])
+                      + "    Report = out\nEnd Function\n")
+            excel.open_document(paths[name])
+            result = excel.run_vba(reader, "Report", timeout=120.0)
+            assert result.ok, result.message
+            read[name] = str(result.value)
+    for name, case in record["cases"].items():
+        assert read[name] == case["answer"], name
+
+
+def test_excel_reads_the_text_filters_this_wrote(tmp_path: Path) -> None:
+    """Filters over text beyond ASCII (tests/fixtures/filter_text.json), an =, a wildcard pattern and a list, made by
+    the model and saved: Excel opens the file and reads the rows each hides and its criteria as the model has them."""
+    import json
+
+    harness = pytest.importorskip("pyvbaharness")
+    record = json.loads((Path(__file__).parent / "fixtures" / "filter_text.json").read_text(encoding="utf-8"))
+
+    def text(value: str) -> str:
+        return " & ".join(f"ChrW({ord(character)})" for character in value)
+
+    cases = [(record["values"], text("=\u00c6sop")), (record["values"], text("\u00e6*")),
+             (record["saved_list"], "Array(" + ", ".join(text(one) for one in record["saved_list"]) + "), "
+              "Operator:=xlFilterValues")]
+    build = ["Public Sub Build()", "Dim wb As Object, ws As Object", "Set wb = ActiveWorkbook"]
+    for index, (values, criteria) in enumerate(cases):
+        build += ["Set ws = wb.Worksheets(1)" if index == 0 else
+                  "Set ws = wb.Worksheets.Add(After:=wb.Worksheets(wb.Worksheets.Count))",
+                  'ws.Columns("A").NumberFormat = "@"', 'ws.Cells(1, 1).Value = "Word"',
+                  *(f"ws.Cells({row}, 1).Value = {text(value)}" for row, value in enumerate(values, start=2)),
+                  f'ws.Range("A1:A{len(values) + 1}").AutoFilter Field:=1, Criteria1:={criteria}']
+    build += ["End Sub"]
+    reader = ('Private Function Coded(v As Variant) As String\n    Dim i As Long, out As String\n'
+              '    If IsArray(v) Then\n        For i = LBound(v) To UBound(v)\n'
+              '            out = out & Coded(v(i)) & ","\n        Next\n        Coded = out\n        Exit Function\n'
+              '    End If\n    For i = 1 To Len(v)\n        out = out & Hex(AscW(Mid(v, i, 1)) And &HFFFF&) & "."\n'
+              '    Next\n    Coded = out\nEnd Function\n\n'
+              'Public Function Report() As String\n    Dim ws As Object, out As String, r As Long\n'
+              '    For Each ws In ActiveWorkbook.Worksheets\n'
+              '        For r = 2 To ws.UsedRange.Rows.Count\n'
+              '            If ws.Rows(r).Hidden Then out = out & "0" Else out = out & "1"\n        Next\n'
+              '        out = out & ";" & Coded(ws.AutoFilter.Filters(1).Criteria1) & "|"\n    Next\n'
+              '    Report = out\nEnd Function\n')
+    app = ExcelApplication()
+    app.add_workbook()
+    app.add_module("\n".join(build) + "\n", name="Builder")
+    app.add_module(reader, name="Reader")
+    app.run("Build")
+    made = str(app.run("Report"))
+    path = tmp_path / "text_filters.xlsx"
+    app.save(path)
+    with harness.ExcelSession(harness.HarnessConfig(lock_wait_s=45.0)) as excel:
+        excel.open_document(path)
+        result = excel.run_vba(reader, "Report", timeout=240.0)
+        assert result.ok, result.message
+    assert str(result.value) == made
+    assert made.split("|")[2].split(";")[0] == record["saved_kept"]
+
+
+def test_excel_reads_the_sheet_groups_this_saved(tmp_path: Path) -> None:
+    """A workbook saved with sheets grouped, and a new workbook a group copy made (tests/fixtures/sheet_groups.json,
+    sheet_group_moves.json), made by the model and saved: Excel opens each, the first with the group selected as
+    Excel's own was, the second with the copied sheets and their formulas as the model has them."""
+    import json
+
+    harness = pytest.importorskip("pyvbaharness")
+    fixtures = Path(__file__).parent / "fixtures"
+    moves = json.loads((fixtures / "sheet_group_moves.json").read_text(encoding="utf-8"))
+    groups = json.loads((fixtures / "sheet_groups.json").read_text(encoding="utf-8"))
+    grouped = tmp_path / "grouped.xlsx"
+    app = ExcelApplication()
+    app.add_workbook()
+    app.add_module(moves["saved_code"], name="Probe")
+    app.run("Saved", str(grouped))
+    copied = tmp_path / "copied.xlsx"
+    maker = (groups["helper"] + "Public Function Make(path As String) As String\n    Dim wb As Object\n"
+             '    Set wb = Fresh()\n    wb.Sheets(Array("Two", "One")).Copy\n    Make = Listed(ActiveWorkbook)\n'
+             "    ActiveWorkbook.SaveAs path, 51\nEnd Function\n")
+    app = ExcelApplication()
+    app.add_workbook()
+    app.add_module(maker, name="Maker")
+    made = str(app.run("Make", str(copied)))
+    reader = (groups["helper"] + "Public Function Read() As String\n    Read = Listed(ActiveWorkbook)\nEnd Function\n")
+    with harness.ExcelSession(harness.HarnessConfig(lock_wait_s=45.0)) as excel:
+        excel.new_document()
+        result = excel.run_vba(moves["saved_code"], "Reopened", [str(grouped)], timeout=120.0)
+        assert result.ok, result.message
+        assert str(result.value) == moves["reopened"]
+        excel.open_document(copied)
+        result = excel.run_vba(reader, "Read", timeout=120.0)
+        assert result.ok, result.message
+        assert str(result.value) == made
+
+
+def test_excel_reads_the_cell_shifts_this_made(tmp_path: Path) -> None:
+    """Cells tests/fixtures/cell_shifts.json shifted, made by the model, saved, and opened in Excel one by one."""
+    import json
+
+    harness = pytest.importorskip("pyvbaharness")
+    record = json.loads((Path(__file__).parent / "fixtures" / "cell_shifts.json").read_text(encoding="utf-8"))
+    chosen = ("del_up_b3b4", "del_up_b2b6", "ins_down_b3c4", "del_left_b3c5", "ins_right_a5", "del_default_b3b4",
+              "ins_down_formats", "filter_ins_a3c3", "filter_del_header", "filter_ins_right_a1")
+    layouts = [layout for layout in record["layouts"] if layout["name"] in chosen]
+    paths: list[Path] = []
+    for layout in layouts:
+        code = ["Public Sub Build()", "Dim ws As Object, other As Object, r As Long, c As Long",
+                "Set ws = ActiveWorkbook.Worksheets(1)", 'ws.Name = "Grid"',
+                "Set other = ActiveWorkbook.Worksheets.Add(After:=ws)", 'other.Name = "Other"',
+                *record["grid"].splitlines(), *layout["setup"].splitlines(), "End Sub"]
+        app = ExcelApplication()
+        app.add_workbook()
+        app.add_module("\n".join(code) + "\n", name="Builder")
+        app.run("Build")
+        path = tmp_path / f"{layout['name']}.xlsx"
+        app.save(path)
+        paths.append(path)
+    reader = record["helper"] + 'Public Function Report() As String\nReport = Dump(Worksheets("Grid"))\nEnd Function\n'
+    read: dict[str, str] = {}
+    with harness.ExcelSession(harness.HarnessConfig(lock_wait_s=45.0)) as excel:
+        for layout, path in zip(layouts, paths, strict=True):
+            excel.open_document(path)
+            result = excel.run_vba(reader, "Report", timeout=120.0)
+            assert result.ok, result.message
+            read[layout["name"]] = str(result.value)
+    for layout in layouts:
+        assert read[layout["name"]] == layout["answers"], layout["name"]
+
+
+def test_excel_reads_the_filtered_edits_this_made(tmp_path: Path) -> None:
+    """Every edit tests/fixtures/autofilter_edits.json measured, made by the model, saved and opened in Excel."""
+    import json
+
+    harness = pytest.importorskip("pyvbaharness")
+    record = json.loads((Path(__file__).parent / "fixtures" / "autofilter_edits.json").read_text(encoding="utf-8"))
+    layouts = record["layouts"]
+    build = ["Public Sub Build()", "Dim wb As Object, ws As Object", "Set wb = ActiveWorkbook"]
+    # Every sheet is named before any layout runs, a copy's destination beside its sheet as the copy would add it:
+    # the model renames no sheet once a formula holds a qualified error, which some layouts leave.
+    added = 'Set dest = ws.Parent.Worksheets.Add(After:=ws)\ndest.Name = ws.Name & "_to"\n'
+    for index, layout in enumerate(layouts):
+        build += ["Set ws = wb.Worksheets(1)" if index == 0 else
+                  "Set ws = wb.Worksheets.Add(After:=wb.Worksheets(wb.Worksheets.Count))",
+                  f'ws.Name = "{layout["name"][:28]}"']
+        if added in layout["setup"]:
+            build += [f'wb.Worksheets.Add(After:=ws).Name = "{layout["name"][:28]}_to"']
+    bodies: list[str] = []
+    for index, layout in enumerate(layouts):
+        setup = layout["setup"].replace(added, 'Set dest = ws.Parent.Worksheets(ws.Name & "_to")\n')
+        build += [f'Set ws = wb.Worksheets("{layout["name"][:28]}")', "ws.Activate", f"Case{index} ws"]
+        bodies.append("\n".join([f"Private Sub Case{index}(ws As Object)", "Dim v As Variant, dest As Object",
+                                 "On Error Resume Next", *(record["table"] + setup).splitlines(),
+                                 "End Sub"]) + "\n")
+    build += ["End Sub"]
+    app = ExcelApplication()
+    app.add_workbook()
+    app.add_module(record["helper"] + "\n".join(build) + "\n" + "".join(bodies), name="Builder")
+    app.run("Build")
+    path = tmp_path / "filtered_edits.xlsx"
+    app.save(path)
+    reader = (record["helper"] + "Public Function Report() As String\nDim ws As Object, out As String\n"
+              "For Each ws In ActiveWorkbook.Worksheets\nout = out & ws.Name & \"^\" & Dump(ws) & \"|\"\nNext\n"
+              "Report = out\nEnd Function\n")
+    with harness.ExcelSession(harness.HarnessConfig(lock_wait_s=45.0)) as excel:
+        excel.open_document(path)
+        result = excel.run_vba(reader, "Report", timeout=240.0)
+        assert result.ok, result.message
+    read = dict(one.split("^", 1) for one in str(result.value).split("|") if one)
+    for layout in layouts:
+        # What Excel read after the edit, past the error and the value the setup left.
+        assert read[layout["name"][:28]] == "hidden=" + layout["answers"].split(";hidden=", 1)[1], layout["name"]
+
+
+def test_excel_reads_the_table_filters_this_wrote(tmp_path: Path) -> None:
+    """Every table filter tests/fixtures/table_autofilter measured, made by the model, saved and opened in Excel,
+    which reads each sheet as it read its own file."""
+    import json
+
+    from test_excel_table_autofilter import UNSUPPORTED, saved_layouts
+
+    harness = pytest.importorskip("pyvbaharness")
+    record = json.loads((Path(__file__).parent / "fixtures" / "table_autofilter" / "table_autofilter.json")
+                        .read_text(encoding="utf-8"))
+    path = tmp_path / "table_filters.xlsx"
+    saved_layouts(path)
+    reader = (record["helper"] + record["dump"] + "Public Function Report() As String\nDim ws As Object, out As String\n"
+              "For Each ws In ActiveWorkbook.Worksheets\nout = out & ws.Name & \"^\" & TableDump(ws) & \"|\"\nNext\n"
+              "Report = out\nEnd Function\n")
+    with harness.ExcelSession(harness.HarnessConfig(lock_wait_s=45.0)) as excel:
+        excel.open_document(path)
+        result = excel.run_vba(reader, "Report", timeout=240.0)
+        assert result.ok, result.message
+    read = dict(one.split("^", 1) for one in str(result.value).split("|") if one)
+
+    def named(dump: str) -> str:
+        return re.sub(r"\[Table\d+ ", "[Table ", dump)
+
+    for layout in record["layouts"]:
+        if layout["name"] not in UNSUPPORTED:
+            assert named(read[layout["name"][:31]]) == named(layout["reopened"]), layout["name"]
+
+
+def test_excel_reads_the_colour_sorts_this_wrote(tmp_path: Path) -> None:
+    """Every colour sort tests/fixtures/sort_colour measured, made by the model, saved and opened in Excel, which
+    reads each sheet, and sorts it again, as it did its own file."""
+    import json
+
+    from test_excel_sort_colour import saved_layouts
+
+    harness = pytest.importorskip("pyvbaharness")
+    record = json.loads((Path(__file__).parent / "fixtures" / "sort_colour" / "sort_colour.json")
+                        .read_text(encoding="utf-8"))
+    path = tmp_path / "colour_sorts.xlsx"
+    saved_layouts(path)
+    reader = (record["helper"] + "Public Function Report() As String\nDim ws As Object, out As String\n"
+              "For Each ws In ActiveWorkbook.Worksheets\nout = out & ws.Name & \"^\" & Dump(ws) & \"|\"\nNext\n"
+              "out = out & \"#\"\nOn Error Resume Next\nFor Each ws In ActiveWorkbook.Worksheets\nErr.Clear\n"
+              "ws.Sort.Apply\nout = out & ws.Name & \"^\" & IIf(Err.Number <> 0, \"S\" & Err.Number & \";\", \"\") & "
+              "Dump(ws) & \"|\"\nNext\nReport = out\nEnd Function\n")
+    with harness.ExcelSession(harness.HarnessConfig(lock_wait_s=45.0)) as excel:
+        excel.open_document(path)
+        result = excel.run_vba(reader, "Report", timeout=240.0)
+        assert result.ok, result.message
+    read, again = (dict(one.split("^", 1) for one in part.split("|") if one) for part in str(result.value).split("#"))
+    for layout in record["layouts"]:
+        assert read[layout["name"]] == layout["reopened"], layout["name"]
+        assert again[layout["name"]] == layout["applied_again"], layout["name"]
+
+
+def test_excel_reads_the_colour_scales_this_wrote(tmp_path: Path) -> None:
+    """Every colour scale tests/fixtures/colour_scales measured, made by the model, saved and opened in Excel,
+    which reads each sheet, colours included, as it read its own file."""
+    import json
+
+    from test_excel_colour_scales import saved_layouts
+
+    harness = pytest.importorskip("pyvbaharness")
+    record = json.loads((Path(__file__).parent / "fixtures" / "colour_scales" / "colour_scales.json")
+                        .read_text(encoding="utf-8"))
+    path = tmp_path / "colour_scales.xlsx"
+    saved_layouts(path)
+    reader = (record["helper"] + "Public Function Report() As String\nDim ws As Object, out As String\n"
+              "For Each ws In ActiveWorkbook.Worksheets\nout = out & ws.Name & \"^\" & Dump(ws) & \"|\"\nNext\n"
+              "Report = out\nEnd Function\n")
+    with harness.ExcelSession(harness.HarnessConfig(lock_wait_s=45.0)) as excel:
+        excel.open_document(path)
+        result = excel.run_vba(reader, "Report", timeout=240.0)
+        assert result.ok, result.message
+    read = dict(one.split("^", 1) for one in str(result.value).split("|") if one)
+    for layout in record["layouts"]:
+        assert read[layout["name"]] == layout["reopened"], layout["name"]
+
+
+def test_excel_reads_the_data_bars_and_icon_sets_this_wrote(tmp_path: Path) -> None:
+    """Every rule tests/fixtures/data_bars_icons measured, made by the model, saved and opened in Excel, which
+    reads each sheet as it read its own file; and Excel's file changed by the model as Excel changed it, which
+    Excel reads as it had the changes before saving."""
+    import json
+
+    from test_excel_data_bars_icons import FIXTURES, RESAVED, saved_layouts
+
+    harness = pytest.importorskip("pyvbaharness")
+    record = json.loads((FIXTURES / "data_bars_icons.json").read_text(encoding="utf-8"))
+    made = tmp_path / "data_bars_icons.xlsx"
+    saved_layouts(made)
+    changed = tmp_path / "data_bars_icons_resaved.xlsx"
+    app = ExcelApplication.open(FIXTURES / "data_bars_icons.xlsx", with_vba=False)
+    steps = "".join(f"Private Sub Change{index}(ws As Object)\nOn Error Resume Next\n{one['step']}End Sub\n"
+                    for index, one in enumerate(RESAVED))
+    calls = "\n".join(f'Change{index} ActiveWorkbook.Worksheets("{one["name"]}")' for index, one in enumerate(RESAVED))
+    app.add_module(steps + f"Public Sub Change()\n{calls}\nEnd Sub\n", name="Changer")
+    app.run("Change")
+    app.save(changed)
+    reader = (record["helper"] + "Public Function Report() As String\nDim ws As Object, out As String\n"
+              "For Each ws In ActiveWorkbook.Worksheets\nout = out & ws.Name & \"^\" & Dump(ws) & \"|\"\nNext\n"
+              "Report = out\nEnd Function\n")
+    read: list[dict[str, str]] = []
+    for path in (made, changed):
+        with harness.ExcelSession(harness.HarnessConfig(lock_wait_s=45.0)) as excel:
+            excel.open_document(path)
+            result = excel.run_vba(reader, "Report", timeout=600.0)
+            assert result.ok, result.message
+        read.append(dict(one.split("^", 1) for one in str(result.value).split("|") if one))
+    for layout in record["layouts"]:
+        assert read[0][layout["name"]] == layout["reopened"], layout["name"]
+    for one in record["resaved"]:
+        assert read[1][one["name"]] == re.sub(r"^S\d+;", "", one["answers"]), one["name"]
+
+
+def test_excel_reads_the_conditional_edits_this_made(tmp_path: Path) -> None:
+    """Every edit tests/fixtures/conditional_edits measured that the model makes, made by the model in one workbook,
+    saved and opened in Excel, which reads each sheet as it read its own file; and Excel's file edited by the model
+    as Excel edited it, which Excel reads as it had the edits before saving, once it has drawn the sheets as the
+    dump that went before the edits drew them."""
+    from test_excel_conditional_edits import FIXTURES, RECORD, RESAVED, edited_layouts
+
+    from pyopenvba.exceptions import VBAUnsupportedError
+
+    harness = pytest.importorskip("pyvbaharness")
+    made = edited_layouts(tmp_path)
+    changed = tmp_path / "conditional_edits_resaved.xlsx"
+    app = ExcelApplication.open(FIXTURES / "conditional_edits.xlsx", with_vba=False)
+    app.add_module(RECORD["helper"] + "Public Function Read(name As String) As String\n"
+                   "Read = Dump(ActiveWorkbook.Worksheets(name))\nEnd Function\n", name="Reader")
+    for one in RECORD["layouts"]:
+        try:
+            app.run("Read", one["name"])
+        except VBAUnsupportedError:
+            pass
+    steps = "".join(f'Private Sub Change{index}()\nDim ws As Object\nSet ws = ActiveWorkbook.Worksheets("{one["name"]}")\n'
+                    f"On Error Resume Next\nws.Activate\n{one['edit']}\nEnd Sub\n" for index, one in enumerate(RESAVED))
+    app.add_module(steps, name="Changer")
+    for index in range(len(RESAVED)):
+        app.run(f"Change{index}")
+    app.save(changed)
+    reader = (RECORD["helper"] + "Public Function Report() As String\nDim ws As Object, out As String\n"
+              "For Each ws In ActiveWorkbook.Worksheets\nout = out & ws.Name & \"^\" & Dump(ws) & \"|\"\nNext\n"
+              "Report = out\nEnd Function\n")
+    def report(path: Path, *, drawn: bool) -> dict[str, str]:
+        with harness.ExcelSession(harness.HarnessConfig(lock_wait_s=45.0)) as excel:
+            excel.open_document(path)
+            if drawn:
+                assert excel.run_vba(reader, "Report", timeout=600.0).ok
+            result = excel.run_vba(reader, "Report", timeout=600.0)
+            assert result.ok, result.message
+        return dict(one.split("^", 1) for one in str(result.value).split("|") if one)
+
+    for path, layouts in made:
+        read = report(path, drawn=False)
+        for layout in layouts:
+            assert read[layout["name"]] == layout["reopened"], layout["name"]
+    read = report(changed, drawn=True)
+    for one in RESAVED:
+        assert read[one["name"]] == one["answers"], one["name"]
+
+
+def test_excel_joins_the_rules_this_wrote(tmp_path: Path) -> None:
+    """Every layout tests/fixtures/conditional_joins measured, made by the model, saved as an .xlsx and opened in
+    Excel, which joins the rules alike as it joined its own; and each of Excel's files, an .xlsm with a module
+    among them, saved again by the model, which Excel reads as it read its own."""
+    from test_excel_conditional_joins import FILES, FIXTURES, LAYOUTS, RECORD, made_layouts
+
+    harness = pytest.importorskip("pyvbaharness")
+    made = {"xlsx": tmp_path / "made.xlsx"}
+    made_layouts(made["xlsx"])
+    again = {file: ExcelApplication.open(FIXTURES / name, with_vba=False).save(tmp_path / ("again_" + name))
+             for file, name in FILES.items()}
+    reader = (RECORD["helper"] + "Public Function Report() As String\nDim ws As Object, out As String\n"
+              "For Each ws In ActiveWorkbook.Worksheets\nout = out & ws.Name & \"^\" & Dump(ws) & \"|\"\nNext\n"
+              "Report = out\nEnd Function\n")
+    for file, path in [*made.items(), *again.items()]:
+        with harness.ExcelSession(harness.HarnessConfig(lock_wait_s=45.0)) as excel:
+            excel.open_document(path)
+            result = excel.run_vba(reader, "Report", timeout=600.0)
+            assert result.ok, result.message
+        read = dict(one.split("^", 1) for one in str(result.value).split("|") if one)
+        for layout in LAYOUTS:
+            assert read[layout["name"]] == layout["reopened"][file], (path.name, layout["name"])
+
+
+def test_excel_reads_the_rule_number_formats_this_wrote(tmp_path: Path) -> None:
+    """Every layout tests/fixtures/conditional_number_formats measured, made by the model and saved as an .xlsx,
+    and each copy whose rules' formats another program might have numbered and spelled, saved again by the model:
+    Excel opens each and reads every rule's NumberFormat, and what its cells show, as it read its own."""
+    from test_excel_conditional_number_formats import FIXTURES, FOREIGN, FOREIGN_READER, LAYOUTS, RECORD, made_layouts
+
+    harness = pytest.importorskip("pyvbaharness")
+    made = tmp_path / "made.xlsx"
+    made_layouts(made)
+    again = {case["name"]: ExcelApplication.open(FIXTURES / "foreign" / f"{case['name']}.xlsx", with_vba=False)
+             .save(tmp_path / f"{case['name']}.xlsx") for case in FOREIGN["cases"]}
+    reader = (RECORD["reader"] + "Public Function Report() As String\nDim ws As Object, out As String\n"
+              "For Each ws In ActiveWorkbook.Worksheets\nout = out & ws.Name & \"^\" & Shown(ws) & \"|\"\nNext\n"
+              "Report = out\nEnd Function\n")
+    shown: dict[str, str] = {}
+    with harness.ExcelSession(harness.HarnessConfig(lock_wait_s=45.0)) as excel:
+        excel.open_document(made)
+        result = excel.run_vba(reader, "Report", timeout=600.0)
+        assert result.ok, result.message
+        for name, path in again.items():
+            excel.open_document(path)
+            copy = excel.run_vba(FOREIGN_READER, "Read", timeout=120.0)
+            assert copy.ok, copy.message
+            shown[name] = str(copy.value)
+    read = dict(one.split("^", 1) for one in str(result.value).split("|") if one)
+    for layout in LAYOUTS:
+        assert read[layout["name"]] == layout["reopened"], layout["name"]
+    for case in FOREIGN["cases"]:
+        assert shown[case["name"]] == case["answer"], case["name"]
+
+
+def test_excel_reads_the_formats_this_renumbered(tmp_path: Path) -> None:
+    """Each workbook tests/fixtures/number_format_resave measured, opened by the model and saved with nothing
+    changed, its formats numbered as Excel numbers them: Excel opens each and reads every cell's format, what it
+    shows, the pivot's and the rules', as it read the file the model opened."""
+    from test_excel_number_format_resave import CASES, FIXTURES, RECORD
+
+    harness = pytest.importorskip("pyvbaharness")
+    for case in CASES:
+        ExcelApplication.open(FIXTURES / f"{case['name']}.xlsx", with_vba=False).save(tmp_path / f"{case['name']}.xlsx")
+    reader = RECORD["read"].replace("{names}", ", ".join(f'"{case["name"]}"' for case in CASES)).replace(
+        "{folder}", str(tmp_path))
+    with harness.ExcelSession(harness.HarnessConfig(lock_wait_s=45.0)) as excel:
+        excel.new_document()
+        result = excel.run_vba(reader, "Read", timeout=600.0)
+        assert result.ok, result.message
+    read = dict(one.split("^", 1) for one in str(result.value).split("|") if "^" in one)
+    for case in CASES:
+        assert read[case["name"]] == case["answer"], case["name"]
+
+
+def test_excel_reads_the_stylesheets_this_saved_unchanged(tmp_path: Path) -> None:
+    """Each workbook tests/fixtures/unchanged_save measured, opened by the model and saved with nothing changed,
+    what nothing uses left out and xfs alike joined: Excel opens each and reads every cell's, row's and column's
+    format and the styles as it read the file the model opened."""
+    from test_excel_unchanged_save import CASES, FIXTURES, RECORD
+
+    harness = pytest.importorskip("pyvbaharness")
+    for case in CASES:
+        ExcelApplication.open(FIXTURES / f"{case['name']}.xlsx", with_vba=False).save(tmp_path / f"{case['name']}.xlsx")
+    reader = RECORD["read"].replace("{names}", ", ".join(f'"{case["name"]}"' for case in CASES)).replace(
+        "{folder}", str(tmp_path))
+    with harness.ExcelSession(harness.HarnessConfig(lock_wait_s=45.0)) as excel:
+        excel.new_document()
+        result = excel.run_vba(reader, "Read", timeout=600.0)
+        assert result.ok, result.message
+    read = dict(one.split("^", 1) for one in str(result.value).split("|") if "^" in one)
+    for case in CASES:
+        assert read[case["name"]] == case["answer"], case["name"]
+
+
+def test_excel_reads_the_dxfs_this_wrote(tmp_path: Path) -> None:
+    """Each workbook tests/fixtures/dxf_table measured that Excel read, opened by the model and saved with nothing
+    changed, its dxfs in Excel's order and every name following them, and the model's save of a rule given a new
+    format: Excel opens each and reads every rule, the sort's, the filter's, the table styles', the tables' and the
+    pivot's colours as it read the file the model opened, or its own save of the edit."""
+    from test_excel_dxf_table import FIXTURES, READ, RECORD, edit, opened
+
+    harness = pytest.importorskip("pyvbaharness")
+    for case in READ:
+        ExcelApplication.open(FIXTURES / f"{case['name']}.xlsx", with_vba=False).save(tmp_path / f"{case['name']}.xlsx")
+    edit(opened("order_changed"), "order_changed").save(tmp_path / "edited.xlsx")
+    expected = {case["name"]: case["answer"] for case in READ}
+    expected["edited"] = expected["order_changed"]
+    ordered = [name for name in expected if name.startswith("order") or name == "edited"]
+    read: dict[str, str] = {}
+    with harness.ExcelSession(harness.HarnessConfig(lock_wait_s=45.0)) as excel:
+        for reader, names in ((RECORD["read"], [name for name in expected if name not in ordered]),
+                              (RECORD["order_read"], ordered)):
+            excel.new_document()
+            result = excel.run_vba(reader.replace("{names}", ", ".join(f'"{name}"' for name in names)).replace(
+                "{folder}", str(tmp_path)), "Read", timeout=600.0)
+            assert result.ok, result.message
+            read.update(dict(one.split("^", 1) for one in str(result.value).split("|") if "^" in one))
+    for name, answer in expected.items():
+        assert read[name] == answer, name
+
+
+def test_excel_reads_the_prefixed_workbooks_this_saved(tmp_path: Path) -> None:
+    """Each copy tests/fixtures/prefixed_parts measured, its parts spelling SpreadsheetML's namespace under a prefix,
+    opened by the model and saved as it was and after a cell is given a value and a bold font: Excel opens each and
+    reads every cell, rule and table as it read the copy, or as the model reads its own save of the edit."""
+    from test_excel_prefixed_parts import CASES, FOLDER, RECORD
+
+    harness = pytest.importorskip("pyvbaharness")
+    expected: dict[Path, str] = {}
+    for case in CASES:
+        app = ExcelApplication.open(FOLDER / f"{case['name']}.xlsx", with_vba=False)
+        expected[app.save(tmp_path / f"{case['name']}.xlsx")] = case["answer"]
+        app.add_module('Public Sub Edit()\nActiveSheet.Range("Z9").Value = "new"\n'
+                       'ActiveSheet.Range("Z9").Font.Bold = True\nEnd Sub\n', name="Editor")
+        app.run("Edit")
+        edited = app.save(tmp_path / f"edited_{case['name']}.xlsx")
+        reader = ExcelApplication()
+        reader.add_module(RECORD["read"], name="Reader")
+        expected[edited] = str(reader.run("Read", str(edited), ""))
+        assert "Z9=new/General/True/" in expected[edited], case["name"]
+    with harness.ExcelSession(harness.HarnessConfig(lock_wait_s=45.0)) as excel:
+        excel.new_document()
+        for path, answer in expected.items():
+            result = excel.run_vba(RECORD["read"], "Read", (str(path), ""), timeout=120.0)
+            assert result.ok, (path.name, result.message)
+            assert str(result.value) == answer, path.name
+
+
+def test_excel_reads_the_rules_a_delete_cut(tmp_path: Path) -> None:
+    """Each layout tests/fixtures/conditional_partial_delete measured, made by the model with the macro Excel ran,
+    a rule deleted through part of its range, all of it or more, and saved: Excel opens each and lists the rules
+    as it lists them in its own save of the layout."""
+    from test_excel_conditional_partial_delete import FIXTURES, LAYOUTS, RECORD
+
+    harness = pytest.importorskip("pyvbaharness")
+    body = "".join(RECORD["layout"].replace("{name}", layout["name"]).replace("{rules}", layout["rules"])
+                   .replace("{delete}", layout["delete"]) for layout in LAYOUTS)
+    app = ExcelApplication()
+    app.add_module(RECORD["build"].replace("{layouts}", body).replace("{folder}", str(tmp_path)), name="Builder")
+    app.run("Build")
+    reader = RECORD["build"].split("Public Function Build")[0] + (
+        "Public Function Read(path As String) As String\nDim wb As Object\nSet wb = Workbooks.Open(path)\n"
+        "Read = Listed(wb.Worksheets(1))\nwb.Close False\nEnd Function\n")
+    with harness.ExcelSession(harness.HarnessConfig(lock_wait_s=45.0)) as excel:
+        excel.new_document()
+        for layout in LAYOUTS:
+            model = excel.run_vba(reader, "Read", (str(tmp_path / f"{layout['name']}.xlsx"),), timeout=120.0)
+            own = excel.run_vba(reader, "Read", (str(FIXTURES / f"{layout['name']}.xlsx"),), timeout=120.0)
+            assert model.ok and own.ok, (layout["name"], model.message, own.message)
+            assert str(model.value) == str(own.value), layout["name"]
+
+
+def test_excel_reads_the_dxfs_a_delete_left(tmp_path: Path) -> None:
+    """Each layout tests/fixtures/dxf_lifetime measured, made by the model with the macro Excel ran, a rule taken
+    away and its dxf kept or let go, and saved: Excel opens each and lists every sheet's rules and their fills as it
+    lists them in its own save of the layout."""
+    from test_excel_dxf_lifetime import FILES, FIXTURES, RECORD
+
+    harness = pytest.importorskip("pyvbaharness")
+    saves = {layout["name"]: "".join(f'wb.SaveAs "{{folder}}\\{save}.xlsx", 51\n' for save in layout["saves"])
+             for layout in RECORD["layouts"]}
+    body = "".join(RECORD["layout"].replace("{steps}", layout["steps"]).replace("{name}", layout["name"])
+                   .replace("{saves}", saves[layout["name"]]) for layout in RECORD["layouts"])
+    app = ExcelApplication()
+    app.add_module(RECORD["build"].replace("{layouts}", body).replace("{folder}", str(tmp_path)), name="Builder")
+    assert app.run("Build") == "ok"
+    reader = ('Public Function Read(path As String) As String\nDim wb As Object, ws As Object, f As Object, '
+              'out As String\nSet wb = Workbooks.Open(path)\nFor Each ws In wb.Worksheets\nout = out & ws.Name & ":"\n'
+              'For Each f In ws.Cells.FormatConditions\nout = out & f.AppliesTo.Address(False, False) & "@" & '
+              'f.Priority & "=" & f.Interior.Color & ","\nNext\nout = out & ";"\nNext\nwb.Close False\nRead = out\n'
+              'End Function\n')
+    with harness.ExcelSession(harness.HarnessConfig(lock_wait_s=45.0)) as excel:
+        excel.new_document()
+        for name in FILES:
+            model = excel.run_vba(reader, "Read", (str(tmp_path / f"{name}.xlsx"),), timeout=120.0)
+            own = excel.run_vba(reader, "Read", (str(FIXTURES / f"{name}.xlsx"),), timeout=120.0)
+            assert model.ok and own.ok, (name, model.message, own.message)
+            assert str(model.value) == str(own.value), name
+
+
+def test_excel_reads_the_colour_filters_this_wrote(tmp_path: Path) -> None:
+    """Every layout tests/fixtures/colour_filters measured, made by the model with the macro Excel ran, a filter
+    by a cell's colour or its font's on each sheet, and saved: Excel opens the file and reads each sheet's hidden
+    rows and filters as it read its own file opened again."""
+    from test_excel_colour_filters import LAYOUTS, RECORD
+
+    harness = pytest.importorskip("pyvbaharness")
+    body = "".join(RECORD["layout"].replace("{name}", layout["name"]).replace("{table}", RECORD["table"])
+                   .replace("{steps}", layout["steps"]) for layout in LAYOUTS)
+    app = ExcelApplication()
+    app.add_module(RECORD["build"].replace("{layouts}", body).replace("{folder}", str(tmp_path)), name="Builder")
+    app.run("Build")
+    reader = RECORD["helper"] + (
+        "Public Function Read(path As String) As String\nDim wb As Object, ws As Object, out As String\n"
+        "Set wb = Workbooks.Open(path)\nFor Each ws In wb.Worksheets\nout = out & ws.Name & \"^\" & Dump(ws) & \"|\"\n"
+        "Next\nwb.Close False\nRead = out\nEnd Function\n")
+    with harness.ExcelSession(harness.HarnessConfig(lock_wait_s=45.0)) as excel:
+        excel.new_document()
+        result = excel.run_vba(reader, "Read", (str(tmp_path / "colour_filters.xlsx"),), timeout=300.0)
+        assert result.ok, result.message
+    read = dict(one.split("^", 1) for one in str(result.value).split("|") if "^" in one)
+    for layout in LAYOUTS:
+        assert read[layout["name"]] == layout["reopened"], layout["name"]
+
+
+def test_excel_reads_the_date_filters_this_wrote(tmp_path: Path) -> None:
+    """Every layout tests/fixtures/date_filters measured, made by the model with the macro Excel ran, a filter by
+    dates on each sheet, and saved, and the model's save of each file holding a filter the classic way: Excel opens
+    them and reads each sheet's hidden rows and filters as it read its own files."""
+    from test_excel_date_filters import CLASSIC, FIXTURES, LAYOUTS, RECORD
+
+    harness = pytest.importorskip("pyvbaharness")
+    body = "".join(RECORD["layout"].replace("{name}", layout["name"]).replace("{table}", RECORD["table"])
+                   .replace("{steps}", layout["steps"]) for layout in LAYOUTS)
+    app = ExcelApplication()
+    app.add_module(RECORD["build"].replace("{layouts}", body).replace("{folder}", str(tmp_path)), name="Builder")
+    app.run("Build")
+    for case in CLASSIC:
+        ExcelApplication.open(FIXTURES / f"{case['name']}.xlsx", with_vba=False).save(tmp_path / f"{case['name']}.xlsx")
+    with harness.ExcelSession(harness.HarnessConfig(lock_wait_s=45.0)) as excel:
+        excel.new_document()
+        result = excel.run_vba(RECORD["read"], "Read", (str(tmp_path / "date_filters.xlsx"),
+                                                        str(tmp_path / "date_filters_resaved.xlsx")), timeout=300.0)
+        assert result.ok, result.message
+        read = dict(one.split("^", 1) for one in str(result.value).split("|") if "^" in one)
+        for layout in LAYOUTS:
+            assert read[layout["name"]] == layout["reopened"], layout["name"]
+        for case in CLASSIC:
+            result = excel.run_vba(RECORD["read"], "Read", (str(tmp_path / f"{case['name']}.xlsx"),
+                                                            str(tmp_path / f"{case['name']}_again.xlsx")), timeout=300.0)
+            assert result.ok, result.message
+            shown = dict(one.split("^", 1) for one in str(result.value).split("|") if "^" in one)
+            assert shown[case["sheet"]] == case["dump"], case["name"]
+
+
+def test_excel_reads_the_dynamic_filters_this_wrote(tmp_path: Path) -> None:
+    """Every layout tests/fixtures/dynamic_filters measured, made by the model with the macro Excel ran, its clock
+    where Excel's stood, a dynamic filter on dates on each sheet, and saved: Excel opens the file and reads each
+    sheet's hidden rows and filter as it read its own file opened again."""
+    from test_excel_dynamic_filters import LAYOUTS, NOW, RECORD
+
+    harness = pytest.importorskip("pyvbaharness")
+    body = "".join(RECORD["layout"].replace("{name}", layout["name"]).replace("{criteria}", str(layout["criteria"]))
+                   for layout in LAYOUTS)
+    app = ExcelApplication()
+    app.freeze_clock(NOW)
+    app.add_module(RECORD["build"].replace("{layouts}", body).replace("{folder}", str(tmp_path)), name="Builder")
+    app.run("Build")
+    reader = RECORD["helper"] + (
+        "Public Function Read(path As String) As String\nDim wb As Object, ws As Object, out As String\n"
+        "Set wb = Workbooks.Open(path)\nFor Each ws In wb.Worksheets\nout = out & ws.Name & \"^\" & Dump(ws) & \"|\"\n"
+        "Next\nwb.Close False\nRead = out\nEnd Function\n")
+    with harness.ExcelSession(harness.HarnessConfig(lock_wait_s=45.0)) as excel:
+        excel.new_document()
+        result = excel.run_vba(reader, "Read", (str(tmp_path / "dynamic_filters.xlsx"),), timeout=300.0)
+        assert result.ok, result.message
+    read = dict(one.split("^", 1) for one in str(result.value).split("|") if "^" in one)
+    for layout in LAYOUTS:
+        assert read[layout["name"]] == layout["reopened"], layout["name"]
+
+
+def test_excel_reads_the_icon_filters_this_wrote(tmp_path: Path) -> None:
+    """Every layout tests/fixtures/icon_filters measured, made by the model with the macro Excel ran, an icon set
+    and a filter by an icon or by none on each sheet, and saved: Excel opens the file and reads each sheet's hidden
+    rows and filter as it read its own file opened again."""
+    from test_excel_icon_filters import LAYOUTS, RECORD
+
+    harness = pytest.importorskip("pyvbaharness")
+    body = "".join(RECORD["layout"].replace("{name}", layout["name"]).replace("{set}", str(layout["set"]))
+                   .replace("{count}", str(layout["count"])).replace("{filter_set}", str(layout["filter_set"]))
+                   .replace("{last}", str(layout["last"])) for layout in LAYOUTS)
+    app = ExcelApplication()
+    app.add_module(RECORD["build"].replace("{cases}", RECORD["cases"]).replace("{layouts}", body).replace(
+        "{folder}", str(tmp_path)), name="Builder")
+    app.run("Build")
+    reader = RECORD["build"].split("Private Function Fill")[0] + (
+        "Public Function Read(path As String) As String\nDim wb As Object, ws As Object, out As String\n"
+        "Set wb = Workbooks.Open(path)\nFor Each ws In wb.Worksheets\nout = out & ws.Name & \"^\" & Dump(ws) & \"|\"\n"
+        "Next\nwb.Close False\nRead = out\nEnd Function\n")
+    with harness.ExcelSession(harness.HarnessConfig(lock_wait_s=45.0)) as excel:
+        excel.new_document()
+        result = excel.run_vba(reader, "Read", (str(tmp_path / "icon_filters.xlsx"),), timeout=300.0)
+        assert result.ok, result.message
+    read = dict(one.split("^", 1) for one in str(result.value).split("|") if "^" in one)
+    for layout in LAYOUTS:
+        assert read[layout["name"]] == layout["reopened"], layout["name"]
+
+
+def test_excel_reads_the_icon_sorts_this_wrote(tmp_path: Path) -> None:
+    """Every layout tests/fixtures/icon_sorts measured, made by the model with the macro Excel ran, a list sorted on
+    an icon set's icons on each sheet, and saved: Excel opens the file and reads each sheet's rows and sort fields
+    as it read its own file opened again."""
+    from test_excel_icon_sorts import LAYOUTS, RECORD
+
+    harness = pytest.importorskip("pyvbaharness")
+    body = "".join(RECORD["layout"].replace("{name}", layout["name"]).replace("{steps}", layout["steps"])
+                   for layout in LAYOUTS)
+    app = ExcelApplication()
+    app.add_module(RECORD["build"].replace("{layouts}", body).replace("{folder}", str(tmp_path)), name="Builder")
+    app.run("Build")
+    reader = RECORD["build"].split("Private Sub Fill")[0] + (
+        "Public Function Read(path As String) As String\nDim wb As Object, ws As Object, out As String\n"
+        "Set wb = Workbooks.Open(path)\nFor Each ws In wb.Worksheets\nout = out & ws.Name & \"^\" & Dump(ws) & \"|\"\n"
+        "Next\nwb.Close False\nRead = out\nEnd Function\n")
+    with harness.ExcelSession(harness.HarnessConfig(lock_wait_s=45.0)) as excel:
+        excel.new_document()
+        result = excel.run_vba(reader, "Read", (str(tmp_path / "icon_sorts.xlsx"),), timeout=300.0)
+        assert result.ok, result.message
+    read = dict(one.split("^", 1) for one in str(result.value).split("|") if "^" in one)
+    for layout in LAYOUTS:
+        assert read[layout["name"]] == layout["reopened"], layout["name"]
+
+
+def test_excel_reads_the_pivot_filters_this_wrote(tmp_path: Path) -> None:
+    """Every layout tests/fixtures/pivot_filters measured, made by the model with the macro Excel ran, a pivot
+    table hiding items or choosing page items on each sheet, and saved: Excel opens the file and reads each table's
+    cells, items and page choices as it read its own file opened again."""
+    from test_excel_pivot_filters import HELPER, LAYOUTS, RECORD, SAVED
+
+    harness = pytest.importorskip("pyvbaharness")
+    body = "".join(RECORD["layout"].replace("{name}", layout["name"]).replace("{row}", layout["row"])
+                   .replace("{column}", layout["column"]).replace("{page}", layout["page"])
+                   .replace("{source}", layout["own_source"]).replace("{step}", str(index))
+                   for index, layout in enumerate(LAYOUTS, 1))
+    app = ExcelApplication()
+    app.add_module(RECORD["build"].replace("{steps}", RECORD["steps"]).replace("{source}", RECORD["source"])
+                   .replace("{layouts}", body).replace("{unsaved}", RECORD["unsaved"])
+                   .replace("{folder}", str(tmp_path)), name="Builder")
+    app.run("Build")
+    reader = HELPER + (
+        "Public Function Read(path As String) As String\nDim wb As Object, ws As Object, out As String\n"
+        "Set wb = Workbooks.Open(path)\nFor Each ws In wb.Worksheets\n"
+        "If ws.PivotTables.Count > 0 Then out = out & ws.Name & \"^\" & Dump(ws.PivotTables(1)) & \"|\"\n"
+        "Next\nwb.Close False\nRead = out\nEnd Function\n")
+    with harness.ExcelSession(harness.HarnessConfig(lock_wait_s=45.0)) as excel:
+        excel.new_document()
+        result = excel.run_vba(reader, "Read", (str(tmp_path / "pivot_filters.xlsx"),), timeout=300.0)
+        assert result.ok, result.message
+    read = dict(one.split("^", 1) for one in str(result.value).split("|") if "^" in one)
+    for layout in SAVED:
+        assert read[layout["name"]] == layout["reopened"], layout["name"]
+
+
+def test_excel_reads_the_pivot_sorts_this_wrote(tmp_path: Path) -> None:
+    """Every layout tests/fixtures/pivot_sorts measured, made by the model with the macro Excel ran, a pivot table
+    sorted by names or values or with items moved on each sheet, and saved: Excel opens the file and reads each
+    table's cells, item positions and sorts as it read its own file opened again."""
+    from test_excel_pivot_sorts import HELPER, LAYOUTS, RECORD
+
+    harness = pytest.importorskip("pyvbaharness")
+    body = "".join(RECORD["layout"].replace("{name}", layout["name"]).replace("{row}", layout["row"])
+                   .replace("{column}", layout["column"]).replace("{page}", layout["page"])
+                   .replace("{source}", layout["own_source"]).replace("{step}", str(index))
+                   for index, layout in enumerate(LAYOUTS, 1))
+    app = ExcelApplication()
+    app.add_module(RECORD["build"].replace("{steps}", RECORD["steps"]).replace("{source}", RECORD["source"])
+                   .replace("{layouts}", body).replace("{folder}", str(tmp_path)), name="Builder")
+    app.run("Build")
+    reader = HELPER + (
+        "Public Function Read(path As String) As String\nDim wb As Object, ws As Object, out As String\n"
+        "Set wb = Workbooks.Open(path)\nFor Each ws In wb.Worksheets\n"
+        "If ws.PivotTables.Count > 0 Then out = out & ws.Name & \"^\" & Dump(ws.PivotTables(1)) & \"|\"\n"
+        "Next\nwb.Close False\nRead = out\nEnd Function\n")
+    with harness.ExcelSession(harness.HarnessConfig(lock_wait_s=45.0)) as excel:
+        excel.new_document()
+        result = excel.run_vba(reader, "Read", (str(tmp_path / "pivot_sorts.xlsx"),), timeout=300.0)
+        assert result.ok, result.message
+    read = dict(one.split("^", 1) for one in str(result.value).split("|") if "^" in one)
+    for layout in LAYOUTS:
+        assert read[layout["name"]] == layout["reopened"], layout["name"]
+
+
+def test_excel_reads_the_pivotfilters_this_wrote(tmp_path: Path) -> None:
+    """Every layout tests/fixtures/pivotfilters measured, made by the model with the macro Excel ran, a pivot table
+    with label, value or top 10 filters on each sheet, and saved: Excel opens the file and reads each table's cells,
+    items and filters as it read its own file opened again."""
+    from test_excel_pivotfilters import HELPER, LAYOUTS, RECORD
+
+    harness = pytest.importorskip("pyvbaharness")
+    body = "".join(RECORD["layout"].replace("{name}", layout["name"]).replace("{row}", layout["row"])
+                   .replace("{column}", layout["column"]).replace("{page}", layout["page"])
+                   .replace("{source}", layout["own_source"]).replace("{step}", str(index))
+                   for index, layout in enumerate(LAYOUTS, 1))
+    app = ExcelApplication()
+    app.add_module(RECORD["build"].replace("{steps}", RECORD["steps"]).replace("{source}", RECORD["source"])
+                   .replace("{layouts}", body).replace("{folder}", str(tmp_path)), name="Builder")
+    app.run("Build")
+    reader = HELPER + (
+        "Public Function Read(path As String) As String\nDim wb As Object, ws As Object, out As String\n"
+        "Set wb = Workbooks.Open(path)\nFor Each ws In wb.Worksheets\n"
+        "If ws.PivotTables.Count > 0 Then out = out & ws.Name & \"^\" & Dump(ws.PivotTables(1)) & \"|\"\n"
+        "Next\nwb.Close False\nRead = out\nEnd Function\n")
+    with harness.ExcelSession(harness.HarnessConfig(lock_wait_s=45.0)) as excel:
+        excel.new_document()
+        result = excel.run_vba(reader, "Read", (str(tmp_path / "pivotfilters.xlsx"),), timeout=300.0)
+        assert result.ok, result.message
+    read = dict(one.split("^", 1) for one in str(result.value).split("|") if "^" in one)
+    for layout in LAYOUTS:
+        assert read[layout["name"]] == layout["reopened"], layout["name"]
+
+
+def test_excel_reads_the_pivot_date_filters_this_wrote(tmp_path: Path) -> None:
+    """Every layout tests/fixtures/pivot_date_filters measured, made by the model with the macro Excel ran, a date
+    field with a date filter on each sheet, and saved: Excel opens the file and reads each table as it reads its
+    own. The periods count from the day the gate runs, so Excel makes the layouts afresh that day, and the model's
+    clock is on that day too."""
+    import datetime as dt
+
+    from test_excel_pivot_date_filters import HELPER, LAYOUTS, RECORD
+
+    harness = pytest.importorskip("pyvbaharness")
+    body = "".join(RECORD["layout"].replace("{name}", layout["name"]).replace("{row}", layout["row"])
+                   .replace("{column}", layout["column"]).replace("{page}", layout["page"])
+                   .replace("{source}", layout["own_source"]).replace("{step}", str(index))
+                   for index, layout in enumerate(LAYOUTS, 1))
+    theirs, mine = tmp_path / "excel", tmp_path / "model"
+    theirs.mkdir()
+    mine.mkdir()
+
+    def code(folder: Path) -> str:
+        return (RECORD["build"].replace("{steps}", RECORD["steps"]).replace("{source}", RECORD["source"])
+                .replace("{layouts}", body).replace("{folder}", str(folder)))
+
+    app = ExcelApplication()
+    app.freeze_clock(dt.datetime.combine(dt.date.today(), dt.time(9)))
+    app.add_module(code(mine), name="Builder")
+    app.run("Build")
+    reader = HELPER + (
+        "Public Function Read(path As String) As String\nDim wb As Object, ws As Object, out As String\n"
+        "Set wb = Workbooks.Open(path)\nFor Each ws In wb.Worksheets\n"
+        "If ws.PivotTables.Count > 0 Then out = out & ws.Name & \"^\" & Dump(ws.PivotTables(1)) & \"|\"\n"
+        "Next\nwb.Close False\nRead = out\nEnd Function\n")
+    with harness.ExcelSession(harness.HarnessConfig(lock_wait_s=45.0)) as excel:
+        excel.new_document()
+        fresh = excel.run_vba(code(theirs), "Build", timeout=600.0)
+        assert fresh.ok, fresh.message
+        result = excel.run_vba(reader, "Read", (str(mine / "pivot_date_filters.xlsx"),), timeout=300.0)
+        assert result.ok, result.message
+    reopened = str(fresh.value).split("@", 1)[1].split("~", 1)[1]
+    expected = dict(one.split("^", 1) for one in reopened.split("|") if "^" in one)
+    read = dict(one.split("^", 1) for one in str(result.value).split("|") if "^" in one)
+    for layout in LAYOUTS:
+        assert read[layout["name"]] == expected[layout["name"]], layout["name"]
+
+
+def test_excel_reads_the_pivot_layouts_this_wrote(tmp_path: Path) -> None:
+    """Every layout tests/fixtures/pivot_layouts measured that the model lays out, made by the model with the macro
+    Excel ran, a pivot table in compact, outline or tabular form with its subtotals, blank lines and repeated
+    labels on each sheet, and saved: Excel opens the file and reads each table's cells, their indents, ranges and
+    layout as it read its own file opened again."""
+    from test_excel_pivot_layouts import HELPER, LAYOUTS, built
+
+    harness = pytest.importorskip("pyvbaharness")
+    built(tmp_path).run("Build")
+    reader = HELPER + (
+        "Public Function Read(path As String) As String\nDim wb As Object, ws As Object, out As String\n"
+        "Set wb = Workbooks.Open(path)\nFor Each ws In wb.Worksheets\n"
+        "If ws.PivotTables.Count > 0 Then out = out & ws.Name & \"^\" & Dump(ws.PivotTables(1)) & \"|\"\n"
+        "Next\nwb.Close False\nRead = out\nEnd Function\n")
+    with harness.ExcelSession(harness.HarnessConfig(lock_wait_s=45.0)) as excel:
+        excel.new_document()
+        result = excel.run_vba(reader, "Read", (str(tmp_path / "pivot_layouts.xlsx"),), timeout=300.0)
+        assert result.ok, result.message
+    read = dict(one.split("^", 1) for one in str(result.value).split("|") if "^" in one)
+    for layout in LAYOUTS:
+        assert read[layout["name"]] == layout["reopened"], layout["name"]
+
+
+def test_excel_reads_the_pivot_options_this_wrote(tmp_path: Path) -> None:
+    """Every layout tests/fixtures/pivot_options measured, made by the model with the macro Excel ran, a pivot table
+    with its style, null and error strings, page order, flags, AddFields, ClearTable, Location or ManualUpdate on
+    each sheet, and saved: Excel opens the file and reads each table's cells, ranges and options as it read its own
+    file opened again."""
+    from test_excel_pivot_options import HELPER, LAYOUTS, built
+
+    harness = pytest.importorskip("pyvbaharness")
+    built(tmp_path).run("Build")
+    reader = HELPER + (
+        "Public Function Read(path As String) As String\nDim wb As Object, ws As Object, out As String\n"
+        "Set wb = Workbooks.Open(path)\nFor Each ws In wb.Worksheets\n"
+        "If ws.PivotTables.Count > 0 Then out = out & ws.Name & \"^\" & Dump(ws.PivotTables(1)) & \"|\"\n"
+        "Next\nwb.Close False\nRead = out\nEnd Function\n")
+    with harness.ExcelSession(harness.HarnessConfig(lock_wait_s=45.0)) as excel:
+        excel.new_document()
+        result = excel.run_vba(reader, "Read", (str(tmp_path / "pivot_options.xlsx"),), timeout=300.0)
+        assert result.ok, result.message
+    read = dict(one.split("^", 1) for one in str(result.value).split("|") if "^" in one)
+    for layout in LAYOUTS:
+        assert read[layout["name"]] == layout["reopened"], layout["name"]
+
+
+def test_excel_reads_the_pivot_calculations_this_wrote(tmp_path: Path) -> None:
+    """Every layout tests/fixtures/pivot_calculations measured, made by the model with the macro Excel ran, a pivot
+    table with a data field shown as a difference, percent, running total, index or rank on each sheet, and saved:
+    Excel opens the file and reads each table's cells, their formats and every data field's calculation as it read
+    its own file opened again."""
+    from test_excel_pivot_calculations import HELPER, LAYOUTS, built
+
+    harness = pytest.importorskip("pyvbaharness")
+    built(tmp_path).run("Build")
+    reader = HELPER + (
+        "Public Function Read(path As String) As String\nDim wb As Object, ws As Object, out As String\n"
+        "Set wb = Workbooks.Open(path)\nFor Each ws In wb.Worksheets\n"
+        "If ws.PivotTables.Count > 0 Then out = out & ws.Name & \"^\" & Dump(ws.PivotTables(1)) & \"|\"\n"
+        "Next\nwb.Close False\nRead = out\nEnd Function\n")
+    with harness.ExcelSession(harness.HarnessConfig(lock_wait_s=45.0)) as excel:
+        excel.new_document()
+        result = excel.run_vba(reader, "Read", (str(tmp_path / "pivot_calculations.xlsx"),), timeout=300.0)
+        assert result.ok, result.message
+    read = dict(one.split("^", 1) for one in str(result.value).split("|") if "^" in one)
+    for layout in LAYOUTS:
+        assert read[layout["name"]] == layout["reopened"], layout["name"]
+
+
+def test_excel_reads_the_pivot_calculated_fields_this_wrote(tmp_path: Path) -> None:
+    """Every layout tests/fixtures/pivot_calculated_fields measured, made by the model with the macro Excel ran, a
+    pivot table with calculated fields added, put in the data area, changed, renamed or deleted on each sheet, and
+    saved: Excel opens the file and reads each table's cells and every calculated field's formula as it read its
+    own file opened again."""
+    from test_excel_pivot_calculated_fields import HELPER, LAYOUTS, built
+
+    harness = pytest.importorskip("pyvbaharness")
+    built(tmp_path).run("Build")
+    reader = HELPER + (
+        "Public Function Read(path As String) As String\nDim wb As Object, ws As Object, out As String\n"
+        "Set wb = Workbooks.Open(path)\nFor Each ws In wb.Worksheets\n"
+        "If ws.PivotTables.Count > 0 Then out = out & ws.Name & \"^\" & Dump(ws.PivotTables(1)) & \"|\"\n"
+        "Next\nwb.Close False\nRead = out\nEnd Function\n")
+    with harness.ExcelSession(harness.HarnessConfig(lock_wait_s=45.0)) as excel:
+        excel.new_document()
+        result = excel.run_vba(reader, "Read", (str(tmp_path / "pivot_calculated_fields.xlsx"),), timeout=300.0)
+        assert result.ok, result.message
+    read = dict(one.split("^", 1) for one in str(result.value).split("|") if "^" in one)
+    for layout in LAYOUTS:
+        assert read[layout["name"]] == layout["reopened"], layout["name"]
+
+
+def test_excel_reads_the_pivot_names_this_wrote(tmp_path: Path) -> None:
+    """Every layout tests/fixtures/pivot_names measured, made by the model with the macro Excel ran, a pivot table
+    with a data field, the Values field, a field or an item renamed on each sheet, and saved: Excel opens the file and
+    reads each table's cells and every name, caption and source as it read its own file opened again."""
+    from test_excel_pivot_names import HELPER, LAYOUTS, built
+
+    harness = pytest.importorskip("pyvbaharness")
+    built(tmp_path).run("Build")
+    reader = HELPER + (
+        "Public Function Read(path As String) As String\nDim wb As Object, ws As Object, out As String\n"
+        "Set wb = Workbooks.Open(path)\nFor Each ws In wb.Worksheets\n"
+        "If ws.PivotTables.Count > 0 Then out = out & ws.Name & \"^\" & Dump(ws.PivotTables(1)) & \"|\"\n"
+        "Next\nwb.Close False\nRead = out\nEnd Function\n")
+    with harness.ExcelSession(harness.HarnessConfig(lock_wait_s=45.0)) as excel:
+        excel.new_document()
+        result = excel.run_vba(reader, "Read", (str(tmp_path / "pivot_names.xlsx"),), timeout=300.0)
+        assert result.ok, result.message
+    read = dict(one.split("^", 1) for one in str(result.value).split("|") if "^" in one)
+    for layout in LAYOUTS:
+        assert read[layout["name"]] == layout["reopened"], layout["name"]
+
+
+def test_excel_reads_the_pivot_show_detail_this_wrote(tmp_path: Path) -> None:
+    """Every layout tests/fixtures/pivot_show_detail measured, made by the model with the macro Excel ran, a pivot
+    table with items or fields collapsed and expanded on each sheet, and saved: Excel opens the file and reads each
+    table's cells and every ShowDetail as it read its own file opened again."""
+    from test_excel_pivot_show_detail import HELPER, LAYOUTS, built
+
+    harness = pytest.importorskip("pyvbaharness")
+    built(tmp_path).run("Build")
+    reader = HELPER + (
+        "Public Function Read(path As String) As String\nDim wb As Object, ws As Object, out As String\n"
+        "Set wb = Workbooks.Open(path)\nFor Each ws In wb.Worksheets\n"
+        "If ws.PivotTables.Count > 0 Then out = out & ws.Name & \"^\" & Dump(ws.PivotTables(1)) & \"|\"\n"
+        "Next\nwb.Close False\nRead = out\nEnd Function\n")
+    with harness.ExcelSession(harness.HarnessConfig(lock_wait_s=45.0)) as excel:
+        excel.new_document()
+        result = excel.run_vba(reader, "Read", (str(tmp_path / "pivot_show_detail.xlsx"),), timeout=300.0)
+        assert result.ok, result.message
+    read = dict(one.split("^", 1) for one in str(result.value).split("|") if "^" in one)
+    for layout in LAYOUTS:
+        assert read[layout["name"]] == layout["reopened"], layout["name"]
+
+
+def test_excel_reads_the_pivot_grouping_this_wrote(tmp_path: Path) -> None:
+    """Every layout tests/fixtures/pivot_grouping measured, made by the model with the macro Excel ran, a pivot table
+    with a field grouped by ranges, by a date's periods or by chosen items on each sheet, and saved: Excel opens the
+    file and reads each table's cells and fields' items as it read its own file opened again."""
+    from test_excel_pivot_grouping import HELPER, LAYOUTS, built
+
+    harness = pytest.importorskip("pyvbaharness")
+    built(tmp_path).run("Build")
+    reader = HELPER + (
+        "Public Function Read(path As String) As String\nDim wb As Object, ws As Object, out As String\n"
+        "Set wb = Workbooks.Open(path)\nFor Each ws In wb.Worksheets\n"
+        "If ws.PivotTables.Count > 0 Then out = out & ws.Name & \"^\" & Dump(ws.PivotTables(ws.Name)) & \"|\"\n"
+        "Next\nwb.Close False\nRead = out\nEnd Function\n")
+    with harness.ExcelSession(harness.HarnessConfig(lock_wait_s=45.0)) as excel:
+        excel.new_document()
+        result = excel.run_vba(reader, "Read", (str(tmp_path / "pivot_grouping.xlsx"),), timeout=300.0)
+        assert result.ok, result.message
+    read = dict(one.split("^", 1) for one in str(result.value).split("|") if "^" in one)
+    for layout in LAYOUTS:
+        assert read[layout["name"]] == layout["reopened"], layout["name"]
+
+
+def test_excel_reads_the_pivot_calculated_items_this_wrote(tmp_path: Path) -> None:
+    """Every layout tests/fixtures/pivot_calculated_items measured, made by the model with the macro Excel ran, a
+    pivot table with calculated items added, changed, hidden or deleted on each sheet, and saved: Excel opens the
+    file and reads each table's cells and its items' formulas as it read its own file opened again."""
+    from test_excel_pivot_calculated_items import HELPER, LAYOUTS, built
+
+    harness = pytest.importorskip("pyvbaharness")
+    built(tmp_path).run("Build")
+    reader = HELPER + (
+        "Public Function Read(path As String) As String\nDim wb As Object, ws As Object, out As String\n"
+        "Set wb = Workbooks.Open(path)\nFor Each ws In wb.Worksheets\n"
+        "If ws.PivotTables.Count > 0 Then out = out & ws.Name & \"^\" & Dump(ws.PivotTables(ws.Name)) & \"|\"\n"
+        "Next\nwb.Close False\nRead = out\nEnd Function\n")
+    with harness.ExcelSession(harness.HarnessConfig(lock_wait_s=45.0)) as excel:
+        excel.new_document()
+        result = excel.run_vba(reader, "Read", (str(tmp_path / "pivot_calculated_items.xlsx"),), timeout=300.0)
+        assert result.ok, result.message
+    read = dict(one.split("^", 1) for one in str(result.value).split("|") if "^" in one)
+    for layout in LAYOUTS:
+        assert read[layout["name"]] == layout["reopened"], layout["name"]
+
+
+def test_excel_reads_the_pivot_show_pages_this_wrote(tmp_path: Path) -> None:
+    """Every scenario tests/fixtures/pivot_show_pages measured, made by the model with the macro Excel ran, a
+    sheet of its own for each page of a pivot table, and saved: Excel opens each workbook and reads every sheet in
+    order and each table's name, place, page choices and cells as it read its own workbook opened again."""
+    from test_excel_pivot_show_pages import RECORD, ROTATING, SCENARIOS, built, unordered
+
+    harness = pytest.importorskip("pyvbaharness")
+    built(tmp_path).run("Build")
+    reader = RECORD["build"].split("Private Function Scenario")[0] + (
+        "Public Function Read(folder As String, names As String) As String\n"
+        "Dim wb As Object, name As Variant, out As String\nApplication.DisplayAlerts = False\n"
+        "For Each name In Split(names, \",\")\nSet wb = Workbooks.Open(folder & \"\\\" & name & \".xlsx\")\n"
+        "out = out & name & \"^\" & Dump(wb) & \"|\"\nwb.Close False\nNext\nRead = out\nEnd Function\n")
+    names = ",".join(scenario["name"] for scenario in SCENARIOS)
+    with harness.ExcelSession(harness.HarnessConfig(lock_wait_s=45.0)) as excel:
+        excel.new_document()
+        result = excel.run_vba(reader, "Read", (str(tmp_path), names), timeout=600.0)
+        assert result.ok, result.message
+    read = dict(one.split("^", 1) for one in str(result.value).split("|") if "^" in one)
+    for scenario in SCENARIOS:
+        if scenario["name"] in ROTATING:
+            assert unordered(read[scenario["name"]]) == unordered(scenario["reopened"]), scenario["name"]
+        else:
+            assert read[scenario["name"]] == scenario["reopened"], scenario["name"]
+
+
+def test_excel_reads_the_shared_pivot_caches_this_wrote(tmp_path: Path) -> None:
+    """Every scenario tests/fixtures/pivot_shared_caches measured, made by the model with the macro Excel ran, a
+    cache's tables on two sheets refreshed, the workbook's caches refreshed or a setting of a cache set, and saved:
+    Excel opens each workbook and reads every sheet's widths and tables, their caches' indexes, places and cells,
+    as it reads its own workbook of the scenario, a sheet's tables in either order. Excel reads a width against
+    its display's pixels, so both are read in one session rather than against the widths a 96-DPI Excel read."""
+    import shutil
+
+    from test_excel_pivot_shared_caches import FIXTURES, RECORD, SCENARIOS, built, unordered
+
+    harness = pytest.importorskip("pyvbaharness")
+    ours, theirs = tmp_path / "model", tmp_path / "excel"
+    ours.mkdir()
+    theirs.mkdir()
+    built(ours).run("Build")
+    for scenario in SCENARIOS:
+        shutil.copy(FIXTURES / f"{scenario['name']}.xlsx", theirs)
+    reader = RECORD["build"].split("Private Function Made")[0] + (
+        "Public Function Read(folder As String, names As String) As String\n"
+        "Dim wb As Object, name As Variant, out As String\nApplication.DisplayAlerts = False\n"
+        "For Each name In Split(names, \",\")\nSet wb = Workbooks.Open(folder & \"\\\" & name & \".xlsx\")\n"
+        "out = out & name & \"^\" & Dump(wb) & \"|\"\nwb.Close False\nNext\nRead = out\nEnd Function\n")
+    names = ",".join(scenario["name"] for scenario in SCENARIOS)
+    with harness.ExcelSession(harness.HarnessConfig(lock_wait_s=45.0)) as excel:
+        excel.new_document()
+        results = [excel.run_vba(reader, "Read", (str(folder), names), timeout=600.0) for folder in (ours, theirs)]
+        assert all(result.ok for result in results), [result.message for result in results]
+    model, own = (dict(one.split("^", 1) for one in str(result.value).split("|") if "^" in one) for result in results)
+    for scenario in SCENARIOS:
+        assert unordered(model[scenario["name"]]) == unordered(own[scenario["name"]]), scenario["name"]
+
+
+def test_excel_reads_the_tab_colours_this_wrote(tmp_path: Path) -> None:
+    """Every case tests/fixtures/sheet_tabs measured, made by the model with the macro Excel ran and saved: Excel
+    opens the workbook and reads every tab's Color, ColorIndex, ThemeColor and TintAndShade as it read its own."""
+    from test_excel_sheet_tabs import RECORD
+
+    harness = pytest.importorskip("pyvbaharness")
+    app = ExcelApplication()
+    app.add_module(RECORD["build"].replace('folder & "\\" & name', f'folder & "{os.sep}" & name'), name="Builder")
+    app.run("Build", str(tmp_path))
+    reader = RECORD["build"].split("Public Function Build")[0] + (
+        "Public Function Read(path As String) As String\nDim wb As Object, ws As Object, out As String\n"
+        "Application.DisplayAlerts = False\nSet wb = Workbooks.Open(path)\n"
+        'For Each ws In wb.Worksheets\nout = out & ws.Name & "^" & Dump(ws) & "~"\nNext\n'
+        "wb.Close False\nRead = out\nEnd Function\n")
+    with harness.ExcelSession(harness.HarnessConfig(lock_wait_s=45.0)) as excel:
+        excel.new_document()
+        result = excel.run_vba(reader, "Read", (str(tmp_path / "sheet_tabs.xlsx"),), timeout=300.0)
+        assert result.ok, result.message
+    read = dict(one.split("^", 1) for one in str(result.value).split("~") if "^" in one)
+    assert read == RECORD["reopened"]
+
+
+def test_excel_reads_the_subtotals_this_wrote(tmp_path: Path) -> None:
+    """A spread of the cases tests/fixtures/subtotals measured, made by the model with Excel's functions for them in
+    one workbook and saved: Excel opens it and reads every subtotal row, label, formula, format and outline level
+    as it read its own."""
+    from test_excel_subtotals import NAMES, RECORD
+
+    harness = pytest.importorskip("pyvbaharness")
+    chosen = ["fn_sum", "fn_count", "fn_varp", "above", "range_columns", "offset_list", "outside_cells",
+              "outside_formulas", "list_formulas", "values_kinds", "values_numbers", "values_blanks",
+              "values_all_blank", "total_groupby", "groupby_total_outside", "nested_sum", "nested_count",
+              "nested_above", "nested_three", "nested_grand_again", "replace_true", "remove_basic", "remove_range_rows",
+              "collapsed", "collapsed_then_nested", "hidden_row", "formats_rows", "formats_currency",
+              "formats_whole_row", "register_set", "register_after_subtotal", "large", "breaks_below",
+              "breaks_nested", "breaks_above"]
+    calls = "".join(f"out = out & Make{NAMES.index(name)}(wb, scratch)\n" for name in chosen)
+    app = ExcelApplication()
+    app.add_module(RECORD["build"].split("Public Function Build")[0] + (
+        "Public Function Gate(path As String) As String\nDim wb As Object, scratch As Object, out As String\n"
+        "Set wb = Workbooks.Add(xlWBATWorksheet)\nSet scratch = wb.Worksheets(1)\nscratch.Name = \"scratch\"\n"
+        f"scratch.Range(\"A1\").NumberFormat = \"General\"\n{calls}wb.SaveAs path, 51\nGate = out\nEnd Function\n"),
+        name="Builder")
+    app.run("Gate", str(tmp_path / "subtotals.xlsx"))
+    reader = RECORD["build"].split("Public Function Build")[0] + (
+        "Public Function Read(path As String) As String\nDim wb As Object, ws As Object, out As String\n"
+        "Application.DisplayAlerts = False\nSet wb = Workbooks.Open(path)\n"
+        'For Each ws In wb.Worksheets\nout = out & ws.Name & "^" & Dump(ws) & "~"\nNext\n'
+        "wb.Close False\nRead = out\nEnd Function\n")
+    with harness.ExcelSession(harness.HarnessConfig(lock_wait_s=45.0)) as excel:
+        excel.new_document()
+        result = excel.run_vba(reader, "Read", (str(tmp_path / "subtotals.xlsx"),), timeout=300.0)
+        assert result.ok, result.message
+    read = dict(one.split("^", 1) for one in str(result.value).split("~") if "^" in one)
+    assert {name: read[name] for name in chosen} == {name: RECORD["reopened"][name] for name in chosen}
+
+
+def test_excel_reads_the_page_breaks_this_wrote(tmp_path: Path) -> None:
+    """Every supported case tests/fixtures/page_breaks measured, made by the model with Excel's functions for them in
+    one workbook and saved: Excel opens it and reads every break as it read its own."""
+    from test_excel_page_breaks import NAMES, RECORD, SUPPORTED
+
+    harness = pytest.importorskip("pyvbaharness")
+    calls = "".join(f"out = out & Make{NAMES.index(name)}(wb, scratch)\n" for name in SUPPORTED)
+    app = ExcelApplication()
+    app.add_module(RECORD["build"].split("Public Function Build")[0] + (
+        "Public Function Gate(path As String) As String\nDim wb As Object, scratch As Object, out As String\n"
+        "Set wb = Workbooks.Add(xlWBATWorksheet)\nSet scratch = wb.Worksheets(1)\nscratch.Name = \"scratch\"\n"
+        f"{calls}wb.SaveAs path, 51\nGate = out\nEnd Function\n"), name="Builder")
+    app.run("Gate", str(tmp_path / "page_breaks.xlsx"))
+    reader = RECORD["build"].split("Public Function Build")[0] + (
+        "Public Function Read(path As String) As String\nDim wb As Object, ws As Object, out As String\n"
+        "Application.DisplayAlerts = False\nSet wb = Workbooks.Open(path)\n"
+        'For Each ws In wb.Worksheets\nout = out & ws.Name & "^" & Dump(ws) & "~"\nNext\n'
+        "wb.Close False\nRead = out\nEnd Function\n")
+    with harness.ExcelSession(harness.HarnessConfig(lock_wait_s=45.0)) as excel:
+        excel.new_document()
+        result = excel.run_vba(reader, "Read", (str(tmp_path / "page_breaks.xlsx"),), timeout=300.0)
+        assert result.ok, result.message
+    read = dict(one.split("^", 1) for one in str(result.value).split("~") if "^" in one)
+    expected = {name: dump for name, dump in RECORD["reopened"].items() if name.split(" (")[0] in SUPPORTED}
+    assert {name: read[name] for name in expected} == expected
+
+
+def test_excel_reads_the_headers_this_wrote(tmp_path: Path) -> None:
+    """Every case tests/fixtures/page_headers.json set and saved, made by the model with Excel's functions for them:
+    Excel opens each file and reads its headers, footers and flags as it read its own before saving."""
+    from test_excel_page_headers import RECORD, portable, records
+
+    harness = pytest.importorskip("pyvbaharness")
+    app = ExcelApplication()
+    app.add_workbook()
+    app.add_module(portable(RECORD["build"]), name="Build")
+    names = [case[0] for case in records(str(app.run("Build.Build", str(tmp_path))))]
+    reader = RECORD["helper"] + (
+        "Public Function Read(folder As String, names As String) As String\n"
+        "Dim wb As Object, out As String, one As Variant\nApplication.DisplayAlerts = False\n"
+        'For Each one In Split(names, ",")\nSet wb = Workbooks.Open(folder & "\\" & one & ".xlsx")\n'
+        'out = out & one & "^^" & Dump(wb.Worksheets(1).PageSetup) & "~"\nwb.Close False\nNext\n'
+        "Read = out\nEnd Function\n")
+    with harness.ExcelSession(harness.HarnessConfig(lock_wait_s=45.0)) as excel:
+        excel.new_document()
+        result = excel.run_vba(reader, "Read", (str(tmp_path), ",".join(names)), timeout=600.0)
+        assert result.ok, result.message
+    assert records(str(result.value)) == [[case[0], "", *case[2:]] for case in RECORD["cases"][:len(names)]]
+
+
+def test_excel_reads_the_xml_maps_this_wrote(tmp_path: Path) -> None:
+    """Every case tests/fixtures/xml_maps measured that the model saves, made by the model in the measurement's order and
+    folder: Excel opens each file and reads its maps, tables, mapped cells and values as it read its own before saving."""
+    from test_excel_xml_maps import CASES, RECORD, REFUSED
+
+    harness = pytest.importorskip("pyvbaharness")
+    for name, text in {**RECORD["schemas"], **RECORD["data"]}.items():
+        (tmp_path / name).write_text(text, encoding="utf-8")
+    kept = tmp_path / "kept"
+    kept.mkdir()
+    made: list[int] = []
+    for index in range(len(CASES)):
+        if index in REFUSED:
+            continue
+        app = ExcelApplication(sandbox=False)
+        app.add_workbook()
+        app.add_module(RECORD["source"], name="P")
+        app.run("P.Probe", str(tmp_path), index)
+        saved = tmp_path / f"c{index}.xlsx"
+        if saved.exists() and CASES[index][2].get("xl/xmlMaps.xml"):
+            shutil.move(saved, kept / saved.name)
+            made.append(index)
+    reader = RECORD["source"].split("Private Sub Act(", 1)[0] + (
+        "Public Function Read(paths As String) As String\nDim wb As Object, one As Variant, out As String\n"
+        'Application.DisplayAlerts = False\nFor Each one In Split(paths, "~")\nSet wb = Workbooks.Open(one)\n'
+        'out = out & Digest(wb) & "~"\nwb.Close False\nNext\nRead = out\nEnd Function\n')
+    paths = "~".join(str(kept / f"c{index}.xlsx") for index in made)
+    with harness.ExcelSession(harness.HarnessConfig(lock_wait_s=45.0)) as excel:
+        excel.new_document()
+        result = excel.run_vba(reader, "Read", (paths,), timeout=600.0, line_numbers=False)
+    assert result.ok, result.message
+    read = str(result.value).split("~")[:-1]
+    assert {index: one for index, one in zip(made, read, strict=True)} == {index: CASES[index][1].split("|", 2)[2] for index in made}
+
+
+def test_excel_reads_the_document_properties_this_wrote(tmp_path: Path) -> None:
+    """Every case tests/fixtures/document_properties measured that the model makes, made by the model with Excel's
+    functions for them, this machine's time zone, clock and user, and saved, the workbook without docProps among
+    them: Excel opens each file and reads every property as it read its own."""
+    from test_excel_document_properties import CASES, FIXTURES, MADE, ONE, RECORD
+
+    from pyopenvba.interpreter._values import VBADate
+
+    harness = pytest.importorskip("pyvbaharness")
+    reader = RECORD["build"].split("Private Function Make0", 1)[0] + (
+        "Public Function Read(paths As String, who As String) As String\n"
+        "Dim wb As Object, one As Variant, parts() As String, out As String\nApplication.DisplayAlerts = False\n"
+        'Author = who\nFor Each one In Split(paths, "~")\nparts = Split(one, "|")\nStarted = CDate(Val(parts(1)))\n'
+        'Set wb = Workbooks.Open(parts(0))\nout = out & Dump(wb) & "~"\nwb.Close False\nNext\nRead = out\n'
+        "End Function\n")
+    with harness.ExcelSession(harness.HarnessConfig(lock_wait_s=45.0)) as excel:
+        excel.new_document()
+        who = excel.run_vba('Public Function Who() As String\nDim wb As Object\nSet wb = Workbooks.Add\n'
+                            'Who = wb.BuiltinDocumentProperties("Author").Value\nwb.Close False\nEnd Function\n',
+                            "Who", timeout=120.0)
+        assert who.ok, who.message
+        author = str(who.value)
+        files: list[tuple[str, Path, float]] = []
+        # A file Excel cannot open again, dates_overflow.
+        left_out = {"dates_overflow"}
+        for index, name in enumerate(MADE):
+            if name in left_out:
+                continue
+            app = ExcelApplication(sandbox=False)
+            app.application.user_name = author
+            app.add_module(ONE, name="Cases")
+            started = VBADate.from_datetime(datetime.datetime.now()).serial
+            app.run("One", index, str(tmp_path))
+            files.append((name, tmp_path / f"{name}.xlsx", started))
+            if CASES[name]["again"] is not None:
+                files.append((name + " again", tmp_path / f"{name}_again.xlsx", started))
+        shutil.copy(FIXTURES / "no_docprops.xlsx", tmp_path / "no_docprops.xlsx")
+        app = ExcelApplication(sandbox=False)
+        app.application.user_name = author
+        app.add_module(RECORD["opened"], name="Cases")
+        started = VBADate.from_datetime(datetime.datetime.now()).serial
+        app.run("Opened", str(tmp_path))
+        files.append(("no_docprops", tmp_path / "no_docprops_again.xlsx", started))
+        paths = "~".join(f"{path}|{started!r}" for _name, path, started in files)
+        result = excel.run_vba(reader, "Read", (paths, author), timeout=600.0)
+        assert result.ok, result.message
+    read = str(result.value).replace(author, "<author>").split("~")
+    saved_again = [name for name in MADE if name not in left_out and CASES[name]["again"] is not None]
+    assert len(files) == len(read) - 1 == len(MADE) - len(left_out) + len(saved_again) + 1, "every case, read back"
+    found = {name: read[place] for place, (name, _path, _started) in enumerate(files)}
+    expected = {name: CASES[name.removesuffix(" again")]["again" if name.endswith(" again") else "reopened"]
+                for name, _path, _started in files}
+    assert found == expected
+
+
+def test_excel_reads_the_names_this_wrote(tmp_path: Path) -> None:
+    """Every case tests/fixtures/names_add measured, made by the model with Excel's functions for them and saved:
+    Excel opens each file and reads every name, structured references among them, as it read its own."""
+    from test_excel_names_add import NAMES, ONE, RECORD
+
+    harness = pytest.importorskip("pyvbaharness")
+    for index in range(len(NAMES)):
+        app = ExcelApplication()
+        app.add_module(ONE, name="Cases")
+        app.run("One", index, str(tmp_path))
+    reader = RECORD["helper"] + (
+        "Public Function Read(paths As String) As String\nDim wb As Object, one As Variant, out As String\n"
+        'Application.DisplayAlerts = False\nFor Each one In Split(paths, "|")\nSet wb = Workbooks.Open(one)\n'
+        'out = out & Listed(wb) & "{{case}}"\nwb.Close False\nNext\nRead = out\nEnd Function\n')
+    with harness.ExcelSession(harness.HarnessConfig(lock_wait_s=45.0)) as excel:
+        excel.new_document()
+        result = excel.run_vba(reader, "Read", ("|".join(str(tmp_path / f"{name}.xlsx") for name in NAMES),),
+                               timeout=300.0)
+        assert result.ok, result.message
+    read = str(result.value).split("{{case}}")[:-1]
+    assert dict(zip(NAMES, read, strict=True)) == {case["name"]: case["reopened"] for case in RECORD["cases"]}
+
+
+def test_excel_reads_the_protection_this_wrote(tmp_path: Path) -> None:
+    """Every protection tests/fixtures/protection_file.json measured, made by the model, saved, opened in Excel.
+
+    Where a password was given, Excel refuses a wrong one and takes the
+    right one: the hash the model wrote with its own salt is Excel's.
+    """
+    import json
+
+    harness = pytest.importorskip("pyvbaharness")
+    record = json.loads((Path(__file__).parent / "fixtures" / "protection_file.json").read_text(encoding="utf-8"))
+    passwords = {"password": "pw", "password_long": "Correct Horse 9!", "allow_everything_select_none": "pw"}
+    paths: dict[str, Path] = {}
+    for case in record["cases"]:
+        app = ExcelApplication()
+        app.add_workbook()
+        app.add_module(f"Public Sub Make()\nDim ws As Object\nSet ws = ActiveWorkbook.Worksheets(1)\n{case['action']}\n"
+                       "End Sub\n", name="Builder")
+        app.run("Make")
+        paths[case["name"]] = tmp_path / f"{case['name']}.xlsx"
+        app.save(paths[case["name"]])
+    read: dict[str, str] = {}
+    opened: dict[str, str] = {}
+    with harness.ExcelSession(harness.HarnessConfig(lock_wait_s=45.0)) as excel:
+        for case in record["cases"]:
+            excel.open_document(paths[case["name"]])
+            reader = f"Public Function Report() As String\nDim ws As Object\nSet ws = ActiveWorkbook.Worksheets(1)\n" \
+                     f"Report = {record['read']}\nEnd Function\n"
+            result = excel.run_vba(reader, "Report", timeout=120.0)
+            assert result.ok, result.message
+            read[case["name"]] = str(result.value)
+            if case["name"] in passwords:
+                trial = ("Public Function Report() As String\nDim ws As Object, out As String\n"
+                         "Set ws = ActiveWorkbook.Worksheets(1)\nOn Error Resume Next\nws.Unprotect \"not it\"\n"
+                         "out = Err.Number & \",\" & ws.ProtectContents\nErr.Clear\n"
+                         f"ws.Unprotect \"{passwords[case['name']]}\"\n"
+                         "Report = out & \",\" & Err.Number & \",\" & ws.ProtectContents\nEnd Function\n")
+                result = excel.run_vba(trial, "Report", timeout=120.0)
+                assert result.ok, result.message
+                opened[case["name"]] = str(result.value)
+    for case in record["cases"]:
+        assert read[case["name"]] == case["read"], case["name"]
+    for name in passwords:
+        assert opened[name] == "1004,True,0,False", name
+
+
+def test_excel_reads_the_notes_this_wrote(tmp_path: Path) -> None:
+    """The workbook of notes tests/fixtures/notes.json measured, made by the model, saved, opened in Excel: each
+    note reads as it did in the Excel that made the measured one, form control and all."""
+    import json
+
+    harness = pytest.importorskip("pyvbaharness")
+    record = json.loads((Path(__file__).parent / "fixtures" / "notes.json").read_text(encoding="utf-8"))
+    reader = ("Public Function Notes() As String\nDim ws As Object, c As Object, out As String\n"
+              "For Each ws In ActiveWorkbook.Worksheets\n    out = out & ws.Name & \"`\"\n"
+              "    For Each c In ws.Comments\n"
+              "        out = out & c.Parent.Address(False, False) & \"|\" & Replace(Replace(c.Text, vbCr, \"\\r\"), "
+              "vbLf, \"\\n\") & \"|\" & c.Visible & \"|\" & c.Shape.Name & \"|\" & c.Shape.Left & \"|\" & c.Shape.Top "
+              "& \"|\" & c.Shape.Width & \"|\" & c.Shape.Height & \"|\" & (c.Author = Application.UserName) & \"~\"\n"
+              "    Next\n    out = out & \"^\"\nNext\nNotes = out\nEnd Function\n")
+    fields = ("cell", "text", "visible", "shape", "left", "top", "width", "height", "by_user")
+    expected = "".join(
+        name + "`" + "".join("|".join(note[field].replace("\r", "\\r").replace("\n", "\\n") for field in fields) + "~"
+                             for note in notes) + "^"
+        for name, notes in record["opened"].items())
+    app = ExcelApplication()
+    app.add_workbook()
+    lines = ["Public Sub Make()", "Dim ws As Object"]
+    for index, (name, writes) in enumerate(record["sheets"].items()):
+        lines.append("Set ws = ActiveWorkbook.Worksheets(1)" if not index else
+                     "Set ws = ActiveWorkbook.Worksheets.Add(After:=ActiveWorkbook.Worksheets("
+                     "ActiveWorkbook.Worksheets.Count))")
+        lines += [f'ws.Name = "{name}"', writes]
+    app.add_module("\n".join(lines) + "\nEnd Sub\n", name="Builder")
+    with harness.ExcelSession(harness.HarnessConfig(lock_wait_s=45.0)) as excel:
+        author = excel.run_vba("Public Function Report() As String\nReport = Application.UserName\nEnd Function\n",
+                               "Report", timeout=60.0)
+        assert author.ok, author.message
+        app.application.user_name = str(author.value)
+        app.run("Make")
+        path = tmp_path / "notes.xlsx"
+        app.save(path)
+        excel.open_document(path)
+        result = excel.run_vba(reader, "Notes", timeout=120.0)
+    assert result.ok, result.message
+    assert str(result.value) == expected
+
+
+def test_excel_reads_the_workbook_protection_this_wrote(tmp_path: Path) -> None:
+    """Every workbook protection tests/fixtures/workbook_protection.json saved, made by the model, opened in Excel."""
+    import json
+
+    harness = pytest.importorskip("pyvbaharness")
+    record = json.loads((Path(__file__).parent / "fixtures" / "workbook_protection.json").read_text(encoding="utf-8"))
+    fresh = 'Set wb = ActiveWorkbook\nwb.Worksheets(1).Name = "Alpha"\nwb.Worksheets.Add(After:=wb.Worksheets(1)).Name = "Beta"'
+    paths: dict[str, Path] = {}
+    for case in record["files"]:
+        app = ExcelApplication()
+        app.add_workbook()
+        app.add_module(f"Public Sub Make()\nDim wb As Object\n{fresh}\n{case['action']}\nEnd Sub\n", name="Builder")
+        app.run("Make")
+        paths[case["name"]] = tmp_path / f"{case['name']}.xlsx"
+        app.save(paths[case["name"]])
+    read: dict[str, str] = {}
+    with harness.ExcelSession(harness.HarnessConfig(lock_wait_s=45.0)) as excel:
+        for case in record["files"]:
+            excel.open_document(paths[case["name"]])
+            reader = (record["helper"] + "Public Function Report() As String\nDim wb As Object\nSet wb = ActiveWorkbook\n"
+                      f"Report = {record['state']}\nEnd Function\n")
+            result = excel.run_vba(reader, "Report", timeout=120.0)
+            assert result.ok, result.message
+            read[case["name"]] = str(result.value)
+            if case["name"] == "password":
+                trial = ("Public Function Report() As String\nDim wb As Object, out As String\nSet wb = ActiveWorkbook\n"
+                         "On Error Resume Next\nwb.Unprotect \"not it\"\nout = Err.Number & \",\" & wb.ProtectStructure\n"
+                         "Err.Clear\nwb.Unprotect \"pw\"\nReport = out & \",\" & Err.Number & \",\" & wb.ProtectStructure\n"
+                         "End Function\n")
+                result = excel.run_vba(trial, "Report", timeout=120.0)
+                assert result.ok, result.message
+                read["password trial"] = str(result.value)
+    for case in record["files"]:
+        assert read[case["name"]] == case["read"], case["name"]
+    assert read["password trial"] == "1004,True,0,False"
+
+
+def test_excel_reads_the_cell_styles_this_changed(tmp_path: Path) -> None:
+    """Workbooks tests/fixtures/cell_styles/style_changes.json saved, made by the model -- styles changed,
+    deleted and merged, and files opened again -- opened in Excel: every style and cell reads as in Excel's own
+    file of it."""
+    import json
+
+    harness = pytest.importorskip("pyvbaharness")
+    folder = Path(__file__).parent / "fixtures" / "cell_styles"
+    record = json.loads((folder / "style_changes.json").read_text(encoding="utf-8"))
+    saved = {"Follow": "follow", "Normal": "normal", "Setting": "setting", "Delete": "delete", "Merge": "merge",
+             "Quirks": "quirks", "AfterDelete": "after_delete", "Reopened": "reopen_changed",
+             "Planted": "planted_saved", "Duplicates": "duplicates_saved"}
+    for section in saved:
+        app = ExcelApplication()
+        app.add_workbook()
+        app.add_module(record["module"], name="Probe")
+        target, source = str(tmp_path) + os.sep, str(folder) + os.sep
+        app.run(section, *{"target": (target,), "both": (source, target)}[record["sections"][section]])
+    module: str = record["module"]
+    reader = module[:module.index("Public Function Follow")] + (
+        "Public Function Describe() As String\nDim wb As Object, s As Object, c As Object, out As String\n"
+        'Set wb = ActiveWorkbook\nout = Listing(wb) & "~"\n'
+        'For Each s In wb.Styles\nout = out & StyleProps(s) & "^"\nNext\n'
+        'For Each c In wb.Worksheets(1).Range("A1:C21").Cells\nout = out & Look(c) & "^"\nNext\n'
+        "Describe = out\nEnd Function\n")
+    read: dict[Path, str] = {}
+    with harness.ExcelSession(harness.HarnessConfig(lock_wait_s=45.0)) as excel:
+        for name in saved.values():
+            for path in (tmp_path / f"{name}.xlsx", folder / f"{name}.xlsx"):
+                excel.open_document(path)
+                result = excel.run_vba(reader, "Describe", timeout=600.0)
+                assert result.ok, f"{path.name}: {result.message}"
+                read[path] = str(result.value)
+    for name in saved.values():
+        assert read[tmp_path / f"{name}.xlsx"] == read[folder / f"{name}.xlsx"], name
+
+
+LINKS_READ = """Public Function Describe() As String
+    Dim ws As Object, h As Object, c As Object, out As String
+    On Error Resume Next
+    For Each ws In ActiveWorkbook.Worksheets
+        out = out & ws.Name & "~"
+        For Each h In ws.Hyperlinks
+            out = out & h.Range.Address & "`" & h.Address & "`" & h.SubAddress & "`" & h.ScreenTip & "`" _
+                & h.TextToDisplay & "`" & h.Name & "^"
+        Next
+        out = out & "~"
+        For Each c In ws.UsedRange.Cells
+            out = out & c.Address & "`" & c.Style.Name & "`" & c.Font.Underline & "`" & CStr(c.Value) & "^"
+        Next
+        out = out & "~"
+    Next
+    Describe = out
+End Function
+"""
+
+
+def test_excel_reads_the_links_this_saved(tmp_path: Path) -> None:
+    """Workbooks tests/fixtures/hyperlinks/hyperlinks.json saved, made by the model, opened in Excel: every link and
+    cell reads as in Excel's own file of it, a DOS path relative to the folder each was saved in."""
+    import json
+
+    from pyopenvba.apps.excel._hyperlinks_file import saved_address
+
+    harness = pytest.importorskip("pyvbaharness")
+    folder = Path(__file__).parent / "fixtures" / "hyperlinks"
+    record = json.loads((folder / "hyperlinks.json").read_text(encoding="utf-8"))
+    for section, saves in record["sections"].items():
+        if not saves:
+            continue
+        app = ExcelApplication()
+        app.add_workbook()
+        app.add_module(record["module"], name="Probe")
+        app.run(section, str(tmp_path) + os.sep)
+    names = sorted(path.name for path in folder.glob("*.xlsx"))
+    read: dict[Path, str] = {}
+    with harness.ExcelSession(harness.HarnessConfig(lock_wait_s=45.0)) as excel:
+        for name in names:
+            for path in (tmp_path / name, folder / name):
+                excel.open_document(path)
+                result = excel.run_vba(LINKS_READ, "Describe", timeout=600.0)
+                assert result.ok, f"{path.name}: {result.message}"
+                read[path] = str(result.value)
+    ours = saved_address("C:\\docs\\file.xlsx", str(tmp_path.resolve()))
+    theirs = saved_address("C:\\docs\\file.xlsx", "C:\\a\\b\\c\\d\\e\\f")
+    for name in names:
+        assert read[tmp_path / name].replace(ours, theirs) == read[folder / name], name
+
+
+@pytest.mark.parametrize("sheets", [66, 100, 255])
+def test_excel_adds_modules_to_a_project_of_many_sheets(tmp_path: Path, sheets: int) -> None:
+    """A macro gives the model's workbook many more sheets and the model saves it; Excel's editor then adds
+    modules to its project and runs one.  The writer used to leave the project's storage tree red, and from
+    about 65 added sheets Excel refused the first module: "Device I/O error", scode 0x800A0039."""
+    harness = pytest.importorskip("pyvbaharness")
+    app = ExcelApplication()
+    app.add_workbook()
+    app.add_module(f"Sub Build()\nDim i As Long\nFor i = 1 To {sheets}\n"
+                   "Worksheets.Add After:=Worksheets(Worksheets.Count)\nNext i\nEnd Sub\n", name="Module1")
+    app.run("Build")
+    path = app.save(tmp_path / "sheets.xlsm")
+    probe = ("Public Function Report() As String\n"
+             'Report = ActiveWorkbook.Worksheets.Count & "|" & ActiveWorkbook.VBProject.VBComponents.Count\n'
+             "End Function\n")
+    with harness.ExcelSession(harness.HarnessConfig(lock_wait_s=45.0)) as excel:
+        excel.open_document(path)
+        first = excel.run_vba(probe, "Report", timeout=120.0)
+        assert first.ok, first.message
+        for k in range(1, 4):
+            excel.add_module(f"Extra{k}", f"Public Function Extra{k}() As Long\nExtra{k} = {k}\nEnd Function\n")
+        again = excel.run_vba(probe, "Report", timeout=120.0)
+    assert again.ok, again.message
+    # ThisWorkbook, every sheet, Module1 and the harness's three modules; then Extra1 to Extra3.
+    assert (str(first.value), str(again.value)) == (f"{sheets + 1}|{sheets + 6}", f"{sheets + 1}|{sheets + 9}")
+
+
+def test_excel_reads_the_active_tab_this_wrote(tmp_path: Path) -> None:
+    """Tabs moved, added and deleted by the model, saved, opened in Excel: it opens each, on the sheet Excel's own save of
+    the same action opens on (tests/fixtures/active_tab/active_tab.json)."""
+    import json
+    import shutil
+
+    harness = pytest.importorskip("pyvbaharness")
+    here = Path(__file__).parent / "fixtures" / "active_tab"
+    record = json.loads((here / "active_tab.json").read_text(encoding="utf-8"))
+    with harness.ExcelSession(harness.HarnessConfig(lock_wait_s=900.0)) as excel:
+        excel.new_document()
+        for row in record["rows"]:
+            file = tmp_path / f"{row['book']}_{row['case']}.xlsx"
+            shutil.copy(here / f"{row['book']}.xlsx", file)
+            app = ExcelApplication(sandbox=False)
+            app.add_workbook()
+            app.add_module(record["act"].format(action=record["actions"][row["case"]]), name="M")
+            app.run("Act", file.as_posix())
+            read = excel.run_vba(record["read"], "ReadIt", (str(file),), timeout=45.0)
+            assert read.ok, (row["book"], row["case"], read.message)
+            assert read.value == row["reads"], (row["book"], row["case"])

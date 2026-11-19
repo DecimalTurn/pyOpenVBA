@@ -1,0 +1,1666 @@
+"""Excel tables: Worksheet.ListObjects, the objects under it, and the part a file keeps each table in.
+
+Measured in live Excel (scripts/measure_tables.py, tests/fixtures/tables/).
+A table is a block of a sheet: a header row naming its columns, its data
+rows, and a totals row it may show under them. ListObjects.Add makes one
+over a range:
+
+* with headers (xlYes), the first row's cells name the columns and
+  become text, 2020 the text "2020"; a blank one is the first free
+  ColumnN and a repeated one takes the first free number after it,
+  Name2;
+* without (xlNo), a header row is put in above the range, the cells
+  under it moving down, and names Column1, Column2 and on;
+* left to guess, a first row of text over data that is not all text is
+  taken as headers, and otherwise a header row is put in;
+* over a range that meets another table it is error 1004.
+
+The new table is the first free TableN in the workbook, TableStyleMedium2
+with row stripes and an AutoFilter. Its name is not a defined name. A
+file keeps each table in its own part, xl/tables/tableN.xml, which the
+sheet names in a tableParts element; a table read from a file keeps its
+part as it was until it changes.
+
+A header names its column, and writing over one renames the column
+through every formula; the totals row under the data shows and hides as
+:func:`show_totals` and :func:`hide_totals` set out
+(scripts/measure_structured_references.py, scripts/measure_totals_row.py).
+"""
+
+from __future__ import annotations
+
+import re
+import uuid
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass
+from dataclasses import field as dataclass_field
+from typing import TYPE_CHECKING, Any
+
+from pyopenvba.apps.excel._held import HeldPart
+from pyopenvba._a1 import Area, parse_area
+from pyopenvba._xml import attributes, escape, escape_text, unescape
+from pyopenvba.apps.excel._creator import ItemDefault
+from pyopenvba.apps.excel._model import ExcelObject, Range
+from pyopenvba.exceptions import VBARuntimeError, VBAUnsupportedError
+from pyopenvba.formula import _prefixes as prefixes
+from pyopenvba.formula._structured import TableShape, from_file, in_file, renamed_columns, renamed_table
+from pyopenvba.interpreter._objects import VBACollection, member, method, setter
+from pyopenvba.interpreter._values import (
+    EMPTY,
+    ERR_SUBSCRIPT_OUT_OF_RANGE,
+    MISSING,
+    NOTHING,
+    NULL,
+    VBADate,
+    VBAInt,
+    error,
+    to_bool,
+    to_integer,
+    to_text,
+)
+
+if TYPE_CHECKING:
+    from pyopenvba.apps.excel._autofilter import SheetFilter
+    from pyopenvba.apps.excel._model import Workbook, Worksheet
+    from pyopenvba.apps.excel._pivots import PivotTable
+    from pyopenvba.apps.excel._sort import SortState
+
+#: ListObjects.Add's SourceType for a range of the sheet and for a database, and its answers to whether the range has
+#: headers.
+SOURCE_RANGE, SOURCE_EXTERNAL = 1, 0
+GUESS, YES, NO = 0, 1, 2
+DEFAULT_STYLE = "TableStyleMedium2"
+
+_NAMESPACES = ('xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" '
+               'xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006" mc:Ignorable="xr xr3" '
+               'xmlns:xr="http://schemas.microsoft.com/office/spreadsheetml/2014/revision" '
+               'xmlns:xr3="http://schemas.microsoft.com/office/spreadsheetml/2016/revision3"')
+_TABLE = re.compile(r"<table\b[^>]*>")
+_COLUMN = re.compile(r"<tableColumn\b[^>]*?(?:/>|>.*?</tableColumn>)", re.DOTALL)
+_STYLE = re.compile(r"<tableStyleInfo\b[^>]*/>")
+_FILTER = re.compile(r"<autoFilter\b[^>]*?(?:/>|>.*?</autoFilter>)", re.DOTALL)
+_TOTALS_FORMULA = re.compile(r"<totalsRowFormula\b[^>]*>(.*?)</totalsRowFormula>", re.DOTALL)
+_CALCULATED = re.compile(r"<calculatedColumnFormula\b[^>]*>(.*?)</calculatedColumnFormula>", re.DOTALL)
+_ALT_TEXT_URI = "{504A1905-F514-4f6f-8877-14C23A59335A}"
+_ALT_TEXT = re.compile(r"<x14:table\b([^>]*?)/>")
+_EXTENSIONS = re.compile(r"<extLst>(.*?)</extLst>(?=</table>)", re.DOTALL)
+#: The most characters ListObject.Comment takes; more is error 5 (tests/fixtures/table_members.json).
+COMMENT_LIMIT = 255
+
+
+@dataclass
+class TableColumn:
+    name: str
+    id: int
+    uid: str = ""
+    #: What the totals row holds under the column, kept while the row is hidden: a label, or a function by its
+    #: name in the part -- sum, count, custom and the rest -- with a custom one's formula.
+    totals_label: str = ""
+    totals_function: str = ""
+    totals_formula: str = ""
+    #: A calculated column's formula, which a row the table gains takes; "" for a column of values.
+    calculated: str = ""
+    #: The XML map and leaf the column is mapped to (see _xml_maps), or None, and the leaf's name, which it keeps as its
+    #: uniqueName once cleared.
+    xml: Any = None
+    xml_name: str = ""
+
+
+@dataclass
+class Table:
+    """One table of a sheet, as the model holds it."""
+
+    sheet: Worksheet
+    id: int
+    #: DisplayName, which formulas name the table by.
+    name: str
+    #: The whole table, its header and totals rows included.
+    area: Area
+    columns: list[TableColumn]
+    #: Delete took it, where another end leaves a held object something to answer (tests/fixtures/held_objects.json).
+    deleted: bool = False
+    headers: bool = True
+    totals: bool = False
+    #: Whether the totals row has ever been shown, which a part says by leaving out totalsRowShown="0".
+    totals_shown: bool = False
+    style: str = DEFAULT_STYLE
+    first_column: bool = False
+    last_column: bool = False
+    row_stripes: bool = True
+    column_stripes: bool = False
+    #: ShowAutoFilter, and the filter's criteria once it has had any (see _table_filters).
+    auto_filter: bool = True
+    #: ShowAutoFilterDropDown: False writes a hidden button on every column of the filter.
+    drop_downs: bool = True
+    #: Comment, AlternativeText and Summary; the part keeps the first on the table, the others in an x14 extension.
+    comment: str = ""
+    alt_text: str = ""
+    summary: str = ""
+    #: The part's tableType, "" for a table of the sheet's own cells.
+    kind: str = ""
+    filter: SheetFilter | None = dataclass_field(default=None, repr=False)
+    #: The block a file gave the filter, which leaves a totals row out, and the table's own block then.
+    filter_ref: tuple[Area, Area] | None = dataclass_field(default=None, repr=False)
+    uid: str = ""
+    #: ListObject.Name where it differs from DisplayName, as the part's name; "" while they agree.
+    own_name: str = ""
+    #: The part the table was read from or written to, and the sheet relationship naming it; "" for a new table.
+    part: str = ""
+    relationship: str = ""
+    #: The part as the file had it, kept while nothing about the table changes.
+    xml: str = ""
+    changed: bool = False
+    #: Whether an XML import left it with no rows, which a save marks insertRow (tests/fixtures/xml_infer.json).
+    xml_emptied: bool = False
+    view: ListObject | None = dataclass_field(default=None, repr=False)
+    #: The query table of a table over a database, read from a file (see _query_databases.ListQueryTable).
+    query: Any = dataclass_field(default=None, repr=False)
+    sort_state: SortState | None = dataclass_field(default=None, repr=False)
+
+    @property
+    def header_row(self) -> int:
+        return self.area.top if self.headers else 0
+
+    @property
+    def data(self) -> Area | None:
+        """The data rows, or None for a table with none."""
+        top = self.area.top + (1 if self.headers else 0)
+        bottom = self.area.bottom - (1 if self.totals else 0)
+        return Area(top, self.area.left, bottom, self.area.right) if top <= bottom else None
+
+    def rows(self) -> int:
+        data = self.data
+        return 0 if data is None else data.rows
+
+
+# --- the file ------------------------------------------------------------------------------------
+
+
+def read_table(sheet: Worksheet, part: str, relationship: str, xml: str) -> Table:
+    """A table as its part spells it."""
+    found = _TABLE.search(xml)
+    head = attributes(found.group(0)) if found else {}
+    style = _STYLE.search(xml)
+    shown = attributes(style.group(0)) if style else {}
+    columns: list[TableColumn] = []
+    for match in _COLUMN.finditer(xml):
+        one = attributes(_opening(match.group(0)))
+        formula = _TOTALS_FORMULA.search(match.group(0))
+        calculated = _CALCULATED.search(match.group(0))
+        columns.append(TableColumn(
+            name=_column_name(one.get("name", "")), id=int(one.get("id", "0") or 0), uid=one.get("xr3:uid", ""),
+            totals_label=_column_name(one.get("totalsRowLabel", "")), totals_function=one.get("totalsRowFunction", ""),
+            totals_formula=_read_formula(formula.group(1)) if formula else "",
+            calculated=_read_formula(calculated.group(1)) if calculated else ""))
+    element = _FILTER.search(xml)
+    table = Table(
+        sheet=sheet, id=int(head.get("id", "0") or 0), name=head.get("displayName") or head.get("name", ""),
+        own_name="" if head.get("name", "") in ("", head.get("displayName")) else head.get("name", ""),
+        area=parse_area(head.get("ref", "A1"), sheet=""), columns=columns,
+        headers=head.get("headerRowCount", "1") != "0", totals=int(head.get("totalsRowCount", "0") or 0) > 0,
+        totals_shown=head.get("totalsRowShown", "1") != "0",
+        style=shown.get("name", ""), first_column=shown.get("showFirstColumn") == "1",
+        last_column=shown.get("showLastColumn") == "1", row_stripes=shown.get("showRowStripes") == "1",
+        column_stripes=shown.get("showColumnStripes") == "1", auto_filter=element is not None,
+        comment=_column_name(head.get("comment", "")), kind=head.get("tableType", ""),
+        uid=head.get("xr:uid", ""), part=part, relationship=relationship, xml=xml)
+    extension = _ALT_TEXT.search(xml)
+    if extension is not None:
+        described = attributes(extension.group(1))
+        table.alt_text, table.summary = described.get("altText", ""), described.get("altTextSummary", "")
+    if element is not None:
+        _read_filter(table, element.group(0))
+    return table
+
+
+def _read_filter(table: Table, element: str) -> None:
+    """A table's filter as its part spells it: the criteria on its columns, and the block it gives."""
+    from pyopenvba.apps.excel._autofilter import read_filter
+
+    found = read_filter(table.sheet, element)
+    if found is None:
+        return
+    block = Area(found.area.top, found.area.left, found.area.bottom, found.area.right)
+    # Excel writes the filter's block without the totals row, and reading it back answers the whole table
+    # (tests/fixtures/table_filter_range.json).
+    short = Area(table.area.top, table.area.left, table.area.bottom - 1, table.area.right) if table.totals else None
+    if block != table.area and block != short:
+        table.filter_ref = (block, table.area)
+    hidden = ' hiddenButton="1"'
+    if found.fields and all(index in found.fields and hidden in found.fields[index].attributes
+                            for index in range(1, len(table.columns) + 1)):
+        # Every column's button hidden is ShowAutoFilterDropDown False; a column with no criteria then holds none.
+        table.drop_downs = False
+        for index, one in list(found.fields.items()):
+            one.attributes = one.attributes.replace(hidden, "")
+            if not one.xml and not one.attributes:
+                del found.fields[index]
+    if found.fields or found.tail:
+        table.filter = found
+
+
+def _opening(element: str) -> str:
+    stop = element.find(">")
+    return element if stop < 0 else element[: stop + 1]
+
+
+def _column_attribute(name: str) -> str:
+    """A column's name as a table part spells it: a control character as _xHHHH_, in small letters as Excel
+    writes it there, a tab _x0009_ (tests/fixtures/structured_references/)."""
+    return re.sub(r"[\x00-\x1f]", lambda found: f"_x{ord(found.group(0)):04x}_", escape(name))
+
+
+def _read_formula(body: str) -> str:
+    """A column's formula as the table part spells it, as Range.Formula spells it."""
+    return prefixes.from_file(from_file("=" + unescape(body)))
+
+
+def _written_formula(formula: str, tables: list[str]) -> str:
+    """A column's formula as the table part spells it: structured references, newer functions and bound names as a
+    file has them, without the =."""
+    return escape_text(prefixes.in_file(in_file(formula, tables))[1:])
+
+
+def _column_name(text: str) -> str:
+    """A column's name from its table part, each _xHHHH_ the character it stands for."""
+    return re.sub(r"_x([0-9A-Fa-f]{4})_", lambda found: chr(int(found.group(1), 16)), text)
+
+
+def base_table_xml(table: Table) -> str:
+    """The part for a table the model made, as Excel writes one."""
+    reference = table.area.address(absolute=False)
+    header = "" if table.headers else ' headerRowCount="0"'
+    data = table.data
+    filtered = Area(table.area.top, table.area.left, data.bottom if data is not None else table.area.top,
+                    table.area.right).address(absolute=False)
+    auto_filter = _filter_element(table, filtered, None)
+    names = [one.name for one in all_tables(table.sheet)]
+    query = table.query
+    if query is not None:
+        # A table over a database, as Excel writes one ListObjects.Add made: each column named uniquely by its id and tied
+        # to its field, and an insert row before the first refresh (tests/fixtures/list_query_add.json).
+        fields = list(query.field_ids)
+        if len(fields) != len(table.columns):
+            raise VBAUnsupportedError("saving a table over a database whose fields are not its columns is not implemented")
+        columns = "".join(_patched_column(f'<tableColumn id="{column.id}" xr3:uid="{column.uid}" uniqueName="{column.id}" '
+                                          f'name="" queryTableFieldId="{field}"/>', column, names)
+                          for column, field in zip(table.columns, fields, strict=True))
+        typed = ' tableType="queryTable"' + (' insertRow="1"' if query.placeholder else "")
+    elif table.kind == "xml":
+        # A table mapped to XML: each column named uniquely by its leaf, or by its id where it has none, and its mapping
+        # (tests/fixtures/xml_maps.json).
+        typed = ' tableType="xml"' + (' insertRow="1"' if table.xml_emptied else "")
+        columns = "".join(_patched_column(
+            f'<tableColumn id="{column.id}" xr3:uid="{column.uid}" uniqueName="{escape(column.xml_name) if column.xml_name else column.id}" '
+            f'name="">' + (f'<xmlColumnPr mapId="{column.xml[0].id}" xpath="{escape(column.xml[1].path)}" xmlDataType="{column.xml[1].kind}"/>'
+                           if column.xml else "") + '</tableColumn>', column, names) for column in table.columns)
+    else:
+        typed = ""
+        columns = "".join(_patched_column(f'<tableColumn id="{column.id}" xr3:uid="{column.uid}" name=""/>', column,
+                                          names) for column in table.columns)
+    counts = _totals_counts(table)
+    style = (f'<tableStyleInfo{_style_name(table)} showFirstColumn="{int(table.first_column)}" '
+             f'showLastColumn="{int(table.last_column)}" showRowStripes="{int(table.row_stripes)}" '
+             f'showColumnStripes="{int(table.column_stripes)}"/>')
+    comment = f' comment="{_column_attribute(table.comment)}"' if table.comment else ""
+    return ('<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\r\n'
+            f'<table {_NAMESPACES} id="{table.id}" xr:uid="{table.uid}" name="{escape(table.own_name or table.name)}" '
+            f'displayName="{escape(table.name)}"{comment} ref="{reference}"{typed}{header}{counts}>{auto_filter}'
+            f'<tableColumns count="{len(table.columns)}">{columns}</tableColumns>{style}'
+            f'{_described(table, "")}</table>')
+
+
+def _described(table: Table, extensions: str) -> str:
+    """The part's extLst, ``extensions`` holding what the file had there, with the x14 table extension that keeps
+    AlternativeText and Summary put first where either is set, and the extLst left out where it is empty
+    (tests/fixtures/table_members.json)."""
+    kept = re.sub(r'<ext\b[^>]*?\buri="\{504A1905-F514-4f6f-8877-14C23A59335A\}".*?</ext>', "", extensions,
+                  flags=re.DOTALL)
+    found = ""
+    if table.alt_text or table.summary:
+        alt = f' altText="{_column_attribute(table.alt_text)}"' if table.alt_text else ""
+        summary = f' altTextSummary="{_column_attribute(table.summary)}"' if table.summary else ""
+        found = (f'<ext uri="{_ALT_TEXT_URI}" xmlns:x14="http://schemas.microsoft.com/office/spreadsheetml/2009/9/'
+                 f'main"><x14:table{alt}{summary}/></ext>')
+    return f"<extLst>{found}{kept}</extLst>" if found or kept else ""
+
+
+def _patched_xml(table: Table) -> str:
+    """A table read from a file, its part brought up to date: name, block, AutoFilter and style changed in
+    place, everything else -- totals, calculated columns, a query's fields -- as the file had it."""
+    xml = table.xml
+    found = _TABLE.search(xml)
+    if found is None:
+        return table_xml(table)
+    head = found.group(0)
+    for attribute, value in (("name", escape(table.own_name or table.name)), ("displayName", escape(table.name)),
+                             ("ref", table.area.address(absolute=False))):
+        head = re.sub(rf'(\s{attribute}=")[^"]*(")', lambda match: match.group(1) + value + match.group(2), head,
+                      count=1)
+    head = re.sub(r'\s(?:totalsRowCount|totalsRowShown|comment)="[^"]*"', "", head)
+    if table.comment:
+        named = re.search(r'\sdisplayName="[^"]*"', head)
+        at = named.end() if named is not None else len(head) - 1
+        head = head[:at] + f' comment="{_column_attribute(table.comment)}"' + head[at:]
+    after = max((match.end() for name in ("ref", "tableType", "headerRowCount", "insertRow", "insertRowShift")
+                 for match in re.finditer(rf'\s{name}="[^"]*"', head)), default=len(head) - 1)
+    head = head[:after] + _totals_counts(table) + head[after:]
+    xml = xml[: found.start()] + head + xml[found.end():]
+    elements = list(_COLUMN.finditer(xml))
+    if len(elements) == len(table.columns):
+        # Each column under the name it has now and with what its totals row holds.
+        names = [one.name for one in all_tables(table.sheet)]
+        for element, column in reversed(list(zip(elements, table.columns))):
+            xml = xml[: element.start()] + _patched_column(element.group(0), column, names) + xml[element.end():]
+    data = table.data
+    filtered = Area(table.area.top, table.area.left, data.bottom if data is not None else table.area.top,
+                    table.area.right).address(absolute=False)
+    existing = _FILTER.search(xml)
+    element = _filter_element(table, filtered, existing.group(0) if existing is not None else None)
+    if existing is not None:
+        xml = xml[: existing.start()] + element + xml[existing.end():]
+    elif element:
+        opened = _TABLE.search(xml)
+        assert opened is not None
+        xml = xml[: opened.end()] + element + xml[opened.end():]
+    style = (f'<tableStyleInfo{_style_name(table)} showFirstColumn="{int(table.first_column)}" '
+             f'showLastColumn="{int(table.last_column)}" showRowStripes="{int(table.row_stripes)}" '
+             f'showColumnStripes="{int(table.column_stripes)}"/>')
+    shown = _STYLE.search(xml)
+    if shown is not None:
+        xml = xml[: shown.start()] + style + xml[shown.end():]
+    else:
+        xml = xml.replace("</table>", style + "</table>", 1)
+    extensions = _EXTENSIONS.search(xml)
+    if extensions is not None:
+        return xml[: extensions.start()] + _described(table, extensions.group(1)) + xml[extensions.end():]
+    return xml.replace("</table>", _described(table, "") + "</table>", 1)
+
+
+def _filter_element(table: Table, filtered: str, existing: str | None) -> str:
+    """The table's autoFilter element, "" where it shows none, with every column's button hidden where
+    ShowAutoFilterDropDown is False (see _plain_filter_element)."""
+    element = _plain_filter_element(table, filtered, existing)
+    return element if table.drop_downs or not element else _hidden_buttons(element, len(table.columns))
+
+
+_FILTER_COLUMN = re.compile(r'<filterColumn colId="(\d+)"([^>]*?)(?:/>|>(.*?)</filterColumn>)', re.DOTALL)
+
+
+def _hidden_buttons(element: str, columns: int) -> str:
+    """An autoFilter element with a filterColumn for each column, hiddenButton="1" after its colId, criteria and
+    all, as Excel writes ShowAutoFilterDropDown False (tests/fixtures/table_members.json)."""
+    head = re.match(r"<autoFilter\b[^>]*?(?=/?>)", element)
+    assert head is not None
+    closed = element.endswith("/>") and "</autoFilter>" not in element
+    body = "" if closed else element[element.index(">") + 1: element.rindex("</autoFilter>")]
+    found: dict[int, tuple[str, str | None]] = {int(match.group(1)): (match.group(2), match.group(3))
+                                                for match in _FILTER_COLUMN.finditer(body)}
+    last = max((match.end() for match in _FILTER_COLUMN.finditer(body)), default=0)
+    written: list[str] = []
+    for index in range(columns):
+        others, inner = found.get(index, ("", None))
+        if "hiddenButton=" not in others:
+            others = ' hiddenButton="1"' + others
+        written.append(f'<filterColumn colId="{index}"{others}' + ("/>" if inner is None else
+                                                                  f">{inner}</filterColumn>"))
+    return f"{head.group(0)}>{''.join(written)}{body[last:]}</autoFilter>"
+
+
+def _plain_filter_element(table: Table, filtered: str, existing: str | None) -> str:
+    """The table's autoFilter element, "" where it shows none: the block it covers, and the criteria on its
+    columns once it has had any, written as a sheet's filter writes them (tests/fixtures/table_autofilter/)."""
+    from pyopenvba.apps.excel._table_filters import table_filter
+
+    found = table_filter(table)
+    if found is None:
+        return ""
+    if found.fields or found.tail or (existing is not None and "<filterColumn" in existing):
+        return found.xml()
+    if existing is not None:
+        return re.sub(r'(\sref=")[^"]*(")', rf"\g<1>{filtered}\2", existing, count=1)
+    return f'<autoFilter ref="{filtered}" xr:uid="{table.uid}"/>'
+
+
+def table_xml(table: Table) -> str:
+    from pyopenvba.apps.excel._table_sort import write_state
+
+    return write_state(table, base_table_xml(table))
+
+
+def patched_xml(table: Table) -> str:
+    from pyopenvba.apps.excel._table_sort import write_state
+
+    return write_state(table, _patched_xml(table))
+
+
+def _style_name(table: Table) -> str:
+    """A table with no style has no name for it, where a save would otherwise write an empty one."""
+    return f' name="{escape(table.style)}"' if table.style else ""
+
+
+def _totals_counts(table: Table) -> str:
+    """The table element's word on its totals row: shown, never shown, or neither for one shown and hidden again."""
+    if table.totals:
+        return ' totalsRowCount="1"'
+    return "" if table.totals_shown else ' totalsRowShown="0"'
+
+
+def _patched_column(element: str, column: TableColumn, tables: list[str]) -> str:
+    """A tableColumn element with the column's name and what its totals row holds, anything else kept: a label
+    or a function as an attribute after the name, and a custom function's formula as the file spells it."""
+    opening = _opening(element)
+    closed = opening.endswith("/>")
+    inside = opening[len("<tableColumn"):-2 if closed else -1]
+    body = "" if closed else element[len(opening):element.rindex("</tableColumn>")]
+    inside = re.sub(r'\s(?:totalsRowFunction|totalsRowLabel)="[^"]*"', "", inside)
+    totals = f' totalsRowFunction="{column.totals_function}"' if column.totals_function else \
+        f' totalsRowLabel="{_column_attribute(column.totals_label)}"' if column.totals_label else ""
+    inside = re.sub(r'(\sname=")[^"]*(")', lambda match: match.group(1) + _column_attribute(column.name)
+                    + match.group(2) + totals, inside, count=1)
+    # The children in the schema's order: the calculated column's formula, then the custom total's.
+    body = _TOTALS_FORMULA.sub("", _CALCULATED.sub("", body))
+    if column.totals_function == "custom" and column.totals_formula:
+        body = f"<totalsRowFormula>{_written_formula(column.totals_formula, tables)}</totalsRowFormula>" + body
+    if column.calculated:
+        body = (f"<calculatedColumnFormula>{_written_formula(column.calculated, tables)}"
+                "</calculatedColumnFormula>" + body)
+    return f"<tableColumn{inside}>{body}</tableColumn>" if body else f"<tableColumn{inside}/>"
+
+
+def guid() -> str:
+    return "{" + str(uuid.uuid4()).upper() + "}"
+
+
+def shape(table: Table) -> TableShape:
+    """What a structured reference needs to know of a table."""
+    area = table.area
+    return TableShape(table.name, Area(area.top, area.left, area.bottom, area.right, table.sheet.name), table.headers,
+                      table.totals, tuple(column.name for column in table.columns))
+
+
+# --- names ---------------------------------------------------------------------------------------
+
+
+def rewrite_formulas(book: Workbook, change: Callable[[str], str]) -> None:
+    """Put every formula of the workbook -- its cells', its defined names' and its tables' totals -- through
+    ``change``."""
+    for sheet in book.sheets_:
+        for cell in sheet.cells_.values():
+            if cell.formula:
+                updated = change(cell.formula)
+                if updated != cell.formula:
+                    cell.formula = updated
+                    sheet.touched()
+        for table in sheet.tables:
+            for column in table.columns:
+                for field in ("totals_formula", "calculated"):
+                    text: str = getattr(column, field)
+                    if text and (updated := change(text)) != text:
+                        setattr(column, field, updated)
+                        table.changed = True
+    for entry in book.names_.entries:
+        updated = change(entry.refers_to)
+        if updated != entry.refers_to:
+            entry.refers_to = updated
+            book.names_.changed = True
+    book.calculator.rebuild()
+
+
+def rename(table: Table, wanted: str) -> None:
+    """ListObject.Name: the table's new name, and every formula naming it follows."""
+    old = table.name
+    table.name = wanted
+    table.changed = True
+    table.sheet.touched()
+    rewrite_formulas(table.sheet.book, lambda text: renamed_table(text, old, wanted))
+
+
+#: Set while the model writes a table's header or totals cells itself, which is an edit of them too.
+_naming: set[int] = set()
+
+
+def edited(sheet: Worksheet, row: int, column: int) -> None:
+    """A cell changed: where it is a table's header, the column takes the name it gives; where it is in the totals
+    row, the column totals as it now says."""
+    headers_changed(sheet, row, column)
+    totals_changed(sheet, row, column)
+
+
+def headers_changed(sheet: Worksheet, row: int, column: int) -> None:
+    """A cell changed: where it is a table's header, the columns take the names its cells now give.
+
+    Measured (tests/fixtures/structured_references/): a header cell names
+    its column with the text it shows -- 1.5, TRUE, 1/2/2020 -- and holds
+    that text afterwards; one left empty is the first free ColumnN, and of
+    two alike the one further left keeps the name and the other is
+    numbered, whichever was written. Every formula follows its column.
+    """
+    table = next((one for one in sheet.tables if one.headers and one.area.top == row
+                  and one.area.left <= column <= one.area.right), None)
+    if table is None or id(table) in _naming:
+        return
+    texts = [cell_text(sheet, row, one) for one in range(table.area.left, table.area.right + 1)]
+    name_columns(table, column_names(texts))
+
+
+def name_columns(table: Table, names: list[str]) -> None:
+    """Give a table's columns these names: in its header cells, as text, and in every formula naming them."""
+    renames = {column.name.lower(): name for column, name in zip(table.columns, names) if column.name != name}
+    for column, name in zip(table.columns, names):
+        column.name = name
+    sheet = table.sheet
+    if table.headers:
+        _naming.add(id(table))
+        try:
+            for offset, name in enumerate(names):
+                cell = sheet.cell(table.area.top, table.area.left + offset, create=True)
+                assert cell is not None
+                if cell.value != name or cell.formula:
+                    cell.value, cell.formula, cell.stale, cell.shared = name, "", False, None
+                    sheet.cell_changed(table.area.top, table.area.left + offset)
+        finally:
+            _naming.discard(id(table))
+    if renames:
+        table.changed = True
+        sheet.touched()
+        rewrite_formulas(sheet.book, lambda text: renamed_columns(text, table.name, renames))
+
+
+#: TotalsCalculation's numbers, each the function's name in a table part, and the SUBTOTAL each function writes.
+CALCULATIONS = ("", "sum", "average", "count", "countNums", "min", "max", "stdDev", "var", "custom")
+_SUBTOTAL = {"sum": 109, "average": 101, "count": 103, "countNums": 102, "min": 105, "max": 104, "stdDev": 107,
+             "var": 110}
+
+
+def show_totals(table: Table) -> None:
+    """ShowTotals = True, as measured (tests/fixtures/tables/totals_row/).
+
+    Cells go in under the table across its columns, those below moving
+    down, even where they are empty. The first time the row is shown the
+    first column says Total, unless it is the only one or totals already,
+    and the last adds itself up, or counts where its values are not all
+    numbers. Each column's label, SUBTOTAL or formula is written in.
+    """
+    from pyopenvba.apps.excel._editing import shift_cells
+
+    sheet, area = table.sheet, table.area
+    if not table.totals_shown:
+        last, first = table.columns[-1], table.columns[0]
+        if not last.totals_function:
+            last.totals_function = "sum" if _numbers(table, len(table.columns) - 1) else "count"
+        if len(table.columns) > 1 and not first.totals_function and not first.totals_label:
+            first.totals_label = "Total"
+    below = Area(area.bottom + 1, area.left, area.bottom + 1, area.right, sheet.name)
+    shift_cells(Range(sheet, [below]), below, delete=False, vertical=True)
+    table.area = Area(area.top, area.left, area.bottom + 1, area.right)
+    table.totals = table.totals_shown = table.changed = True
+    for index in range(len(table.columns)):
+        _write_total(table, index)
+    sheet.shape_changed()
+
+
+def hide_totals(table: Table) -> None:
+    """ShowTotals = False: the row's cells are deleted, those below moving up; what each column totals stays for
+    the next time it is shown."""
+    from pyopenvba.apps.excel._editing import shift_cells
+
+    sheet, area = table.sheet, table.area
+    table.area = Area(area.top, area.left, area.bottom - 1, area.right)
+    table.totals, table.changed = False, True
+    row = Area(area.bottom, area.left, area.bottom, area.right, sheet.name)
+    shift_cells(Range(sheet, [row]), row, delete=True, vertical=True)
+    sheet.shape_changed()
+
+
+def _numbers(table: Table, index: int) -> bool:
+    """Whether a column's data is all numbers, and there is some."""
+    data = table.data
+    if data is None:
+        return False
+    calculator = table.sheet.book.calculator
+    values = [calculator.value_of(table.sheet.name, row, data.left + index) for row in range(data.top, data.bottom + 1)]
+    present = [value for value in values if value is not EMPTY]
+    return bool(present) and all(isinstance(value, (int, float)) and not isinstance(value, bool) for value in present)
+
+
+def _write_total(table: Table, index: int) -> None:
+    """Write a column's totals cell as the column says: its SUBTOTAL, its own formula, its label or nothing."""
+    from pyopenvba.formula._parse import Structured
+    from pyopenvba.formula._structured import spelled
+
+    sheet, column = table.sheet, table.columns[index]
+    row, at = table.area.bottom, table.area.left + index
+    formula, value = "", EMPTY
+    code = _SUBTOTAL.get(column.totals_function)
+    if code is not None:
+        formula = f"=SUBTOTAL({code},{spelled(Structured(table=table.name, first=column.name, last=column.name))})"
+    elif column.totals_function == "custom":
+        formula = column.totals_formula
+    elif column.totals_label:
+        value = column.totals_label
+    cell = sheet.cell(row, at, create=bool(formula) or value is not EMPTY)
+    if cell is None:
+        return
+    _naming.add(id(table))
+    try:
+        cell.value, cell.formula, cell.stale, cell.shared = value, formula, bool(formula), None
+        sheet.cell_changed(row, at)
+    finally:
+        _naming.discard(id(table))
+
+
+def totals_changed(sheet: Worksheet, row: int, column: int) -> None:
+    """A cell of a totals row written: the column totals as the cell now says. A SUBTOTAL of the column is that
+    function, TotalsCalculation reading it back; any other formula is the column's own, custom; a value is its
+    label, a number written there becoming its text; an empty cell totals nothing."""
+    table = next((one for one in sheet.tables if one.totals and one.area.bottom == row
+                  and one.area.left <= column <= one.area.right), None)
+    if table is None or id(table) in _naming:
+        return
+    entry = table.columns[column - table.area.left]
+    cell = sheet.cell(row, column)
+    entry.totals_label = entry.totals_function = entry.totals_formula = ""
+    table.changed = True
+    if cell is not None and cell.formula:
+        entry.totals_function = _function_of(cell.formula, table, entry) or "custom"
+        if entry.totals_function == "custom":
+            entry.totals_formula = cell.formula
+    elif cell is not None and cell.value is not EMPTY:
+        entry.totals_label = cell_text(sheet, row, column)
+        if cell.value != entry.totals_label:
+            _naming.add(id(table))
+            try:
+                cell.value = entry.totals_label
+                sheet.cell_changed(row, column)
+            finally:
+                _naming.discard(id(table))
+
+
+def _function_of(formula: str, table: Table, column: TableColumn) -> str | None:
+    """The totals function a formula is: SUBTOTAL with one of the codes over this column's data, or None."""
+    from pyopenvba.formula._parse import Call, FormulaError, Literal, Structured, parse
+
+    try:
+        node = parse(formula)
+    except FormulaError:
+        return None
+    if not (isinstance(node, Call) and node.name.upper() == "SUBTOTAL" and len(node.args) == 2):
+        return None
+    code, reference = node.args
+    if not (isinstance(code, Literal) and isinstance(reference, Structured)) or reference.items or reference.span \
+            or reference.table.lower() != table.name.lower() or (reference.first or "").lower() != column.name.lower():
+        return None
+    return next((name for name, number in _SUBTOTAL.items() if code.value == number), None)
+
+
+def cell_text(sheet: Worksheet, row: int, column: int) -> str:
+    """What a header cell names its column with: the text it shows, a number or a date through its format."""
+    from pyopenvba.formula._display import UndisplayableError, shown
+
+    cell = sheet.cell(row, column)
+    if cell is None:
+        return ""
+    value = sheet.book.calculator.value_of(sheet.name, row, column)
+    if isinstance(value, VBADate):
+        value = value.serial
+    if value is EMPTY or value is None:
+        return ""
+    if isinstance(value, (bool, int, float)):
+        try:
+            return shown(value, cell.number_format, epoch_1904=sheet.book.epoch_1904,
+                         locale=sheet.book.application.locale)[0]
+        except UndisplayableError:
+            pass
+    return to_text(value)
+
+
+def range_areas(sheet: Worksheet, text: str) -> list[Area] | None:
+    """What Range reads a table's name or a structured reference as, None for text that is neither.
+
+    Measured: Range("Table1") is the table's data and Range("Table1[Qty]")
+    a column of it; this row, a totals row the table does not show, a
+    column it has not got, or a table on another sheet is error 1004.
+    """
+    from pyopenvba.formula._parse import STRUCTURED, THIS_ROW, FormulaError, Structured, read_structured, split_sheet
+    from pyopenvba.formula._structured import area
+    from pyopenvba.formula._values import ExcelError
+
+    if re.fullmatch(STRUCTURED, text):
+        try:
+            node = read_structured(text)
+        except FormulaError:
+            raise error(1004, f"{text!r} is not a reference Excel reads") from None
+    else:
+        owner, bare = split_sheet(text)
+        node = Structured(table=bare, sheet=owner)
+    table = next((one for one in all_tables(sheet) if one.name.lower() == node.table.lower()), None)
+    if table is None:
+        if "[" in text:
+            raise error(1004, f"no table for {text!r}")
+        return None
+    on = table.sheet.name.lower()
+    if (node.sheet.lower() != on if node.sheet else table.sheet is not sheet) or THIS_ROW in node.items:
+        raise error(1004, f"{text!r} is not a range of this sheet")
+    try:
+        return [area(node, shape(table), 0)]
+    except ExcelError:
+        raise error(1004, f"{text!r} names no cells") from None
+
+
+# --- making one ----------------------------------------------------------------------------------
+
+
+def all_tables(sheet: Worksheet) -> list[Table]:
+    return [table for one in sheet.book.sheets_ for table in one.tables]
+
+
+def next_part_id(sheet: Worksheet) -> int:
+    """The id the next table or XML-mapped single cell takes: they count on from one another's, in the order they were made
+    (tests/fixtures/xml_infer.json)."""
+    singles = (single.number for one in sheet.book.sheets_ for single in one.xml_cells.values())
+    return max(max((table.id for table in all_tables(sheet)), default=0), max(singles, default=0)) + 1
+
+
+def table_at(sheet: Worksheet, row: int, column: int) -> Table | None:
+    return next((table for table in sheet.tables if table.area.contains(row, column)), None)
+
+
+def _free_name(sheet: Worksheet) -> str:
+    taken = {table.name.lower() for table in all_tables(sheet)}
+    number = 1
+    while f"table{number}" in taken:
+        number += 1
+    return f"Table{number}"
+
+
+def column_names(texts: list[str]) -> list[str]:
+    """Header texts as Excel makes column names of them: a blank one ColumnN, a repeat numbered after itself."""
+    names: list[str] = []
+    for text in texts:
+        taken = {name.lower() for name in names} | {one.lower() for one in texts if one}
+        if not text:
+            number = 1
+            while f"column{number}" in taken:
+                number += 1
+            names.append(f"Column{number}")
+        elif text.lower() in {name.lower() for name in names}:
+            number = 2
+            while f"{text}{number}".lower() in taken or f"{text}{number}".lower() in {n.lower() for n in names}:
+                number += 1
+            names.append(f"{text}{number}")
+        else:
+            names.append(text)
+    return names
+
+
+def add(sheet: Worksheet, source: Range, headers: int, style: str) -> Table:
+    """ListObjects.Add over a range of the sheet."""
+    if len(source.areas) != 1:
+        raise VBAUnsupportedError("a table over several areas is not implemented")
+    area = source.first
+    area = Area(area.top, area.left, area.bottom, area.right)
+    if any(_meets(table.area, area) for table in sheet.tables):
+        raise error(1004, "A table cannot overlap another table.")
+    if any(_meets(one, area) for one in [*sheet.array_formulas.values(), *sheet.merged_areas]):
+        raise VBAUnsupportedError("a table over array formulas or merged cells is not implemented")
+    if any(_meets(one.block, area) for one in sheet.data_tables.values()):
+        raise VBAUnsupportedError("a table over a data table is not implemented")
+    first_row = [sheet.book.calculator.value_of(sheet.name, area.top, column)
+                 for column in range(area.left, area.right + 1)]
+    if headers == GUESS:
+        rest = [sheet.book.calculator.value_of(sheet.name, row, column)
+                for row in range(area.top + 1, area.bottom + 1) for column in range(area.left, area.right + 1)]
+        headers = YES if all(isinstance(one, str) and one for one in first_row) \
+            and not all(isinstance(one, str) for one in rest) else NO
+    if headers == YES and area.rows == 1:
+        # Excel gives it an empty row under the header that ListRows does not count, its InsertRowRange
+        # (tests/fixtures/table_members.json).
+        raise VBAUnsupportedError("a table over its header row alone, which Excel gives an insert row, is not "
+                                  "implemented")
+    from pyopenvba.apps.excel._table_filters import take_over, taken_over
+
+    taken = take_over(sheet, area)
+    if taken is not None and headers == NO:
+        raise VBAUnsupportedError("a table that puts a header row in over the sheet's filtered range is not "
+                                  "implemented")
+    if headers == NO:
+        from pyopenvba.apps.excel._editing import shift_cells
+
+        # A header row goes in above the range, the cells under it moving down.
+        top = Area(area.top, area.left, area.top, area.right, sheet.name)
+        shift_cells(Range(sheet, [top]), top, delete=False, vertical=True)
+        area = Area(area.top, area.left, area.bottom + 1, area.right)
+        names = column_names([""] * area.columns)
+    else:
+        names = column_names([cell_text(sheet, area.top, column) for column in range(area.left, area.right + 1)])
+    for offset, name in enumerate(names):
+        # Header cells hold their column's name as text: 2020 becomes "2020".
+        cell = sheet.cell(area.top, area.left + offset, create=True)
+        assert cell is not None
+        if cell.value != name or cell.formula:
+            cell.value, cell.formula, cell.stale, cell.shared = name, "", False, None
+            sheet.cell_changed(area.top, area.left + offset)
+    uid = guid()
+    number = next_part_id(sheet)
+    name = _free_name(sheet)
+    if any(one.xml_cells for one in sheet.book.sheets_) and f"table{number}" not in {one.name.lower() for one in all_tables(sheet)}:
+        # Beside XML-mapped single cells a table is named after the id it takes (tests/fixtures/xml_infer.json).
+        name = f"Table{number}"
+    table = Table(sheet=sheet, id=number, name=name,
+                  area=area, columns=[TableColumn(name, index + 1, guid()) for index, name in enumerate(names)],
+                  style=style, uid=uid, changed=True)
+    sheet.tables.append(table)
+    if taken is not None:
+        taken_over(table, taken)
+    sheet.touched()
+    return table
+
+
+def _meets(first: Area, second: Area) -> bool:
+    return not (first.bottom < second.top or second.bottom < first.top
+                or first.right < second.left or second.right < first.left)
+
+
+def moved(sheet: Worksheet, rewrite: Callable[[str], str], *, rows: bool) -> None:
+    """Carry each table through an insert or a delete of whole rows, as a reference is carried."""
+    kept: list[Table] = []
+    for table in sheet.tables:
+        text = rewrite("=" + table.area.address(absolute=False))
+        try:
+            area = parse_area(text.removeprefix("="), sheet="")
+        except ValueError:
+            # Deleting every row of a table takes the table away.
+            raise VBAUnsupportedError("deleting all of a table's rows is not implemented") from None
+        if (area.rows, area.columns) != (table.area.rows, table.area.columns):
+            if not rows or area.columns != table.area.columns:
+                raise VBAUnsupportedError("inserting or deleting columns through a table is not implemented")
+            table.changed = True
+        elif area != table.area:
+            table.changed = True
+        table.area = area
+        kept.append(table)
+    sheet.tables = kept
+
+
+def edit_admitted(sheet: Worksheet, *, rows: bool, start: int, count: int, delete: bool) -> None:
+    """Report, before anything moves, an insert or delete of whole rows or columns the model does not carry
+    through a table: any through its columns, which Excel makes table columns of, and a delete of its header row
+    or of all of it."""
+    from pyopenvba.apps.excel._table_sort import guard_edit
+
+    end = start + count - 1
+    if rows:
+        # Rows put in or taken away through two tables at once are 1004 (tests/fixtures/table_shifts1.json).
+        def through(area: Area) -> bool:
+            return start <= area.bottom and area.top <= end if delete else area.top < start <= area.bottom
+
+        cut = [table for table in sheet.tables if through(table.area)]
+        if len(cut) > 1:
+            raise error(1004, "Delete method of Range class failed" if delete else "Insert method of Range class failed")
+    for table in sheet.tables:
+        area = table.area
+        if start <= (area.bottom if rows else area.right):
+            guard_edit(table, 'structurally shifting')
+        if not rows:
+            if (delete and start <= area.right and area.left <= end) or (not delete and area.left < start <= area.right):
+                raise VBAUnsupportedError("inserting or deleting columns through a table is not implemented")
+        elif delete and start <= area.top <= end:
+            raise VBAUnsupportedError("deleting a table's header row is not implemented")
+
+
+def refuse_growth(sheet: Worksheet, area: Area, doing: str) -> None:
+    """Report a copy or a fill into the row under a table, or the column right of it, which Excel takes the table
+    over by putting a table row in first, the cells under it moving down (tests/fixtures/tables/growth.json)."""
+    for table in sheet.tables:
+        whole = table.area
+        below = not table.totals and area.top <= whole.bottom + 1 <= area.bottom \
+            and area.left <= whole.right and whole.left <= area.right
+        right = area.left <= whole.right + 1 <= area.right and area.top <= whole.bottom and whole.top <= area.bottom
+        if below or right:
+            raise VBAUnsupportedError(f"{doing} the row under a table or the column right of it, which grows the "
+                                      "table, is not implemented")
+
+
+def refuse(sheet: Worksheet, area: Area, doing: str, *, allowing: Table | None = None) -> None:
+    """Report an edit the model does not carry through tables, but for the one ``allowing`` names."""
+    if any(_meets(table.area, area) for table in sheet.tables if table is not allowing):
+        raise VBAUnsupportedError(f"{doing} cells of a table is not implemented")
+
+
+# --- VBA -----------------------------------------------------------------------------------------
+
+
+def view(table: Table) -> ListObject:
+    """The one ListObject a table answers with, so that Is compares tables."""
+    if table.view is None:
+        table.view = ListObject(table)
+    return table.view
+
+
+class ListObjects(VBACollection, ItemDefault, ExcelObject):
+    vba_type_name = "ListObjects"
+
+    def __init__(self, sheet: Worksheet) -> None:
+        self.sheet = sheet
+
+    def vba_items(self) -> list[object]:
+        return [view(table) for table in self.sheet.tables]
+
+    def vba_lookup(self, index: object, items: list[object]) -> object:
+        """By Name, in any case, not DisplayName: a table named "Tb7" or "a b" is found by that and not by the Tb7_ or a_b it
+        shows (tests/fixtures/table_name_lookup.json)."""
+        if isinstance(index, str):
+            for table in self.sheet.tables:
+                if (table.own_name or table.name).lower() == index.lower():
+                    return view(table)
+            raise error(ERR_SUBSCRIPT_OUT_OF_RANGE)
+        return super().vba_lookup(index, items)
+
+    @member
+    def Parent(self) -> object:
+        return self.sheet
+
+    @member
+    def Application(self) -> object:
+        return self.sheet.book.application
+
+    @method
+    def Add(self, SourceType: object = MISSING, Source: object = MISSING, LinkSource: object = MISSING,
+            XlListObjectHasHeaders: object = MISSING, Destination: object = MISSING,
+            TableStyleName: object = MISSING) -> object:
+        kind = SOURCE_RANGE if SourceType is MISSING else int(to_integer(SourceType, "Long"))
+        if kind == SOURCE_EXTERNAL:
+            # Over a database: the headers argument changes nothing, and with no Destination it is error 5
+            # (tests/fixtures/list_query_add.json).
+            if LinkSource is not MISSING or TableStyleName is not MISSING:
+                raise VBAUnsupportedError("ListObjects.Add(xlSrcExternal) with LinkSource or TableStyleName is not "
+                                          "implemented")
+            if Destination is MISSING:
+                raise error(5, "Invalid procedure call or argument")
+            from pyopenvba.apps.excel._query_databases import add_list
+
+            return view(add_list(self.sheet, Source, Destination, self._default_style()))
+        if kind != SOURCE_RANGE or not isinstance(Source, Range):
+            raise VBAUnsupportedError("ListObjects.Add from anything but a range of the sheet is not implemented")
+        if Source.sheet is not self.sheet:
+            raise error(1004, "The table's range must be on this sheet")
+        headers = GUESS if XlListObjectHasHeaders is MISSING else int(to_integer(XlListObjectHasHeaders, "Long"))
+        style = self._default_style() if TableStyleName is MISSING else to_text(TableStyleName)
+        return view(add(self.sheet, Source, headers, style))
+
+    def _default_style(self) -> str:
+        """The workbook's default table style (Workbook.DefaultTableStyle, tests/fixtures/workbook_settings.json)."""
+        found = self.sheet.book.stylesheet.table_style_default("table")
+        if found is None:
+            raise VBAUnsupportedError("ListObjects.Add in a workbook with no default table style is not implemented")
+        return found
+
+
+def _table_gone(table: Table, sheet: Worksheet) -> bool:
+    return not any(one is table for one in sheet.tables)
+
+
+class ListObject(HeldPart, ExcelObject):
+    vba_type_name = "ListObject"
+
+    def __init__(self, table: Table) -> None:
+        self.table = table
+        self.sheet = table.sheet
+
+    def held_gone(self) -> bool:
+        return self.table.sheet is self.sheet and _table_gone(self.table, self.sheet)
+
+    def held_error(self, name: str) -> int:
+        """Deleted, it answers nothing. Unlisted or cleared away, it still has what needs no table; and Delete then kills Excel."""
+        if self.table.deleted:
+            return 424
+        if name == "delete":
+            raise VBAUnsupportedError("ListObject.Delete on a table that has gone, which ends Excel")
+        return 0 if name in ("parent", "application", "creator") else 1004
+
+    @method
+    def ExportToVisio(self) -> object:
+        raise error(1004, "Application-defined or object-defined error")
+
+    @method
+    def Publish(self, Target: object = MISSING, LinkSource: object = MISSING) -> object:
+        raise error(5, "Cannot connect to the server at this time. Your table cannot be published.")
+
+    def vba_get(self, name: str, args: Sequence[object] = (), named: dict[str, object] | None = None) -> object:
+        """A table cut to another sheet leaves this object behind, which answers nothing more
+        (tests/fixtures/table_cut.json)."""
+        if self.table.sheet is not self.sheet:
+            if name.lower() == "autofilter":
+                return NOTHING
+            raise error(1004, "Application-defined or object-defined error")
+        return super().vba_get(name, args, named)
+
+    def _range(self, area: Area | None) -> object:
+        return NOTHING if area is None else Range(self.sheet, [Area(area.top, area.left, area.bottom, area.right,
+                                                                    self.sheet.name)])
+
+    def _changed(self) -> None:
+        self.table.changed = True
+        self.sheet.touched()
+
+    @member(default=True)
+    def _Default(self) -> object:
+        """Name, the name given, not DisplayName (tests/fixtures/list_object_default.json)."""
+        return self.table.own_name or self.table.name
+
+    @member
+    def Name(self) -> object:
+        return self.table.own_name or self.table.name
+
+    @setter("Name")
+    def _set_name(self, value: object) -> None:
+        """Any text, kept as the part's name; DisplayName becomes the name CreateNames would make of it, a b as a_b
+        and 1abc as _1abc. Another table's name is error 1004 (tests/fixtures/text_compare_names.json)."""
+        from pyopenvba.apps.excel._create_names import name_of
+
+        wanted = to_text(value)
+        if self._taken(wanted):
+            raise error(1004, "Application-defined or object-defined error")
+        shown = name_of(wanted)
+        if shown is None or shown != wanted and self._taken(shown):
+            raise VBAUnsupportedError(f"naming a table {wanted!r}, which makes no free DisplayName, is not "
+                                      "implemented")
+        if shown != self.table.name:
+            rename(self.table, shown)
+        self.table.own_name = "" if shown == wanted else wanted
+        self._changed()
+
+    @member
+    def DisplayName(self) -> object:
+        return self.table.name
+
+    @setter("DisplayName")
+    def _set_display_name(self, value: object) -> None:
+        """A name as defined names take them, beyond ASCII too, and Name with it; any other, or another table's, is
+        error 1004 (tests/fixtures/text_compare_names.json)."""
+        from pyopenvba.apps.excel._names import valid
+
+        wanted = to_text(value)
+        if not valid(wanted) or self._taken(wanted):
+            raise error(1004, "Application-defined or object-defined error")
+        if wanted != self.table.name:
+            rename(self.table, wanted)
+        self.table.own_name = ""
+        self._changed()
+
+    def _taken(self, wanted: str) -> bool:
+        return any(one is not self.table and wanted.lower() in (one.name.lower(), one.own_name.lower())
+                   for one in all_tables(self.sheet))
+
+    @member
+    def Parent(self) -> object:
+        return self.sheet
+
+    @member
+    def Sort(self) -> object:
+        from pyopenvba.apps.excel._table_sort import TableSortObject
+
+        return TableSortObject(self.table)
+
+    @member
+    def Range(self) -> object:
+        return self._range(self.table.area)
+
+    @member
+    def DataBodyRange(self) -> object:
+        return self._range(self.table.data)
+
+    @member
+    def HeaderRowRange(self) -> object:
+        area = self.table.area
+        return self._range(Area(area.top, area.left, area.top, area.right) if self.table.headers else None)
+
+    @member
+    def TotalsRowRange(self) -> object:
+        area = self.table.area
+        return self._range(Area(area.bottom, area.left, area.bottom, area.right) if self.table.totals else None)
+
+    @member
+    def ListColumns(self) -> object:
+        return ListColumns(self.table)
+
+    @member
+    def ListRows(self) -> object:
+        return ListRows(self.table)
+
+    @method
+    def Resize(self, Range: object = MISSING) -> object:
+        from pyopenvba.apps.excel._model import Range as Cells
+        from pyopenvba.apps.excel._table_edits import resize
+
+        if not isinstance(Range, Cells) or Range.sheet is not self.sheet or len(Range.areas) != 1:
+            raise error(1004, "Resize takes a range of the table's sheet")
+        first = Range.first
+        resize(self.table, Area(first.top, first.left, first.bottom, first.right))
+        return EMPTY
+
+    @method
+    def Delete(self) -> object:
+        from pyopenvba.apps.excel._table_edits import delete_table
+
+        query = self._query_going()
+        self.table.deleted = True
+        delete_table(self.table)
+        if query is not None:
+            query.dropped()
+        return EMPTY
+
+    @method
+    def Unlist(self) -> object:
+        from pyopenvba.apps.excel._table_unlist import unlist
+
+        query = self._query_going()
+        unlist(self.table)
+        if query is not None:
+            query.dropped()
+        return EMPTY
+
+    def _query_going(self) -> Any:
+        """A table over a database takes its query table, connection and name with it (tests/fixtures/list_query_add.json);
+        the query table, where the model can let it go, else None for a table of the sheet's own cells."""
+        if self.table.query is None:
+            return None
+        from pyopenvba.apps.excel._query_databases import droppable
+
+        return droppable(self.table)
+
+    @member
+    def ShowTotals(self) -> object:
+        return self.table.totals
+
+    @setter("ShowTotals")
+    def _set_show_totals(self, value: object) -> None:
+        wanted = to_bool(value)
+        if wanted != self.table.totals:
+            if wanted:
+                show_totals(self.table)
+            else:
+                hide_totals(self.table)
+
+    @member
+    def ShowHeaders(self) -> object:
+        return self.table.headers
+
+    @setter("ShowHeaders")
+    def _set_show_headers(self, value: object) -> None:
+        if to_bool(value) != self.table.headers:
+            raise VBAUnsupportedError("showing or hiding a table's header row is not implemented")
+
+    @member
+    def TableStyle(self) -> object:
+        """The style as an object, or a space for none (tests/fixtures/settable_lists.json)."""
+        from pyopenvba.apps.excel._workbook_settings import table_style_named
+
+        return table_style_named(self.sheet.book, self.table.style) or " "
+
+    @setter("TableStyle")
+    def _set_table_style(self, value: object) -> None:
+        """A style by name in any case, or none for "", Empty and Null; anything else is error 450."""
+        from pyopenvba.apps.excel._workbook_settings import table_style_named
+
+        wanted = value.vba_get("Name") if isinstance(value, ExcelObject) else value
+        if wanted is EMPTY or wanted is NULL or wanted == "":
+            self.table.style = ""
+        else:
+            found = table_style_named(self.sheet.book, wanted) if isinstance(wanted, str) else None
+            if found is None:
+                raise error(450, "Wrong number of arguments or invalid property assignment")
+            self.table.style = found.name
+        self._changed()
+
+    @member
+    def AutoFilter(self) -> object:
+        from pyopenvba.apps.excel._autofilter import AutoFilter
+        from pyopenvba.apps.excel._table_filters import table_filter
+
+        return NOTHING if table_filter(self.table) is None else AutoFilter(self.sheet, self.table)
+
+    @member
+    def ShowAutoFilter(self) -> object:
+        return self.table.auto_filter
+
+    @setter("ShowAutoFilter")
+    def _set_show_auto_filter(self, value: object) -> None:
+        from pyopenvba.apps.excel._table_filters import refocus, turn_off
+
+        wanted = to_bool(value)
+        if self.table.auto_filter and not wanted:
+            # Its criteria go and its rows show (tests/fixtures/table_autofilter/).
+            turn_off(self.table)
+        if wanted and not self.table.auto_filter:
+            # A filter turned on again shows its buttons (tests/fixtures/table_members.json).
+            self.table.drop_downs = True
+        self.table.auto_filter = wanted
+        self._changed()
+        refocus(self.sheet)
+
+    @member
+    def ShowAutoFilterDropDown(self) -> object:
+        """Whether the filter's buttons show: False with no filter (tests/fixtures/table_members.json)."""
+        return self.table.auto_filter and self.table.drop_downs
+
+    @setter("ShowAutoFilterDropDown")
+    def _set_show_drop_down(self, value: object) -> None:
+        wanted = to_bool(value)
+        if not self.table.auto_filter:
+            if wanted:
+                raise error(1004, "Application-defined or object-defined error")
+            raise VBAUnsupportedError("hiding the buttons of a table with no filter is not implemented")
+        if wanted != self.table.drop_downs:
+            self.table.drop_downs = wanted
+            self._changed()
+
+    @member
+    def Comment(self) -> object:
+        return self.table.comment
+
+    @setter("Comment")
+    def _set_comment(self, value: object) -> None:
+        wanted = to_text(value)
+        if len(wanted) > COMMENT_LIMIT:
+            raise error(5)
+        self.table.comment = wanted
+        self._changed()
+
+    @member
+    def AlternativeText(self) -> object:
+        return self.table.alt_text
+
+    @setter("AlternativeText")
+    def _set_alternative_text(self, value: object) -> None:
+        self.table.alt_text = to_text(value)
+        self._changed()
+
+    @member
+    def Summary(self) -> object:
+        return self.table.summary
+
+    @setter("Summary")
+    def _set_summary(self, value: object) -> None:
+        self.table.summary = to_text(value)
+        self._changed()
+
+    @member
+    def SourceType(self) -> object:
+        """xlSrcRange for a table of the sheet's own cells, xlSrcQuery for one over a database (tests/fixtures/query_refresh_loaded.json)."""
+        if self.table.query is not None:
+            return VBAInt(3, "Long")
+        if self.table.kind:
+            raise VBAUnsupportedError(f"SourceType of a table of type {self.table.kind!r} is not implemented")
+        return VBAInt(SOURCE_RANGE, "Long")
+
+    @member
+    def InsertRowRange(self) -> object:
+        """Nothing for a table with data rows (tests/fixtures/table_members.json)."""
+        if not self.table.rows():
+            raise VBAUnsupportedError("the insert row of a table with no data rows is not implemented")
+        return NOTHING
+
+    @member
+    def Active(self) -> object:
+        """Whether the active cell is in the table, on the active sheet (tests/fixtures/table_members.json)."""
+        if self.sheet.book.active_sheet is not self.sheet:
+            return False
+        cell = self.sheet.active_cell
+        return isinstance(cell, Range) and self.table.area.contains(cell.first.top, cell.first.left)
+
+    @member
+    def DisplayRightToLeft(self) -> object:
+        return self.sheet.vba_get("DisplayRightToLeft")
+
+    @member
+    def Application(self) -> object:
+        return self.sheet.book.application
+
+    @member
+    def Slicers(self) -> object:
+        return TableSlicers(self)
+
+    @method
+    def Refresh(self) -> object:
+        """Over a database, its query table refreshed, as QueryTable.Refresh is (tests/fixtures/list_query_add.json)."""
+        if self.table.query is not None:
+            self.table.query.vba_call("Refresh", [])
+            return EMPTY
+        raise error(1004, "Application-defined or object-defined error")
+
+    @member
+    def QueryTable(self) -> object:
+        if self.table.query is not None:
+            return self.table.query
+        raise error(1004, "Application-defined or object-defined error")
+
+    @member
+    def TableObject(self) -> object:
+        raise error(1004, "Application-defined or object-defined error")
+
+    @member
+    def SharePointURL(self) -> object:
+        raise error(1004, "Application-defined or object-defined error")
+
+    @member
+    def XmlMap(self) -> object:
+        """The XML map its columns are mapped to, or Nothing (see _xml_maps)."""
+        from pyopenvba.apps.excel._xml_maps import table_map
+
+        return table_map(self.table)
+
+    @method
+    def Unlink(self) -> object:
+        """Nothing to do for a table of the sheet's own cells, which no list is linked to."""
+        return EMPTY
+
+    @member
+    def ShowTableStyleRowStripes(self) -> object:
+        return self.table.row_stripes
+
+    @setter("ShowTableStyleRowStripes")
+    def _set_row_stripes(self, value: object) -> None:
+        self.table.row_stripes = to_bool(value)
+        self._changed()
+
+    @member
+    def ShowTableStyleColumnStripes(self) -> object:
+        return self.table.column_stripes
+
+    @setter("ShowTableStyleColumnStripes")
+    def _set_column_stripes(self, value: object) -> None:
+        self.table.column_stripes = to_bool(value)
+        self._changed()
+
+    @member
+    def ShowTableStyleFirstColumn(self) -> object:
+        return self.table.first_column
+
+    @setter("ShowTableStyleFirstColumn")
+    def _set_first_column(self, value: object) -> None:
+        self.table.first_column = to_bool(value)
+        self._changed()
+
+    @member
+    def ShowTableStyleLastColumn(self) -> object:
+        return self.table.last_column
+
+    @setter("ShowTableStyleLastColumn")
+    def _set_last_column(self, value: object) -> None:
+        self.table.last_column = to_bool(value)
+        self._changed()
+
+
+class TableSlicers(VBACollection, ExcelObject):
+    """ListObject.Slicers and PivotTable.Slicers: the model's tables have none."""
+
+    vba_type_name = "Slicers"
+
+    def __init__(self, owner: ListObject | PivotTable) -> None:
+        self.owner = owner
+
+    def vba_items(self) -> list[object]:
+        return []
+
+    @member
+    def Parent(self) -> object:
+        return self.owner
+
+    @member
+    def Application(self) -> object:
+        return self.owner.sheet.book.application
+
+
+def _table_position(value: object) -> int:
+    """Where a row or column goes; what is no number, Null included, is error 9 (tests/fixtures/method_audit.json)."""
+    try:
+        return int(to_integer(value, "Long"))
+    except VBARuntimeError as failed:
+        raise error(9, "Subscript out of range") from failed
+
+
+class _TablePart(HeldPart):
+    """What hangs off a table and goes with it: if deleted, all of it; if unlisted, all but what needs no table."""
+
+    vba_type_name = ""
+    table: Table
+    sheet: Worksheet
+
+    def held_gone(self) -> bool:
+        return _table_gone(self.table, self.sheet)
+
+    def held_error(self, name: str) -> int:
+        if self.table.deleted:
+            return 424
+        return 0 if name in ("application", "creator") else 1004
+
+
+class ListColumns(VBACollection, ItemDefault, _TablePart, ExcelObject):
+    vba_type_name = "ListColumns"
+
+    def __init__(self, table: Table) -> None:
+        self.table = table
+        self.sheet = table.sheet
+
+    def vba_items(self) -> list[object]:
+        return [ListColumn(self.table, index) for index in range(1, len(self.table.columns) + 1)]
+
+    def vba_lookup(self, index: object, items: list[object]) -> object:
+        if isinstance(index, str):
+            for position, column in enumerate(self.table.columns, 1):
+                if column.name.lower() == index.lower():
+                    return ListColumn(self.table, position)
+            raise error(ERR_SUBSCRIPT_OUT_OF_RANGE)
+        return super().vba_lookup(index, items)
+
+    @member
+    def Parent(self) -> object:
+        return view(self.table)
+
+    @member
+    def Application(self) -> object:
+        return self.sheet.book.application
+
+    @method
+    def Add(self, Position: object = MISSING) -> object:
+        from pyopenvba.apps.excel._table_edits import add_column
+
+        where = None if Position is MISSING else _table_position(Position)
+        return ListColumn(self.table, add_column(self.table, where))
+
+
+class ListColumn(HeldPart, ExcelObject):
+    vba_type_name = "ListColumn"
+
+    @member
+    def XPath(self) -> object:
+        """The column's XML mapping (see _xml_maps)."""
+        from pyopenvba.apps.excel._xml_maps import column_xpath
+
+        return column_xpath(self.table, self.held)
+
+    def __init__(self, table: Table, index: int) -> None:
+        self.table = table
+        self.sheet = table.sheet
+        self.held = table.columns[index - 1]
+        self.was = index
+
+    @property
+    def index(self) -> int:
+        """Its place now: a column held follows its own column, unlike a row (tests/fixtures/held_objects.json)."""
+        for place, one in enumerate(self.table.columns):
+            if one is self.held:
+                return place + 1
+        return self.was
+
+    def held_gone(self) -> bool:
+        return _table_gone(self.table, self.sheet) or not any(one is self.held for one in self.table.columns)
+
+    def _column(self) -> int:
+        return self.table.area.left + self.index - 1
+
+    @member(default=True)
+    def _Default(self) -> object:
+        return self.table.columns[self.index - 1].name
+
+    @member
+    def Name(self) -> object:
+        return self.table.columns[self.index - 1].name
+
+    @setter("Name")
+    def _set_name(self, value: object) -> None:
+        """Rename the column, its header and every formula naming it with it. Measured: a name another column has,
+        in any case, leaves the column as it was without an error; an empty one is the first free ColumnN."""
+        wanted = str(value).upper() if isinstance(value, bool) else to_text(value)
+        if len(wanted) > 255:
+            raise error(5)
+        names = [column.name for column in self.table.columns]
+        if any(index != self.index - 1 and name.lower() == wanted.lower() for index, name in enumerate(names)):
+            return
+        names[self.index - 1] = wanted
+        name_columns(self.table, column_names(names))
+
+    @member
+    def Index(self) -> object:
+        return VBAInt(self.index, "Long")
+
+    @member
+    def TotalsCalculation(self) -> object:
+        function = self.table.columns[self.index - 1].totals_function
+        return VBAInt(CALCULATIONS.index(function) if function in CALCULATIONS else 0, "Long")
+
+    @setter("TotalsCalculation")
+    def _set_totals_calculation(self, value: object) -> None:
+        """What the column's totals row works out, shown or not: a SUBTOTAL, nothing, or custom, which leaves the
+        cell empty until a formula is written there (tests/fixtures/tables/totals_row/)."""
+        number = int(to_integer(value, "Long"))
+        if value is True or not 0 <= number < len(CALCULATIONS):
+            raise error(5)
+        column = self.table.columns[self.index - 1]
+        column.totals_function, column.totals_label, column.totals_formula = CALCULATIONS[number], "", ""
+        self.table.changed = True
+        self.sheet.touched()
+        if self.table.totals:
+            _write_total(self.table, self.index - 1)
+
+    @member
+    def Parent(self) -> object:
+        return view(self.table)
+
+    @member
+    def Range(self) -> object:
+        area = self.table.area
+        return Range(self.sheet, [Area(area.top, self._column(), area.bottom, self._column(), self.sheet.name)])
+
+    @member
+    def DataBodyRange(self) -> object:
+        data = self.table.data
+        if data is None:
+            return NOTHING
+        return Range(self.sheet, [Area(data.top, self._column(), data.bottom, self._column(), self.sheet.name)])
+
+    @member
+    def Total(self) -> object:
+        """The column's cell in the totals row, Nothing while the table shows none (tests/fixtures/object_parents.json)."""
+        if not self.table.totals:
+            return NOTHING
+        bottom = self.table.area.bottom
+        return Range(self.sheet, [Area(bottom, self._column(), bottom, self._column(), self.sheet.name)])
+
+    @member
+    def Application(self) -> object:
+        return self.sheet.book.application
+
+    @method
+    def Delete(self) -> object:
+        from pyopenvba.apps.excel._table_edits import delete_column
+
+        delete_column(self.table, self.index)
+        return EMPTY
+
+
+class ListRows(VBACollection, ItemDefault, _TablePart, ExcelObject):
+    vba_type_name = "ListRows"
+
+    def __init__(self, table: Table) -> None:
+        self.table = table
+        self.sheet = table.sheet
+
+    def vba_items(self) -> list[object]:
+        return [ListRow(self.table, index) for index in range(1, self.table.rows() + 1)]
+
+    @member
+    def Parent(self) -> object:
+        return view(self.table)
+
+    @member
+    def Application(self) -> object:
+        return self.sheet.book.application
+
+    @method
+    def Add(self, Position: object = MISSING, AlwaysInsert: object = MISSING) -> object:
+        """A row put in, at the end or at a position (see _table_edits.add_row)."""
+        from pyopenvba.apps.excel._table_edits import add_row
+
+        where = None if Position is MISSING else _table_position(Position)
+        try:
+            always = True if AlwaysInsert is MISSING else to_bool(AlwaysInsert)
+        except VBARuntimeError as failed:
+            raise error(5, "Invalid procedure call or argument") from failed
+        return ListRow(self.table, add_row(self.table, where, always))
+
+
+class ListRow(_TablePart, ExcelObject):
+    """A place among the rows: held, it answers for whichever row is there now, and has gone when none is."""
+
+    vba_type_name = "ListRow"
+
+    def __init__(self, table: Table, index: int) -> None:
+        self.table = table
+        self.sheet = table.sheet
+        self.index = index
+        #: Its own Delete took it, which leaves it nothing, whatever row comes to its place.
+        self.went = False
+
+    def _past_the_end(self) -> bool:
+        data = self.table.data
+        return data is None or self.index > data.bottom - data.top + 1
+
+    def held_gone(self) -> bool:
+        return self.went or _table_gone(self.table, self.sheet) or self._past_the_end()
+
+    def held_error(self, name: str) -> int:
+        if self.went:
+            return 424
+        if not _table_gone(self.table, self.sheet):
+            return 0 if name in ("parent", "application", "creator") else 1004
+        return super().held_error(name)
+
+    @member
+    def Application(self) -> object:
+        return self.sheet.book.application
+
+    @member
+    def Index(self) -> object:
+        return VBAInt(self.index, "Long")
+
+    @member
+    def Parent(self) -> object:
+        return view(self.table)
+
+    @member
+    def Range(self) -> object:
+        data = self.table.data
+        assert data is not None
+        row = data.top + self.index - 1
+        return Range(self.sheet, [Area(row, data.left, row, data.right, self.sheet.name)])
+
+    @method
+    def Delete(self) -> object:
+        from pyopenvba.apps.excel._table_edits import delete_row
+
+        delete_row(self.table, self.index)
+        self.went = True
+        return EMPTY

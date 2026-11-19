@@ -1,0 +1,929 @@
+"""Copy and Cut without a destination, Worksheet.Paste, Range.PasteSpecial, and Cut with one.
+
+Measured in live Excel (scripts/measure_paste.py):
+
+- Copy and Cut put the range on the clipboard, and CutCopyMode reads 1
+  or 2. What is pasted is what the cells hold when it is pasted, not when
+  they were copied, and writing to a cell does not end the copy. A copy
+  lasts through any number of pastes; a cut ends with its paste, and
+  cannot be pasted special. Pasting with nothing copied is error 1004.
+- A paste fills the destination with copies of the source when it is a
+  whole number of source sizes, and otherwise takes the source's size
+  from its top-left cell.
+- PasteSpecial takes along everything, the values the cells show, their
+  formulas, their formats, number formats with values or formulas, all
+  but borders, or column widths alone. A blank source cell pastes as a
+  blank, which clears what is under it, unless blanks are skipped.
+- An operation combines what is pasted with what is under it. Blanks on
+  either side count as 0, and text on either side leaves the cell as it
+  was. Two numbers give a number, division by 0 #DIV/0!; a formula on
+  either side gives a formula: 10 under =D1*2 multiplied is =10*(D1*2),
+  =5+5 under 1 added is =(5+5)+1.
+- Transposed, a formula's references that are relative in both row and
+  column keep their distance with the rows and columns swapped; the
+  rest stay as they are.
+- Cut moves the cells, formats and all, and leaves blanks behind. Every
+  reference in the workbook that lies wholly inside the moved block,
+  names included, follows it, to another sheet with the sheet's name;
+  one wholly inside the cells the block lands on becomes #REF!.
+  (scripts/measure_cut_references.py, 24 layouts:) one that loses a
+  whole edge to the block keeps the rest when the block goes to another
+  sheet, and on its own sheet takes the edge along when the block moves
+  straight along it; any other overlap stays as it is.
+
+Measured in live Excel (scripts/measure_autofilter_edits.py):
+
+- A copy of several areas -- a filtered range's visible cells among
+  them -- closes them up, one under another when they share their
+  columns and side by side when they share their rows; areas that share
+  neither are error 1004. Copy with a destination and Worksheet.Paste
+  paste their formulas as the values they show; PasteSpecial keeps a
+  formula, moved as far as its own cell was.
+- Cutting a filter's whole range moves the filter with it on its sheet,
+  its criteria cleared and its rows shown; to another sheet the filter
+  goes, its rows shown, and its hidden name follows the cells.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, replace
+from typing import TYPE_CHECKING, cast
+
+from pyopenvba._a1 import MAX_COLUMNS, MAX_ROWS, Area, column_letter, column_number, quote_sheet
+from pyopenvba.apps.excel._method_arguments import enum_number, given, switch
+from pyopenvba.apps.excel._protection import whole
+from pyopenvba.apps.excel._visible import unmeasured, visible, visible_areas
+from pyopenvba.exceptions import VBAUnsupportedError
+from pyopenvba.formula._parse import shift_text, split_sheet, tokenize, transpose_text
+from pyopenvba.formula._values import ERRORS, ExcelError, number_text
+from pyopenvba.interpreter._values import EMPTY, MISSING, VBAInt, error, to_bool
+
+if TYPE_CHECKING:
+    from pyopenvba.apps.excel._model import Application, Cell, Range, Worksheet
+    from pyopenvba.apps.excel._styles import Style
+
+ALL, VALUES, FORMULAS, FORMATS = -4104, -4163, -4123, -4122
+ALL_EXCEPT_BORDERS, COLUMN_WIDTHS, FORMULAS_AND_NUMBER_FORMATS, VALUES_AND_NUMBER_FORMATS = 7, 8, 11, 12
+#: Pastes that take everything: the theme and merging variants are the same thing to the model.
+_EVERYTHING = {ALL, ALL_EXCEPT_BORDERS, 13, 14}
+_CONTENT_FORMULAS = _EVERYTHING | {FORMULAS, FORMULAS_AND_NUMBER_FORMATS}
+_CONTENT_VALUES = {VALUES, VALUES_AND_NUMBER_FORMATS}
+#: A paste of the notes alone, which VBA calls comments.
+COMMENTS = -4144
+_UNMODELLED = {6: "data validation"}
+#: Excel's own numbers for the pastes that have a name besides (tests/fixtures/range_methods_clipboard.json).
+_PASTE_NUMBERS = {1: ALL, 2: FORMULAS, 3: VALUES, 4: FORMATS, 5: COMMENTS}
+_OPERATIONS = {-4142: "", 1: "", 2: "+", 3: "-", 4: "*", 5: "/"}
+
+
+@dataclass(frozen=True)
+class Block:
+    """What a copy covers: its areas, closed up into one block, each with the row and column it starts at."""
+
+    parts: tuple[tuple[Area, int, int], ...]
+    rows: int
+    columns: int
+
+    def source(self, down: int, across: int) -> tuple[int, int]:
+        """The cell a position of the block comes from."""
+        for area, top, left in self.parts:
+            if top <= down < top + area.rows and left <= across < left + area.columns:
+                return area.top + down - top, area.left + across - left
+        raise AssertionError("a position outside the block")
+
+    def covers(self, row: int, column: int) -> bool:
+        return any(area.contains(row, column) for area, _, _ in self.parts)
+
+
+def block_of(areas: list[Area]) -> Block:
+    """The block copied areas close up into: one under another when they share their columns, side by side
+    when they share their rows, and error 1004 when they share neither."""
+    first = areas[0]
+    if len(areas) == 1:
+        return Block(((first, 0, 0),), first.rows, first.columns)
+    stacked = all((area.left, area.right) == (first.left, first.right) for area in areas)
+    beside = all((area.top, area.bottom) == (first.top, first.bottom) for area in areas)
+    if not stacked and not beside:
+        raise error(1004, "That command cannot be used on multiple selections")
+    starts = [area.top if stacked else area.left for area in areas]
+    ends = [area.bottom if stacked else area.right for area in areas]
+    if any(start <= end for end, start in zip(ends, starts[1:])):
+        raise VBAUnsupportedError("copying areas out of order, or overlapping, is not implemented")
+    parts: list[tuple[Area, int, int]] = []
+    offset = 0
+    for area in areas:
+        parts.append((area, offset, 0) if stacked else (area, 0, offset))
+        offset += area.rows if stacked else area.columns
+    return Block(tuple(parts), offset if stacked else first.rows, first.columns if stacked else offset)
+
+
+@dataclass
+class Clip:
+    """What Copy or Cut put on the clipboard: the range itself, read when it is pasted."""
+
+    source: Range
+    cut: bool
+    #: Its workbook has closed. Excel shows no mode and still pastes the cells, which is not implemented.
+    orphaned: bool = False
+
+    @property
+    def block(self) -> Block:
+        """What it covers now: the range follows its cells."""
+        return block_of(self.source.areas)
+
+    @property
+    def area(self) -> Area:
+        """What a cut moves: its one area."""
+        return self.block.parts[0][0]
+
+
+#: Application.ClipboardFormats for each kind of copy, whatever was copied (tests/fixtures/clipboard_formats.json): cells copied
+#: or cut, a shape or chart object, a chart's chart area, and an empty clipboard.
+CELL_FORMATS = (0, 2, 4, 5, 6, 7, 8, 9, 11, 12, 14, 17, 19, 22, 23, 31, 32, 33, 44, 45, 50, 58, 63)
+SHAPE_FORMATS = (2, 9, 45, 51, 52, 53, 61, 62, 66, 71, 72)
+CHART_AREA_FORMATS = (2, 9, 14, 17, 19, 22, 23, 31, 32, 45, 51, 52, 53, 61, 62, 66, 71, 72)
+NO_FORMATS = (-1,)
+#: A picture's formats by who made it and its Appearance and Format, None standing for each default.
+PICTURE_FORMATS: dict[tuple[str, float | None, float | None], tuple[int, ...]] = {
+    ("Range", None, None): (2, 11), ("Range", 1.0, -4147.0): (2, 11), ("Range", 1.0, 2.0): (9, 11, 45), ("Range", 2.0, -4147.0): (2, 11),
+    ("Shape", None, None): (2,), ("ChartObject", None, None): (2,), ("Chart", None, None): (2,), ("Chart", 1.0, 2.0): (2,)}
+
+
+def hold_formats(application: Application, formats: tuple[int, ...] | None) -> None:
+    """What the clipboard now holds, other than cells, for as long as no cells are copied after: None for a kind not measured."""
+    application.held_formats = (formats, application.clipboard)
+
+
+#: What cells copied straight after leave on the clipboard at random: Excel's list stayed the picture's or the chart area's in
+#: some runs and became the cells' in others (tests/fixtures/clipboard_formats.json).
+_RACING = ((9, 11, 45), CHART_AREA_FORMATS)
+
+
+def cells_copied(application: Application, clip: Clip) -> None:
+    """Cells copied or cut onto the clipboard, ``clip``, which ends what was held there before."""
+    held = application.held_formats
+    racing = held is not None and held[1] is application.clipboard and held[0] in _RACING
+    application.racing_clip = clip if racing else None
+    application.clipboard = clip
+    application.held_formats = None
+
+
+def clipboard_formats(application: Application) -> tuple[int, ...]:
+    """Application.ClipboardFormats: cells while CutCopyMode says so, else what was last held, else nothing."""
+    if mode(application.clipboard) != 0:
+        if application.clipboard is application.racing_clip:
+            raise VBAUnsupportedError("ClipboardFormats just after a bitmap picture or a chart area was copied is not implemented: "
+                                      "Excel answers either list")
+        return CELL_FORMATS
+    held = application.held_formats
+    if held is None or held[1] is not application.clipboard:
+        return NO_FORMATS
+    if held[0] is None:
+        raise VBAUnsupportedError("ClipboardFormats after this kind of picture is not implemented")
+    return held[0]
+
+
+def picture_held(application: Application) -> bool:
+    """Whether the clipboard still holds what CopyPicture put there: nothing copied since, cells or a chart."""
+    held = application.copied_picture
+    return held is not None and held[0] is application.clipboard and application.copied_chart is None
+
+
+def mode(clip: Clip | None) -> VBAInt:
+    return VBAInt(0 if clip is None or clip.orphaned else 2 if clip.cut else 1, "Long")
+
+
+def copy(target: Range) -> object:
+    """Range.Copy with no destination: on a filtered sheet the visible cells, as _visible has it."""
+    from pyopenvba.apps.excel._sparklines import refuse as refuse_sparklines
+
+    refuse_sparklines(target.sheet, "Copying from")
+    source = visible(target)
+    block_of(source.areas)
+    cells_copied(target.sheet.book.application, Clip(source, cut=False))
+    return True
+
+
+def conditional_copy_admitted(source: Worksheet, areas: list[Area], destination: Worksheet,
+                              landed: list[Area]) -> None:
+    """A format-bearing copy must not silently drop or replace conditional rules."""
+    from pyopenvba.apps.excel._conditional_transfer import guard_extensions
+
+    guard_extensions(source)
+    if destination is not source:
+        guard_extensions(destination)
+    for sheet, touched in ((source, areas), (destination, landed)):
+        for rule in sheet.conditional_formats:
+            if not rule.deleted and any(not (area.bottom < part.top or part.bottom < area.top
+                                            or area.right < part.left or part.right < area.left)
+                                        for area in rule.areas for part in touched):
+                raise VBAUnsupportedError('Range copying conditional formatting is not implemented')
+
+
+def admit_write(sheet: Worksheet) -> bool:
+    """Copy and paste return False without writing when a formula calls VBA."""
+    return not sheet.book.application.udf_callers
+
+
+def copy_range(target: Range, destination: object) -> object:
+    """Range.Copy with a destination: on a filtered sheet, the visible cells into the visible cells.
+
+    A destination with hidden cells takes the copy in each visible block,
+    one after the other, a later one pasting over what an earlier one ran into.
+    """
+    from pyopenvba.apps.excel._model import Range
+    from pyopenvba.apps.excel._sparklines import refuse as refuse_sparklines
+
+    refuse_sparklines(target.sheet, "Copying from")
+    if isinstance(destination, Range):
+        refuse_sparklines(destination.sheet, "Copying onto")
+
+    if not isinstance(destination, Range):
+        raise error(1004, "Copy needs a range to copy to")
+    if not admit_write(destination.sheet):
+        return False
+    from pyopenvba.apps.excel._events import after_edit
+
+    source = visible(target)
+    made = block_of(source.areas)
+    landed = landing_of(made, destination)
+    whole(destination.sheet, [landed], "Copying")
+    landing = visible_areas(destination)
+    if landing is None:
+        paste_block(target.sheet, made, destination)
+    else:
+        conditional_copy_admitted(target.sheet, list(source.areas), destination.sheet, [landed])
+        first = made.parts[0][0]
+        if len(made.parts) > 1:
+            raise VBAUnsupportedError("copying several areas into a filtered range is not implemented")
+        for area in landing:
+            Range(target.sheet, [first]).copy_to(Range(destination.sheet, [area]))
+    # The cells copied to change, as Excel reports them.
+    after_edit(Range(destination.sheet, [landed]))
+    # A copy straight to somewhere ends what was on the clipboard (tests/fixtures/excel_everyday_7.json).
+    target.sheet.book.application.clipboard = None
+    return True
+
+
+def tiled_size(rows: int, columns: int, copied_rows: int, copied_columns: int) -> tuple[int, int]:
+    """The size a copy fills in a destination. Whole copies tile it where each way holds them, and a destination one row or one column
+    across counts as holding them that way, so that A1:B1 copied to H1:H3 fills H1:I3. Otherwise it is one copy (tests/fixtures/excel_fits.json)."""
+    if not all(given % copied == 0 or given == 1 for given, copied in ((rows, copied_rows), (columns, copied_columns))):
+        return copied_rows, copied_columns
+    return (rows if rows % copied_rows == 0 else copied_rows), (columns if columns % copied_columns == 0 else copied_columns)
+
+
+def landing_of(made: Block, destination: Range) -> Area:
+    """The cells a paste lands on: whole copies tiled over the destination when it holds them, else one at its corner."""
+    corner = destination.first
+    height, width = tiled_size(corner.rows, corner.columns, made.rows, made.columns)
+    return Area(corner.top, corner.left, min(corner.top + height - 1, MAX_ROWS),
+                min(corner.left + width - 1, MAX_COLUMNS), destination.sheet.name)
+
+
+def paste_block(sheet: Worksheet, made: Block, destination: Range) -> object:
+    """A copy pasted as Copy and Paste paste it: one area as a copy of it, several closed up at the destination's
+    top-left with their formulas turned into the values they show."""
+    from pyopenvba.apps.excel import _merges
+    from pyopenvba.apps.excel._model import Range
+
+    if len(made.parts) == 1:
+        return Range(sheet, [made.parts[0][0]]).copy_to(destination)
+    corner = destination.first
+    if len(destination.areas) != 1 or not (destination.single or (corner.rows, corner.columns) == (made.rows,
+                                                                                                    made.columns)):
+        raise VBAUnsupportedError("pasting several copied areas over a range of another size is not implemented")
+    landing = Area(corner.top, corner.left, corner.top + made.rows - 1, corner.left + made.columns - 1)
+    conditional_copy_admitted(sheet, [area for area, _, _ in made.parts], destination.sheet, [landing])
+    if landing.bottom > MAX_ROWS or landing.right > MAX_COLUMNS:
+        raise error(1004, "The paste would run past the edge of the worksheet")
+    if destination.sheet is sheet and any(_merges.intersects(landing, area) for area, _, _ in made.parts):
+        raise VBAUnsupportedError("pasting copied areas over themselves is not implemented")
+    # The values first: a formula shows what it gives where it is.
+    calculator = sheet.book.calculator
+    values = {position: calculator.value_of(sheet.name, *position) for position, cell in sheet.cells_.items()
+              if cell.formula and made.covers(*position)}
+    target = destination.sheet
+    for area, down, across in made.parts:
+        top, left = corner.top + down, corner.left + across
+        Range(sheet, [area]).copy_to(Range(target, [Area(top, left, top + area.rows - 1, left + area.columns - 1)]))
+        for (row, column), value in values.items():
+            if not area.contains(row, column):
+                continue
+            at = (row - area.top + top, column - area.left + left)
+            cell = target.cell(*at)
+            if cell is not None:
+                cell.formula, cell.value, cell.stale = "", value, False
+                target.settle(*at)
+                target.cell_changed(*at)
+    return True
+
+
+def cut(target: Range, destination: object) -> object:
+    """Range.Cut: onto the clipboard, or straight to ``destination``."""
+    from pyopenvba.apps.excel._model import Range
+    from pyopenvba.apps.excel._sparklines import refuse as refuse_sparklines
+
+    refuse_sparklines(target.sheet, "Cutting from")
+    if isinstance(destination, Range):
+        refuse_sparklines(destination.sheet, "Cutting onto")
+
+    if target.sheet.advanced_filter is not None or (isinstance(destination, Range) and destination.sheet.advanced_filter is not None):
+        raise VBAUnsupportedError('Cut involving an advanced-filtered sheet is not implemented')
+    if len(target.areas) != 1:
+        raise error(1004, "That command cannot be used on multiple selections")
+    if destination is MISSING:
+        cells_copied(target.sheet.book.application, Clip(target, cut=True))
+        return True
+    if not isinstance(destination, Range):
+        raise error(1004, "Cut needs a range to move to")
+    whole(target.sheet, [target.first], "Cut")
+    whole(destination.sheet, [landing_of(block_of([target.first]), destination)], "Cut")
+    conditional_copy_admitted(target.sheet, [target.first], destination.sheet,
+                              [landing_of(block_of([target.first]), destination)])
+    move(target, target.first, destination)
+    target.sheet.book.application.parameters_ready = True
+    return True
+
+
+def _clip(target: Range, empty: str = "There is nothing to paste") -> Clip:
+    application = target.sheet.book.application
+    clip = application.clipboard
+    if clip is None and picture_held(application):
+        raise VBAUnsupportedError("pasting the picture CopyPicture made is not implemented")
+    if clip is None:
+        raise error(1004, empty)
+    if clip.orphaned:
+        raise VBAUnsupportedError("pasting cells copied from a workbook that has closed is not implemented")
+    return clip
+
+
+def application_of(owner: object) -> Application | None:
+    """The application an object of the model belongs to, through whatever it holds on to: a named style's Font has
+    none."""
+    if hasattr(owner, "clipboard"):
+        return cast("Application", owner)
+    for name in ("application", "book", "sheet", "target"):
+        found = getattr(owner, name, None)
+        if found is not None:
+            return application_of(found)
+    return None
+
+
+def paste(sheet: Worksheet, destination: object, link: object) -> object:
+    """Worksheet.Paste: what was copied or cut, at ``destination`` or the selection."""
+    from pyopenvba.apps.excel._model import Range
+    from pyopenvba.apps.excel._sparklines import refuse as refuse_sparklines
+
+    refuse_sparklines(sheet, "Pasting onto")
+
+    if link is not MISSING and to_bool(link):
+        raise VBAUnsupportedError("Worksheet.Paste Link:=True is not implemented")
+    from pyopenvba.apps.excel._shapes import chart_pasted
+
+    if chart_pasted(sheet, destination):
+        return True
+    if destination is MISSING:
+        from pyopenvba.apps.excel._selected_shapes import selected as selected_shapes
+
+        destination = sheet.selection
+        if not isinstance(destination, Range) or selected_shapes(sheet):
+            raise error(1004, "Paste needs a selection on this sheet")
+    if not isinstance(destination, Range):
+        raise error(1004, "Paste needs a range to paste into")
+    clip = _clip(destination)
+    if not admit_write(destination.sheet):
+        return False
+    if clip.cut:
+        whole(clip.source.sheet, [clip.area], "Cut")
+    whole(destination.sheet, [landing_of(clip.block, destination)], "Pasting")
+    if clip.cut:
+        move(clip.source, clip.area, destination)
+        clip.source.sheet.book.application.parameters_ready = True
+        return True
+    unmeasured(destination, "Worksheet.Paste")
+    return paste_block(clip.source.sheet, clip.block, destination)
+
+
+def landed_selection(sheet: Worksheet) -> Range | None:
+    """What the selection grows to with a paste into it, worked out before the paste: a Cut goes off the clipboard."""
+    from pyopenvba.apps.excel._model import Range
+
+    destination = sheet.selection
+    clip = sheet.book.application.clipboard
+    if not isinstance(destination, Range) or clip is None or clip.orphaned or sheet is not sheet.book.active_sheet:
+        return None
+    made = Range(sheet, [landing_of(clip.block, destination)])
+    sheet.held_ranges.discard(made)
+    return made
+
+
+def pasted_selection(sheet: Worksheet) -> None:
+    """The selection grown to the block just pasted into it."""
+    grown = landed_selection(sheet)
+    if grown is not None:
+        grown.Select()
+
+
+def paste_special(target: Range, what: object, operation: object, skip_blanks: object, transpose: object) -> object:
+    """Range.PasteSpecial."""
+    from pyopenvba.apps.excel._sparklines import refuse as refuse_sparklines
+
+    refuse_sparklines(target.sheet, "Pasting onto")
+    # Measured with the clipboard emptied, as Protect empties it.
+    clip = _clip(target, "PasteSpecial method of Range class failed")
+    if not admit_write(target.sheet):
+        return False
+    if clip.cut:
+        raise error(1004, "PasteSpecial cannot paste what was cut")
+    refusal = "PasteSpecial method of Range class failed"
+    kind = ALL if what is MISSING else enum_number(what, refusal)
+    kind = _PASTE_NUMBERS.get(kind, kind)
+    if kind == 6 and not clip.source.sheet.validations:
+        # Validation from a sheet that has none pastes nothing.
+        return True
+    if kind in _UNMODELLED:
+        raise VBAUnsupportedError(f"PasteSpecial of {_UNMODELLED[kind]} is not implemented")
+    if kind not in _EVERYTHING | _CONTENT_FORMULAS | _CONTENT_VALUES | {FORMATS, COLUMN_WIDTHS, COMMENTS}:
+        raise error(1004, "PasteSpecial has no such paste type")
+    op = _OPERATIONS.get(-4142 if operation is MISSING else enum_number(operation, refusal))
+    if op is None:
+        raise error(1004, "PasteSpecial has no such operation")
+    skip_blanks, transpose = given(skip_blanks), given(transpose)
+    skipping = skip_blanks is not MISSING and switch(skip_blanks, refusal)
+    # Transpose takes a Boolean alone: numbers and Empty are 1004 too.
+    if transpose is not MISSING and not isinstance(transpose, (bool, str)):
+        raise error(1004, refusal)
+    turned = transpose is not MISSING and switch(transpose, refusal)
+    source_sheet, made = clip.source.sheet, clip.block
+    if kind == COLUMN_WIDTHS:
+        _column_widths(source_sheet, made, target)
+        return True
+    rows, columns = (made.columns, made.rows) if turned else (made.rows, made.columns)
+    corner = target.first
+    height, width = tiled_size(corner.rows, corner.columns, rows, columns)
+    if corner.top + height - 1 > MAX_ROWS or corner.left + width - 1 > MAX_COLUMNS:
+        raise error(1004, "The paste would run past the edge of the worksheet")
+    sheet = target.sheet
+    whole(sheet, [Area(corner.top, corner.left, corner.top + height - 1, corner.left + width - 1, sheet.name)],
+          "PasteSpecial")
+    if (kind in _CONTENT_FORMULAS or op) and sheet.book is not source_sheet.book:
+        raise VBAUnsupportedError("PasteSpecial of formulas into another workbook is not implemented")
+    from pyopenvba.apps.excel import _arrays
+
+    landing = Area(corner.top, corner.left, corner.top + height - 1, corner.left + width - 1)
+    conditional_plan = None
+    if kind in _EVERYTHING | {FORMATS}:
+        from pyopenvba.apps.excel._outline import guard_axis_copy
+
+        for part, _down, _across in made.parts:
+            guard_axis_copy(source_sheet, part, sheet, landing)
+        from pyopenvba.apps.excel._conditional_transfer import plan as conditional_plan_for
+
+        if len(target.areas) != 1:
+            conditional_copy_admitted(source_sheet, [part for part, _, _ in made.parts], sheet, [landing])
+        conditional_plan = conditional_plan_for(source_sheet, [part for part, _, _ in made.parts], sheet,
+                                                [landing], kind=kind, transpose=turned, operation=op)
+    covered, divided = _arrays.met(sheet, [landing]) if kind in _CONTENT_FORMULAS | _CONTENT_VALUES or op else ([], [])
+    if divided or op and covered:
+        raise error(1004, _arrays.PART_OF_AN_ARRAY)
+    from pyopenvba.apps.excel import _data_tables
+
+    if sheet.data_tables and (kind in _CONTENT_FORMULAS | _CONTENT_VALUES or op):
+        _data_tables.refuse(sheet, [landing], "PasteSpecial onto")
+    source_cells = {position: _snapshot(cell) for position, cell in source_sheet.cells_.items()
+                    if made.covers(*position)}
+    if source_sheet.data_tables:
+        # A data table's cells are copied as the values they show (tests/fixtures/data_tables.json).
+        _data_tables.as_values(source_sheet, source_cells, (0, 0))
+    array_plans: list[tuple[Area, int, int]] = []
+    origins: dict[tuple[int, int], tuple[int, int]] = {}
+    if kind in _CONTENT_FORMULAS:
+        for part, part_down, part_across in made.parts:
+            for original, fragment in _arrays.copy_fragments(source_sheet, part):
+                origin = (original.top, original.left)
+                original_cell = source_sheet.cells_.get(origin)
+                assert original_cell is not None
+                positions = ([(row, column) for row in range(fragment.top, fragment.bottom + 1)
+                              for column in range(fragment.left, fragment.right + 1)] if op else [(fragment.top, fragment.left)])
+                for position in positions:
+                    source_cells[position] = replace(source_cells.get(position, _snapshot(original_cell)), formula=original_cell.formula)
+                    origins[position] = origin
+                if not op:
+                    array_plans.append((fragment, part_down + fragment.top - part.top, part_across + fragment.left - part.left))
+    values = {position: source_sheet.book.calculator.value_of(source_sheet.name, *position)
+              for position, cell in source_cells.items() if cell.formula} if kind in _CONTENT_VALUES else {}
+    from pyopenvba.apps.excel import _merges, _notes
+
+    notes: dict[tuple[int, int], _notes.Note] = {}
+    for anchor in covered:
+        sheet.array_formulas.pop(anchor, None)
+    for down in range(height):
+        for across in range(width):
+            row, column = corner.top + down, corner.left + across
+            if not _merges.writable(sheet, row, column):
+                continue
+            inner_down, inner_across = down % rows, across % columns
+            source = made.source(inner_across, inner_down) if turned else made.source(inner_down, inner_across)
+            if source in source_sheet.notes:
+                notes[(row, column)] = source_sheet.notes[source]
+            if kind == COMMENTS:
+                continue
+            cell = source_cells.get(source)
+            blank = cell is None or (cell.value is EMPTY and not cell.formula)
+            if blank and skipping:
+                continue
+            formula_source = source if turned else origins.get(source, source)
+            _paste_one(target, kind, op, (row, column), formula_source, cell, values.get(source), turned)
+    for top in range(corner.top, corner.top + height, rows):
+        for left in range(corner.left, corner.left + width, columns):
+            for fragment, down, across in array_plans:
+                row, column = (top + across, left + down) if turned else (top + down, left + across)
+                block_rows, block_columns = (fragment.columns, fragment.rows) if turned else (fragment.rows, fragment.columns)
+                sheet.array_formulas[(row, column)] = Area(row, column, row + block_rows - 1, column + block_columns - 1)
+    if kind == COMMENTS or kind in _EVERYTHING:
+        # The notes come along with everything, and on their own as comments; values and formats leave the notes
+        # where they land as they are (tests/fixtures/excel_model/).
+        _notes.copied(sheet, notes, [Area(corner.top, corner.left, corner.top + height - 1, corner.left + width - 1)])
+    if kind in _EVERYTHING and (source_sheet.hyperlinks or sheet.hyperlinks):
+        _paste_links(source_sheet, made, sheet, corner, height, width, turned)
+    if conditional_plan is not None:
+        conditional_plan.commit()
+    from pyopenvba.apps.excel._model import Range
+
+    if sheet is sheet.book.active_sheet:
+        # What it pasted ends up selected, wherever that was (tests/fixtures/excel_everyday_9.json).
+        Range(sheet, [Area(corner.top, corner.left, corner.top + height - 1, corner.left + width - 1, sheet.name)]).Select()
+    return True
+
+
+def _paste_links(source: Worksheet, made: Block, sheet: Worksheet, corner: Area, height: int, width: int,
+                 turned: bool) -> None:
+    """Everything pasted brings the links it copied, tile by tile, as a copy does; values and formats bring none
+    (tests/fixtures/hyperlinks/pastes.xlsx)."""
+    from pyopenvba.apps.excel import _hyperlinks
+
+    areas = [area for area, _, _ in made.parts]
+    if turned or len(areas) > 1:
+        if _hyperlinks.touches(source, areas):
+            raise VBAUnsupportedError("pasting hyperlinks turned or from several areas is not implemented")
+        return
+    area = areas[0]
+    for top in range(corner.top, corner.top + height, made.rows):
+        for left in range(corner.left, corner.left + width, made.columns):
+            _hyperlinks.copied(source, Area(area.top, area.left, area.bottom, area.right), sheet,
+                               Area(top, left, top + made.rows - 1, left + made.columns - 1))
+
+
+def _snapshot(cell: Cell) -> Cell:
+    from pyopenvba.apps.excel._model import Cell
+
+    return Cell(value=cell.value, formula=cell.formula, style=cell.style)
+
+
+def _paste_one(target: Range, kind: int, op: str, at: tuple[int, int], source: tuple[int, int], cell: Cell | None,
+               value: object, turned: bool) -> None:
+    """Paste one source cell over the cell at ``at``."""
+    sheet = target.sheet
+    row, column = at
+    under = sheet.cell(row, column)
+    default = sheet.book.stylesheet.default
+    source_style: Style = (cell.style if cell is not None and cell.style is not None else default)
+    style = under.style if under is not None and under.style is not None else sheet.style_at(row, column)
+    if kind in _EVERYTHING or kind == FORMATS:
+        style = replace(source_style, border=style.border) if kind == ALL_EXCEPT_BORDERS else source_style
+    elif kind in (VALUES_AND_NUMBER_FORMATS, FORMULAS_AND_NUMBER_FORMATS):
+        style = replace(style, number_format=source_style.number_format,
+                        applied=style.applied | {"number_format"})
+    formula, content = "", EMPTY
+    if kind == FORMATS:
+        formula = under.formula if under is not None else ""
+        content = under.value if under is not None else EMPTY
+    elif cell is not None and cell.formula and kind in _CONTENT_FORMULAS:
+        formula = transpose_text(cell.formula, source, at) if turned \
+            else shift_text(cell.formula, row - source[0], column - source[1])
+    elif cell is not None:
+        content = value if cell.formula else cell.value
+    if op and kind != FORMATS:
+        formula, content = _combined(op, under, formula, content)
+    fresh = sheet.cell(row, column, create=True)
+    assert fresh is not None
+    cached = cell.value if formula and cell is not None and not sheet.book.calculator.automatic else EMPTY
+    if formula and op and not sheet.book.calculator.automatic:
+        cached = 0.0
+    fresh.value, fresh.formula, fresh.stale = (cached, formula, True) if formula else (content, "", False)
+    if kind != FORMATS:
+        fresh.dynamic, fresh.spilled_from = False, None
+    fresh.style, fresh.xf = (None if style == default else style), -1
+    sheet.book.stylesheet.meet(fresh.style)
+    sheet.settle(row, column)
+    sheet.cell_changed(row, column)
+
+
+def _combined(op: str, under: Cell | None, formula: str, content: object) -> tuple[str, object]:
+    """What an operation leaves: the pasted formula or value combined with what was under it."""
+    under_formula = under.formula if under is not None else ""
+    under_value = under.value if under is not None else EMPTY
+    if not formula and not under_formula:
+        first, second = _number(under_value), _number(content)
+        if first is None or second is None:
+            return "", under_value
+        if op == "/" and second == 0:
+            return "", ERRORS.get("#DIV/0!", ExcelError("#DIV/0!"))
+        return "", {"+": first + second, "-": first - second, "*": first * second, "/": first / (second or 1)}[op]
+    left = f"({under_formula[1:]})" if under_formula else _operand(under_value)
+    right = f"({formula[1:]})" if formula else _operand(content)
+    if left is None or right is None:
+        return under_formula, under_value
+    return f"={left}{op}{right}", EMPTY
+
+
+def _number(value: object) -> float | None:
+    """A value an operation can use: a number, or 0 for a blank; None for text and the rest."""
+    if value is EMPTY:
+        return 0.0
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return float(value)
+
+
+def _operand(value: object) -> str | None:
+    number = _number(value)
+    return None if number is None else number_text(number, formula=True)
+
+
+def _column_widths(source_sheet: Worksheet, made: Block, target: Range) -> None:
+    dims, widths = target.sheet.dims, source_sheet.dims
+    for offset in range(made.columns):
+        column = target.first.left + offset
+        if column <= MAX_COLUMNS:
+            dims.set_column_width(column, widths.column_pixels(made.source(0, offset)[1]))
+    target.sheet.touched()
+
+
+# --- moving ----------------------------------------------------------------------------------------
+
+
+def move(source: Range, area: Area, destination: Range) -> None:
+    """Cut ``area`` to ``destination``'s top-left cell, taking every reference to it along."""
+    from pyopenvba.apps.excel._sparklines import refuse as refuse_sparklines
+
+    refuse_sparklines(source.sheet, "Moving cells from")
+    refuse_sparklines(destination.sheet, "Moving cells onto")
+    from pyopenvba.apps.excel._table_sort import guard_edit
+
+    for table in source.sheet.tables:
+        if not (area.bottom < table.area.top or table.area.bottom < area.top
+                or area.right < table.area.left or table.area.right < area.left):
+            guard_edit(table, 'moving')
+    if source.sheet.advanced_filter is not None or destination.sheet.advanced_filter is not None:
+        raise VBAUnsupportedError('Moving cells on an advanced-filtered sheet is not implemented')
+    from pyopenvba.apps.excel import _merges
+    from pyopenvba.apps.excel._model import Range
+
+    sheet, target = source.sheet, destination.sheet
+    if sheet.book is not target.book:
+        raise VBAUnsupportedError("cutting cells to another workbook is not implemented")
+    top, left = destination.first.top, destination.first.left
+    landing = Area(top, left, top + area.rows - 1, left + area.columns - 1, target.name)
+    if landing.bottom > MAX_ROWS or landing.right > MAX_COLUMNS:
+        raise error(1004, "The cells would move past the edge of the worksheet")
+    for table in target.tables:
+        if not (landing.bottom < table.area.top or table.area.bottom < landing.top
+                or landing.right < table.area.left or table.area.right < landing.left):
+            guard_edit(table, 'moving cells into')
+    if sheet.data_tables or target.data_tables:
+        from pyopenvba.apps.excel._data_tables import refuse
+
+        refuse(sheet, [area], "Cutting", whole=True)
+        refuse(target, [landing], "Cutting onto", whole=True)
+    conditional_copy_admitted(sheet, [area], target, [landing])
+    from pyopenvba.apps.excel._conditional import NS
+    from pyopenvba.apps.excel._xstring import decode
+
+    for owner in sheet.book.sheets_:
+        for rule in owner.conditional_formats:
+            if rule.deleted:
+                continue
+            for node in rule.root.findall(NS + 'formula'):
+                text = decode(node.text or '')
+                if moved_references(text, owner.name, sheet.name, area, target.name, landing,
+                                    top - area.top, left - area.left) != text:
+                    raise VBAUnsupportedError('Cut rewriting conditional formatting formulas is not implemented')
+    if any(_merges.intersects(area, one) for one in sheet.merged_areas) or any(
+            _merges.intersects(landing, one) for one in target.merged_areas):
+        raise VBAUnsupportedError("cutting merged cells is not implemented")
+    if sized(sheet, area) or sized(target, landing):
+        raise VBAUnsupportedError("cutting whole rows or columns that carry sizes or formats of their own is not "
+                                  "implemented")
+    unmeasured(Range(target, [landing]), "Cutting cells")
+    from pyopenvba.apps.excel import _arrays
+
+    carried, split = _arrays.met(sheet, [area])
+    covered, divided = _arrays.met(target, [landing])
+    if split or any(anchor not in carried or target is not sheet for anchor in divided):
+        raise error(1004, _arrays.PART_OF_AN_ARRAY)
+    arrays = [sheet.array_formulas[anchor] for anchor in carried]
+    down, across = top - area.top, left - area.left
+    moving = {position: cell for position, cell in sheet.cells_.items() if area.contains(*position)}
+    book = sheet.book
+    from pyopenvba.apps.excel._table_moves import carried as carried_tables
+
+    moving_tables = carried_tables(sheet, area)
+    from pyopenvba.apps.excel._table_moves import leaving
+
+    leaving(sheet, moving, target, down, across, moving_tables)
+    from pyopenvba.apps.excel._spills import cached, restore
+
+    caches = cached(sheet) + (cached(target) if target is not sheet else [])
+    from pyopenvba.apps.excel import _chart_references
+
+    chart_references = _chart_references.plan(book, lambda text, owner: moved_references(
+        text, owner, sheet.name, area, target.name, landing, down, across))
+    _chart_references.carry_out(chart_references)
+    # Every formula and name follows the cells before any cell moves.
+    for owner in book.sheets_:
+        for position, cell in owner.cells_.items():
+            if cell.formula:
+                followed = moved_references(cell.formula, owner.name, sheet.name, area, target.name, landing,
+                                            down, across, moving=owner is sheet and position in moving)
+                if followed != cell.formula:
+                    cell.formula = followed
+                    owner.touched()
+    from pyopenvba.apps.excel._editing import name_scope
+
+    for entry in book.names_.entries:
+        text = moved_references(entry.refers_to, name_scope(book, entry) or sheet.name, sheet.name, area,
+                                target.name, landing, down, across)
+        if text != entry.refers_to:
+            entry.refers_to = text
+            book.names_.changed = True
+    for anchor in carried:
+        sheet.array_formulas.pop(anchor, None)
+    for anchor in covered:
+        target.array_formulas.pop(anchor, None)
+    for position in moving:
+        del sheet.cells_[position]
+    for position in [position for position in target.cells_ if landing.contains(*position)]:
+        del target.cells_[position]
+    for (row, column), cell in moving.items():
+        cell.stale = bool(cell.formula)
+        if cell.formula and book.calculator.automatic:
+            cell.value = EMPTY
+        target.cells_[(row + down, column + across)] = cell
+    for block in arrays:
+        target.array_formulas[(block.top + down, block.left + across)] = Area(
+            block.top + down, block.left + across, block.bottom + down, block.right + across)
+    if sheet.notes or target.notes:
+        from pyopenvba.apps.excel._notes import cut as cut_notes
+
+        cut_notes(sheet, area, target, down, across)
+    if sheet.hyperlinks or target.hyperlinks:
+        from pyopenvba.apps.excel._hyperlinks import cut as cut_links
+
+        cut_links(sheet, area, target, down, across)
+    from pyopenvba.apps.excel._autofilter import filter_moved
+
+    filter_moved(sheet, area, target, down, across)
+    from pyopenvba.apps.excel import _table_moves
+
+    _table_moves.settled(sheet, area, target, landing, moving_tables, down, across)
+    from pyopenvba.apps.excel import _held_ranges
+
+    for owner in {sheet, target}:
+        _held_ranges.moved(owner, lambda text, owner=owner: moved_references(
+            text, owner.name, sheet.name, area, target.name, landing, down, across), target)
+    for owner in {sheet, target}:
+        restore(owner, caches)
+        owner.touched()
+        owner.book.calculator.rebuild()
+    book.calculator.settle_spills()
+    book.application.clipboard = None
+
+
+def sized(sheet: Worksheet, area: Area) -> bool:
+    """Whether whole rows or columns of ``area`` keep a height, width, hiding or format of their own."""
+    if area.whole_columns:
+        return any(area.left <= column <= area.right for column in sheet.dims.columns)
+    if area.whole_rows:
+        return any(area.top <= row <= area.bottom for row in sheet.dims.rows)
+    return False
+
+
+def moved_references(formula: str, owner: str, sheet: str, area: Area, target: str, landing: Area,
+                     down: int, across: int, *, moving: bool = False) -> str:
+    """``formula``, on ``owner``, with its references into a moved block following it.
+
+    A reference wholly inside ``area`` on ``sheet`` moves by ``down`` and
+    ``across`` to ``target``; one wholly inside ``landing`` on ``target``,
+    whose cells the block replaces, becomes #REF!. One that loses a whole
+    edge to the block -- its full width at the top or bottom, its full
+    height at a side -- keeps the rest when the block goes to another
+    sheet, and on its own sheet takes the edge where the block goes, if
+    the block moves straight along it and the range stays the right way
+    round: B7 cut to B9 leaves SUM(B2:B7) reading SUM(B2:B9). A formula
+    ``moving`` with the block to ``target`` names that sheet only where
+    it did, and names its old sheet for a reference to it that stays behind.
+    """
+    body = formula[1:] if formula.startswith("=") else formula
+    after = target if moving else owner
+    pieces: list[tuple[int, int, str]] = []
+    for token in tokenize(body):
+        if token.kind != "ref":
+            continue
+        named, reference = split_sheet(token.text)
+        on = named or owner
+        corners = [_corner(part) for part in reference.split(":")]
+        box = _box(corners)
+        prefix = token.text[: len(token.text) - len(reference)]
+        if on.casefold() == sheet.casefold() and _inside(box, area):
+            moved = ":".join(_shifted(corner, down, across) for corner in corners)
+            if target.casefold() != on.casefold() or named:
+                prefix = quote_sheet(target) + "!" if (named or target.casefold() != after.casefold()) else ""
+            pieces.append((token.at, token.at + len(token.text), prefix + moved))
+            continue
+        if on.casefold() == target.casefold() and _inside(box, landing):
+            pieces.append((token.at, token.at + len(token.text), prefix + "#REF!"))
+            continue
+        edged = _edged(corners, box, area, down, across, elsewhere=target.casefold() != sheet.casefold()) \
+            if on.casefold() == sheet.casefold() else None
+        if edged is None and (named or after.casefold() == owner.casefold()):
+            continue
+        text = reference if edged is None else edged
+        if not named and after.casefold() != owner.casefold():
+            prefix = quote_sheet(owner) + "!"
+        pieces.append((token.at, token.at + len(token.text), prefix + text))
+    for start, stop, replacement in reversed(pieces):
+        body = body[:start] + replacement + body[stop:]
+    return ("=" if formula.startswith("=") else "") + body
+
+
+def _corner(part: str) -> tuple[str, int | None, str, int | None]:
+    column_fixed = part.startswith("$")
+    rest = part[1:] if column_fixed else part
+    letters = ""
+    while rest and rest[0].isalpha():
+        letters, rest = letters + rest[0], rest[1:]
+    row_fixed = rest.startswith("$")
+    digits = rest[1:] if row_fixed else rest
+    if not letters:
+        # A whole row: its only dollar sign is the row's.
+        return "", None, "$" if column_fixed or row_fixed else "", int(digits) if digits else None
+    return ("$" if column_fixed else ""), column_number(letters), ("$" if row_fixed else ""), \
+        int(digits) if digits else None
+
+
+def _box(corners: list[tuple[str, int | None, str, int | None]]) -> Area:
+    columns = [corner[1] for corner in corners]
+    rows = [corner[3] for corner in corners]
+    left = min(column for column in columns if column is not None) if any(columns) else 1
+    right = max(column for column in columns if column is not None) if any(columns) else MAX_COLUMNS
+    top = min(row for row in rows if row is not None) if any(rows) else 1
+    bottom = max(row for row in rows if row is not None) if any(rows) else MAX_ROWS
+    return Area(top, left, bottom, right)
+
+
+def _inside(box: Area, area: Area) -> bool:
+    return area.top <= box.top and box.bottom <= area.bottom and area.left <= box.left and box.right <= area.right
+
+
+def _edged(corners: list[tuple[str, int | None, str, int | None]], box: Area, area: Area, down: int, across: int,
+           *, elsewhere: bool) -> str | None:
+    """A reference that loses a whole edge to a cut block, as moved_references has it; None where it stays."""
+    if any(corner[1] is None or corner[3] is None for corner in corners):
+        return None  # Whole rows and columns stay.
+    top, left = max(box.top, area.top), max(box.left, area.left)
+    bottom, right = min(box.bottom, area.bottom), min(box.right, area.right)
+    if top > bottom or left > right:
+        return None
+    wide, tall = (left, right) == (box.left, box.right), (top, bottom) == (box.top, box.bottom)
+    side = "top" if wide and top == box.top else "bottom" if wide and bottom == box.bottom else \
+        "left" if tall and left == box.left else "right" if tall and right == box.right else ""
+    if not side or (not elsewhere and (across if side in ("top", "bottom") else down)):
+        return None  # On its own sheet an edge follows only a block moving straight along the range.
+    new_top, new_left, new_bottom, new_right = box.top, box.left, box.bottom, box.right
+    if side == "top":
+        new_top = bottom + 1 if elsewhere else box.top + down
+    elif side == "bottom":
+        new_bottom = top - 1 if elsewhere else box.bottom + down
+    elif side == "left":
+        new_left = right + 1 if elsewhere else box.left + across
+    else:
+        new_right = left - 1 if elsewhere else box.right + across
+    if new_top > new_bottom or new_left > new_right or new_top < 1 or new_left < 1 or new_bottom > MAX_ROWS \
+            or new_right > MAX_COLUMNS:
+        return None
+    rows = [corner[3] or 0 for corner in corners]
+    columns = [corner[1] or 0 for corner in corners]
+    placed_rows = [new_top] if len(corners) == 1 else [new_top, new_bottom] if rows[0] <= rows[-1] else \
+        [new_bottom, new_top]
+    placed_columns = [new_left] if len(corners) == 1 else [new_left, new_right] if columns[0] <= columns[-1] else \
+        [new_right, new_left]
+    return ":".join(f"{column_fixed}{column_letter(column)}{row_fixed}{row}"
+                    for (column_fixed, _, row_fixed, _), row, column in zip(corners, placed_rows, placed_columns))
+
+
+def _shifted(corner: tuple[str, int | None, str, int | None], down: int, across: int) -> str:
+    column_fixed, column, row_fixed, row = corner
+    return (f"{column_fixed}{column_letter(column + across)}" if column is not None else "") + \
+        (f"{row_fixed}{row + down}" if row is not None else "")

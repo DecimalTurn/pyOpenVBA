@@ -1,0 +1,348 @@
+{
+ "helper": "Private Function Show(v As Variant) As String\n    Dim i As Long, out As String\n    If IsArray(v) Then\n        out = \"Array(\"\n        For i = LBound(v) To UBound(v)\n            out = out & Show(v(i)) & \",\"\n        Next\n        Show = out & \")\"\n    ElseIf IsNull(v) Then\n        Show = \"Null\"\n    ElseIf IsEmpty(v) Then\n        Show = \"Empty\"\n    ElseIf IsError(v) Then\n        Show = \"Error:\" & CStr(CLng(v))\n    ElseIf IsObject(v) Then\n        Show = \"Object\"\n    Else\n        Show = TypeName(v) & \":\" & CStr(v)\n    End If\nEnd Function\n\nPrivate Function Filters(ws As Object) As String\n    Dim out As String, i As Long, f As Object, part As String\n    On Error Resume Next\n    out = \"mode=\" & ws.AutoFilterMode & \" filtering=\" & ws.FilterMode\n    If ws.AutoFilterMode Then\n        out = out & \" range=\" & ws.AutoFilter.Range.Address & \" count=\" & ws.AutoFilter.Filters.Count\n        For i = 1 To ws.AutoFilter.Filters.Count\n            Set f = ws.AutoFilter.Filters(i)\n            part = \" f\" & i & \":\" & f.On\n            If f.On Then\n                Err.Clear\n                part = part & \" op=\" & f.Operator\n                If Err.Number <> 0 Then part = part & \" op=E\" & Err.Number\n                Err.Clear\n                part = part & \" c1=\" & Show(f.Criteria1)\n                If Err.Number <> 0 Then part = part & \" c1=E\" & Err.Number\n                Err.Clear\n                part = part & \" c2=\" & Show(f.Criteria2)\n                If Err.Number <> 0 Then part = part & \" c2=E\" & Err.Number\n            End If\n            out = out & part\n        Next\n    End If\n    Err.Clear\n    Dim n As Object\n    Set n = Nothing\n    Set n = ws.Names(\"_FilterDatabase\")\n    If Not n Is Nothing Then out = out & \" db=\" & n.RefersTo & \":\" & n.Visible\n    Filters = out\nEnd Function\n\nPrivate Function Dump(ws As Object) As String\n    Dim out As String, r As Long\n    For r = 1 To 14\n        If ws.Rows(r).Hidden Then out = out & r & \",\"\n    Next\n    Dump = \"hidden=\" & out & \" \" & Filters(ws)\nEnd Function\n",
+ "table": "ws.Range(\"A1:D1\").Value = Array(\"Name\", \"Qty\", \"Day\", \"Note\")\nws.Range(\"A2:D2\").Value = Array(\"apple\", 1, #1/1/2020#, \"x\")\nws.Range(\"A3:D3\").Value = Array(\"Apple\", 2, #1/15/2020#, \"y\")\nws.Range(\"A4:D4\").Value = Array(\"banana\", 2.5, #2/1/2020#, \"x\")\nws.Range(\"A5:D5\").Value = Array(\"cherry\", 10, #3/1/2020#, \"\")\nws.Range(\"A6\").Value = \"apple pie\"\nws.Range(\"B6\").Value = -1\nws.Range(\"C6\").Value = #1/1/2021#\nws.Range(\"A7\").Value = \"b*\"\nws.Range(\"B7\").Value = 1\nws.Range(\"B7\").NumberFormat = \"0.00\"\nws.Range(\"C7\").Value = #12/31/2019#\nws.Range(\"A8\").Value = \"~\"\nws.Range(\"B8\").Value = 100\nws.Range(\"A9\").Value = \"'123\"\nws.Range(\"B9\").Value = \"'5\"\nws.Range(\"C9\").Value = \"text\"\nws.Range(\"A10\").Value = \"Banana\"\nws.Range(\"B10\").Value = True\nws.Range(\"C10\").Value = #1/15/2020 6:00:00 AM#\nws.Range(\"A11\").Value = \"date\"\nws.Range(\"B11\").Formula = \"=1/0\"\nws.Range(\"A12\").Value = \"cherry\"\nws.Range(\"B12\").Value = 2\nws.Range(\"C12\").Value = #1/15/2020#\nws.Range(\"D12\").Value = \"y\"\nws.Range(\"A13\").Value = 12\nws.Range(\"B13\").Value = 0.5\n",
+ "names": [
+  "<definedName name=\"_xlnm._FilterDatabase\" localSheetId=\"13\" hidden=\"1\">above_average!$F$1:$F$9</definedName>",
+  "<definedName name=\"_xlnm._FilterDatabase\" localSheetId=\"31\" hidden=\"1\">and_plain!$A$1:$D$13</definedName>",
+  "<definedName name=\"_xlnm._FilterDatabase\" localSheetId=\"24\" hidden=\"1\">any_text!$A$1:$D$13</definedName>",
+  "<definedName name=\"_xlnm._FilterDatabase\" localSheetId=\"0\" hidden=\"1\">arrows!$A$1:$D$13</definedName>",
+  "<definedName name=\"_xlnm._FilterDatabase\" localSheetId=\"14\" hidden=\"1\">below_average!$F$1:$F$9</definedName>",
+  "<definedName name=\"_xlnm._FilterDatabase\" localSheetId=\"5\" hidden=\"1\">between!$A$1:$D$13</definedName>",
+  "<definedName name=\"_xlnm._FilterDatabase\" localSheetId=\"15\" hidden=\"1\">blanks!$A$1:$D$13</definedName>",
+  "<definedName name=\"_xlnm._FilterDatabase\" localSheetId=\"12\" hidden=\"1\">bottom_items!$F$1:$F$9</definedName>",
+  "<definedName name=\"_xlnm._FilterDatabase\" localSheetId=\"18\" hidden=\"1\">date_after!$A$1:$D$13</definedName>",
+  "<definedName name=\"_xlnm._FilterDatabase\" localSheetId=\"19\" hidden=\"1\">date_equals!$A$1:$D$13</definedName>",
+  "<definedName name=\"_xlnm._FilterDatabase\" localSheetId=\"33\" hidden=\"1\">decimal_greater!$A$1:$D$13</definedName>",
+  "<definedName name=\"_xlnm._FilterDatabase\" localSheetId=\"6\" hidden=\"1\">either!$A$1:$D$13</definedName>",
+  "<definedName name=\"_xlnm._FilterDatabase\" localSheetId=\"1\" hidden=\"1\">equals!$A$1:$D$13</definedName>",
+  "<definedName name=\"_xlnm._FilterDatabase\" localSheetId=\"27\" hidden=\"1\">escaped!$A$1:$D$13</definedName>",
+  "<definedName name=\"_xlnm._FilterDatabase\" localSheetId=\"4\" hidden=\"1\">greater!$A$1:$D$13</definedName>",
+  "<definedName name=\"_xlnm._FilterDatabase\" localSheetId=\"34\" hidden=\"1\">grown_below!$A$1:$D$13</definedName>",
+  "<definedName name=\"_xlnm._FilterDatabase\" localSheetId=\"35\" hidden=\"1\">grown_reapplied!$A$1:$D$13</definedName>",
+  "<definedName name=\"_xlnm._FilterDatabase\" localSheetId=\"29\" hidden=\"1\">hidden_button!$A$1:$D$13</definedName>",
+  "<definedName name=\"_xlnm._FilterDatabase\" localSheetId=\"16\" hidden=\"1\">non_blanks!$A$1:$D$13</definedName>",
+  "<definedName name=\"_xlnm._FilterDatabase\" localSheetId=\"3\" hidden=\"1\">not_equal!$A$1:$D$13</definedName>",
+  "<definedName name=\"_xlnm._FilterDatabase\" localSheetId=\"23\" hidden=\"1\">not_number!$A$1:$D$13</definedName>",
+  "<definedName name=\"_xlnm._FilterDatabase\" localSheetId=\"21\" hidden=\"1\">number_equals!$A$1:$D$13</definedName>",
+  "<definedName name=\"_xlnm._FilterDatabase\" localSheetId=\"22\" hidden=\"1\">number_shown!$A$1:$D$13</definedName>",
+  "<definedName name=\"_xlnm._FilterDatabase\" localSheetId=\"32\" hidden=\"1\">or_blank!$A$1:$D$13</definedName>",
+  "<definedName name=\"_xlnm._FilterDatabase\" localSheetId=\"30\" hidden=\"1\">or_custom!$A$1:$D$13</definedName>",
+  "<definedName name=\"_xlnm._FilterDatabase\" localSheetId=\"25\" hidden=\"1\">shown_all!$A$1:$D$13</definedName>",
+  "<definedName name=\"_xlnm._FilterDatabase\" localSheetId=\"36\" hidden=\"1\">sub_range!$A$1:$D$5</definedName>",
+  "<definedName name=\"_xlnm._FilterDatabase\" localSheetId=\"37\" hidden=\"1\">sub_range_arrows!$A$1:$D$5</definedName>",
+  "<definedName name=\"_xlnm._FilterDatabase\" localSheetId=\"40\" hidden=\"1\">sub_range_mid!$A$3:$D$5</definedName>",
+  "<definedName name=\"_xlnm._FilterDatabase\" localSheetId=\"39\" hidden=\"1\">sub_range_refiltered!$A$1:$D$13</definedName>",
+  "<definedName name=\"_xlnm._FilterDatabase\" localSheetId=\"38\" hidden=\"1\">sub_range_then_field!$A$1:$D$13</definedName>",
+  "<definedName name=\"_xlnm._FilterDatabase\" localSheetId=\"20\" hidden=\"1\">text_greater!$A$1:$D$13</definedName>",
+  "<definedName name=\"_xlnm._FilterDatabase\" localSheetId=\"28\" hidden=\"1\">time_after!$A$1:$D$13</definedName>",
+  "<definedName name=\"_xlnm._FilterDatabase\" localSheetId=\"10\" hidden=\"1\">top_items!$F$1:$F$9</definedName>",
+  "<definedName name=\"_xlnm._FilterDatabase\" localSheetId=\"11\" hidden=\"1\">top_percent!$F$1:$F$9</definedName>",
+  "<definedName name=\"_xlnm._FilterDatabase\" localSheetId=\"26\" hidden=\"1\">turned_off!$A$1:$D$13</definedName>",
+  "<definedName name=\"_xlnm._FilterDatabase\" localSheetId=\"17\" hidden=\"1\">two_fields!$A$1:$D$13</definedName>",
+  "<definedName name=\"_xlnm._FilterDatabase\" localSheetId=\"9\" hidden=\"1\">values_blank!$A$1:$D$13</definedName>",
+  "<definedName name=\"_xlnm._FilterDatabase\" localSheetId=\"7\" hidden=\"1\">values_three!$A$1:$D$13</definedName>",
+  "<definedName name=\"_xlnm._FilterDatabase\" localSheetId=\"8\" hidden=\"1\">values_two!$A$1:$D$13</definedName>",
+  "<definedName name=\"_xlnm._FilterDatabase\" localSheetId=\"2\" hidden=\"1\">wildcard!$A$1:$D$13</definedName>"
+ ],
+ "names_order": [
+  "<definedName name=\"_xlnm._FilterDatabase\" localSheetId=\"1\" hidden=\"1\">Abc!$A$1:$B$3</definedName>",
+  "<definedName name=\"_xlnm._FilterDatabase\" localSheetId=\"2\" hidden=\"1\">Mid!$A$1:$B$3</definedName>",
+  "<definedName name=\"_xlnm._FilterDatabase\" localSheetId=\"0\" hidden=\"1\">Zed!$A$1:$B$3</definedName>",
+  "<definedName name=\"_under\">Zed!$A$4</definedName>",
+  "<definedName name=\"Alpha\">Zed!$A$2</definedName>",
+  "<definedName name=\"beta\" localSheetId=\"2\">Mid!$B$1</definedName>",
+  "<definedName name=\"beta\">Zed!$A$1</definedName>",
+  "<definedName name=\"Local\" localSheetId=\"1\">Abc!$B$2</definedName>",
+  "<definedName name=\"_xlnm.Print_Area\" localSheetId=\"0\">Zed!$A$1:$B$3</definedName>",
+  "<definedName name=\"zulu\">Zed!$A$3</definedName>"
+ ],
+ "cases": [
+  {
+   "name": "arrows",
+   "setup": "v = ws.Range(\"A1:D13\").AutoFilter\n",
+   "reading": "Boolean:True;hidden= mode=True filtering=False range=$A$1:$D$13 count=4 f1:False f2:False f3:False f4:False db==arrows!$A$1:$D$13:False",
+   "reopened": "hidden= mode=True filtering=False range=$A$1:$D$13 count=4 f1:False f2:False f3:False f4:False db==arrows!$A$1:$D$13:False",
+   "xml": "<autoFilter ref=\"A1:D13\" xr:uid=\"{1F8273A2-AB93-44DD-8F31-0C9BBD186591}\"/>"
+  },
+  {
+   "name": "equals",
+   "setup": "v = ws.Range(\"A1:D13\").AutoFilter(Field:=1, Criteria1:=\"apple\")\n",
+   "reading": "Boolean:True;hidden=4,5,6,7,8,9,10,11,12,13, mode=True filtering=True range=$A$1:$D$13 count=4 f1:True op=0 c1=String:=apple c2=E1004 f2:False f3:False f4:False db==equals!$A$1:$D$13:False",
+   "reopened": "hidden=4,5,6,7,8,9,10,11,12,13, mode=True filtering=True range=$A$1:$D$13 count=4 f1:True op=0 c1=String:=apple c2=E1004 f2:False f3:False f4:False db==equals!$A$1:$D$13:False",
+   "xml": "<autoFilter ref=\"A1:D13\" xr:uid=\"{D5336CF8-AB64-44DF-9F4E-4145D43CD10D}\"><filterColumn colId=\"0\"><filters><filter val=\"apple\"/></filters></filterColumn></autoFilter>"
+  },
+  {
+   "name": "wildcard",
+   "setup": "v = ws.Range(\"A1:D13\").AutoFilter(Field:=1, Criteria1:=\"a*\")\n",
+   "reading": "Boolean:True;hidden=4,5,7,8,9,10,11,12,13, mode=True filtering=True range=$A$1:$D$13 count=4 f1:True op=0 c1=String:=a* c2=E1004 f2:False f3:False f4:False db==wildcard!$A$1:$D$13:False",
+   "reopened": "hidden=4,5,7,8,9,10,11,12,13, mode=True filtering=True range=$A$1:$D$13 count=4 f1:True op=0 c1=String:=a* c2=E1004 f2:False f3:False f4:False db==wildcard!$A$1:$D$13:False",
+   "xml": "<autoFilter ref=\"A1:D13\" xr:uid=\"{8828804C-B758-4280-858E-A03E6897E9CB}\"><filterColumn colId=\"0\"><customFilters><customFilter val=\"a*\"/></customFilters></filterColumn></autoFilter>"
+  },
+  {
+   "name": "not_equal",
+   "setup": "v = ws.Range(\"A1:D13\").AutoFilter(Field:=1, Criteria1:=\"<>apple\")\n",
+   "reading": "Boolean:True;hidden=2,3, mode=True filtering=True range=$A$1:$D$13 count=4 f1:True op=0 c1=String:<>apple c2=E1004 f2:False f3:False f4:False db==not_equal!$A$1:$D$13:False",
+   "reopened": "hidden=2,3, mode=True filtering=True range=$A$1:$D$13 count=4 f1:True op=0 c1=String:<>apple c2=E1004 f2:False f3:False f4:False db==not_equal!$A$1:$D$13:False",
+   "xml": "<autoFilter ref=\"A1:D13\" xr:uid=\"{7F2ED72B-6114-4516-A01A-5C0180F46DA1}\"><filterColumn colId=\"0\"><customFilters><customFilter operator=\"notEqual\" val=\"apple\"/></customFilters></filterColumn></autoFilter>"
+  },
+  {
+   "name": "greater",
+   "setup": "v = ws.Range(\"A1:D13\").AutoFilter(Field:=2, Criteria1:=\">2\")\n",
+   "reading": "Boolean:True;hidden=2,3,6,7,9,10,11,12,13, mode=True filtering=True range=$A$1:$D$13 count=4 f1:False f2:True op=0 c1=String:>2 c2=E1004 f3:False f4:False db==greater!$A$1:$D$13:False",
+   "reopened": "hidden=2,3,6,7,9,10,11,12,13, mode=True filtering=True range=$A$1:$D$13 count=4 f1:False f2:True op=0 c1=String:>2 c2=E1004 f3:False f4:False db==greater!$A$1:$D$13:False",
+   "xml": "<autoFilter ref=\"A1:D13\" xr:uid=\"{1AEB29FC-C2C7-4C81-848B-39EB53BCEE1E}\"><filterColumn colId=\"1\"><customFilters><customFilter operator=\"greaterThan\" val=\"2\"/></customFilters></filterColumn></autoFilter>"
+  },
+  {
+   "name": "between",
+   "setup": "v = ws.Range(\"A1:D13\").AutoFilter(Field:=2, Criteria1:=\">=1\", Operator:=xlAnd, Criteria2:=\"<=10\")\n",
+   "reading": "Boolean:True;hidden=6,8,9,10,11,13, mode=True filtering=True range=$A$1:$D$13 count=4 f1:False f2:True op=1 c1=String:>=1 c2=String:<=10 f3:False f4:False db==between!$A$1:$D$13:False",
+   "reopened": "hidden=6,8,9,10,11,13, mode=True filtering=True range=$A$1:$D$13 count=4 f1:False f2:True op=1 c1=String:>=1 c2=String:<=10 f3:False f4:False db==between!$A$1:$D$13:False",
+   "xml": "<autoFilter ref=\"A1:D13\" xr:uid=\"{6104D5ED-B7C0-4311-B95E-492A65AE775D}\"><filterColumn colId=\"1\"><customFilters and=\"1\"><customFilter operator=\"greaterThanOrEqual\" val=\"1\"/><customFilter operator=\"lessThanOrEqual\" val=\"10\"/></customFilters></filterColumn></autoFilter>"
+  },
+  {
+   "name": "either",
+   "setup": "v = ws.Range(\"A1:D13\").AutoFilter(Field:=1, Criteria1:=\"apple\", Operator:=xlOr, Criteria2:=\"cherry\")\n",
+   "reading": "Boolean:True;hidden=4,6,7,8,9,10,11,13, mode=True filtering=True range=$A$1:$D$13 count=4 f1:True op=2 c1=String:=apple c2=String:=cherry f2:False f3:False f4:False db==either!$A$1:$D$13:False",
+   "reopened": "hidden=4,6,7,8,9,10,11,13, mode=True filtering=True range=$A$1:$D$13 count=4 f1:True op=2 c1=String:=apple c2=String:=cherry f2:False f3:False f4:False db==either!$A$1:$D$13:False",
+   "xml": "<autoFilter ref=\"A1:D13\" xr:uid=\"{C0BA0C41-4151-4D59-A362-37743036C4AC}\"><filterColumn colId=\"0\"><filters><filter val=\"apple\"/><filter val=\"cherry\"/></filters></filterColumn></autoFilter>"
+  },
+  {
+   "name": "values_three",
+   "setup": "v = ws.Range(\"A1:D13\").AutoFilter(Field:=1, Criteria1:=Array(\"apple\", \"cherry\", \"banana\"), Operator:=xlFilterValues)\n",
+   "reading": "Double:1;hidden=6,7,8,9,11,13, mode=True filtering=True range=$A$1:$D$13 count=4 f1:True op=7 c1=Array(String:=apple,String:=banana,String:=cherry,) c2=E1004 f2:False f3:False f4:False db==values_three!$A$1:$D$13:False",
+   "reopened": "hidden=6,7,8,9,11,13, mode=True filtering=True range=$A$1:$D$13 count=4 f1:True op=7 c1=Array(String:=apple,String:=banana,String:=cherry,) c2=E1004 f2:False f3:False f4:False db==values_three!$A$1:$D$13:False",
+   "xml": "<autoFilter ref=\"A1:D13\" xr:uid=\"{C6699311-6484-426A-A54C-80649EF97685}\"><filterColumn colId=\"0\"><filters><filter val=\"apple\"/><filter val=\"banana\"/><filter val=\"cherry\"/></filters></filterColumn></autoFilter>"
+  },
+  {
+   "name": "values_two",
+   "setup": "v = ws.Range(\"A1:D13\").AutoFilter(Field:=1, Criteria1:=Array(\"apple\", \"cherry\"), Operator:=xlFilterValues)\n",
+   "reading": "Double:1;hidden=4,6,7,8,9,10,11,13, mode=True filtering=True range=$A$1:$D$13 count=4 f1:True op=2 c1=String:=apple c2=String:=cherry f2:False f3:False f4:False db==values_two!$A$1:$D$13:False",
+   "reopened": "hidden=4,6,7,8,9,10,11,13, mode=True filtering=True range=$A$1:$D$13 count=4 f1:True op=2 c1=String:=apple c2=String:=cherry f2:False f3:False f4:False db==values_two!$A$1:$D$13:False",
+   "xml": "<autoFilter ref=\"A1:D13\" xr:uid=\"{6FDDA229-2F57-43BB-AA2D-147DDCE52B8A}\"><filterColumn colId=\"0\"><filters><filter val=\"apple\"/><filter val=\"cherry\"/></filters></filterColumn></autoFilter>"
+  },
+  {
+   "name": "values_blank",
+   "setup": "v = ws.Range(\"A1:D13\").AutoFilter(Field:=4, Criteria1:=Array(\"x\", \"y\", \"\"), Operator:=xlFilterValues)\n",
+   "reading": "Double:4;hidden= mode=True filtering=True range=$A$1:$D$13 count=4 f1:False f2:False f3:False f4:True op=7 c1=Array(String:=x,String:=y,String:=,) c2=E1004 db==values_blank!$A$1:$D$13:False",
+   "reopened": "hidden= mode=True filtering=True range=$A$1:$D$13 count=4 f1:False f2:False f3:False f4:True op=7 c1=Array(String:=x,String:=y,String:=,) c2=E1004 db==values_blank!$A$1:$D$13:False",
+   "xml": "<autoFilter ref=\"A1:D13\" xr:uid=\"{D4A46F67-E2F7-4359-84ED-9AC3C67E0416}\"><filterColumn colId=\"3\"><filters blank=\"1\"><filter val=\"x\"/><filter val=\"y\"/></filters></filterColumn></autoFilter>"
+  },
+  {
+   "name": "top_items",
+   "setup": "ws.Range(\"F1\").Value = \"N\"\nws.Range(\"F2:F9\").Value = Application.Transpose(Array(5, 3, 9, 1, 7, 3, 12, 0.5))\nv = ws.Range(\"F1:F9\").AutoFilter(Field:=1, Criteria1:=3, Operator:=xlTop10Items)\n",
+   "reading": "Boolean:True;hidden=2,3,5,7,9, mode=True filtering=True range=$F$1:$F$9 count=1 f1:True op=3 c1=String:>=7 c2=E1004 db==top_items!$F$1:$F$9:False",
+   "reopened": "hidden=2,3,5,7,9, mode=True filtering=True range=$F$1:$F$9 count=1 f1:True op=3 c1=String:>=7 c2=E1004 db==top_items!$F$1:$F$9:False",
+   "xml": "<autoFilter ref=\"F1:F9\" xr:uid=\"{7C54F980-63B3-4E18-ABFA-085CB5AB5697}\"><filterColumn colId=\"0\"><top10 val=\"3\" filterVal=\"7\"/></filterColumn></autoFilter>"
+  },
+  {
+   "name": "top_percent",
+   "setup": "ws.Range(\"F1\").Value = \"N\"\nws.Range(\"F2:F9\").Value = Application.Transpose(Array(5, 3, 9, 1, 7, 3, 12, 0.5))\nv = ws.Range(\"F1:F9\").AutoFilter(Field:=1, Criteria1:=25, Operator:=xlTop10Percent)\n",
+   "reading": "Boolean:True;hidden=2,3,5,6,7,9, mode=True filtering=True range=$F$1:$F$9 count=1 f1:True op=5 c1=String:>=9 c2=E1004 db==top_percent!$F$1:$F$9:False",
+   "reopened": "hidden=2,3,5,6,7,9, mode=True filtering=True range=$F$1:$F$9 count=1 f1:True op=5 c1=String:>=9 c2=E1004 db==top_percent!$F$1:$F$9:False",
+   "xml": "<autoFilter ref=\"F1:F9\" xr:uid=\"{92196363-3057-4F63-A615-795E1A63070F}\"><filterColumn colId=\"0\"><top10 percent=\"1\" val=\"25\" filterVal=\"9\"/></filterColumn></autoFilter>"
+  },
+  {
+   "name": "bottom_items",
+   "setup": "ws.Range(\"F1\").Value = \"N\"\nws.Range(\"F2:F9\").Value = Application.Transpose(Array(5, 3, 9, 1, 7, 3, 12, 0.5))\nv = ws.Range(\"F1:F9\").AutoFilter(Field:=1, Criteria1:=2, Operator:=xlBottom10Items)\n",
+   "reading": "Boolean:True;hidden=2,3,4,6,7,8, mode=True filtering=True range=$F$1:$F$9 count=1 f1:True op=4 c1=String:<=1 c2=E1004 db==bottom_items!$F$1:$F$9:False",
+   "reopened": "hidden=2,3,4,6,7,8, mode=True filtering=True range=$F$1:$F$9 count=1 f1:True op=4 c1=String:<=1 c2=E1004 db==bottom_items!$F$1:$F$9:False",
+   "xml": "<autoFilter ref=\"F1:F9\" xr:uid=\"{864B91F7-95AD-436E-931F-1303B797C7CA}\"><filterColumn colId=\"0\"><top10 top=\"0\" val=\"2\" filterVal=\"1\"/></filterColumn></autoFilter>"
+  },
+  {
+   "name": "above_average",
+   "setup": "ws.Range(\"F1\").Value = \"N\"\nws.Range(\"F2:F9\").Value = Application.Transpose(Array(5, 3, 9, 1, 7, 3, 12, 0.5))\nv = ws.Range(\"F1:F9\").AutoFilter(Field:=1, Criteria1:=xlFilterAboveAverage, Operator:=xlFilterDynamic)\n",
+   "reading": "Boolean:True;hidden=2,3,5,7,9, mode=True filtering=True range=$F$1:$F$9 count=1 f1:True op=11 c1=Long:33 c2=E1004 db==above_average!$F$1:$F$9:False",
+   "reopened": "hidden=2,3,5,7,9, mode=True filtering=True range=$F$1:$F$9 count=1 f1:True op=11 c1=Long:33 c2=E1004 db==above_average!$F$1:$F$9:False",
+   "xml": "<autoFilter ref=\"F1:F9\" xr:uid=\"{D3F53EBF-E27F-4DB6-BAE5-0A01FBCA2F23}\"><filterColumn colId=\"0\"><dynamicFilter type=\"aboveAverage\" val=\"5.0625\"/></filterColumn></autoFilter>"
+  },
+  {
+   "name": "below_average",
+   "setup": "ws.Range(\"F1\").Value = \"N\"\nws.Range(\"F2:F9\").Value = Application.Transpose(Array(5, 3, 9, 1, 7, 3, 12, 0.5))\nv = ws.Range(\"F1:F9\").AutoFilter(Field:=1, Criteria1:=xlFilterBelowAverage, Operator:=xlFilterDynamic)\n",
+   "reading": "Boolean:True;hidden=4,6,8, mode=True filtering=True range=$F$1:$F$9 count=1 f1:True op=11 c1=Long:34 c2=E1004 db==below_average!$F$1:$F$9:False",
+   "reopened": "hidden=4,6,8, mode=True filtering=True range=$F$1:$F$9 count=1 f1:True op=11 c1=Long:34 c2=E1004 db==below_average!$F$1:$F$9:False",
+   "xml": "<autoFilter ref=\"F1:F9\" xr:uid=\"{D3DF8BA4-4109-4355-A340-2B20EFCEED64}\"><filterColumn colId=\"0\"><dynamicFilter type=\"belowAverage\" val=\"5.0625\"/></filterColumn></autoFilter>"
+  },
+  {
+   "name": "blanks",
+   "setup": "v = ws.Range(\"A1:D13\").AutoFilter(Field:=4, Criteria1:=\"=\")\n",
+   "reading": "Boolean:True;hidden=2,3,4,12, mode=True filtering=True range=$A$1:$D$13 count=4 f1:False f2:False f3:False f4:True op=0 c1=String:= c2=E1004 db==blanks!$A$1:$D$13:False",
+   "reopened": "hidden=2,3,4,12, mode=True filtering=True range=$A$1:$D$13 count=4 f1:False f2:False f3:False f4:True op=0 c1=String:= c2=E1004 db==blanks!$A$1:$D$13:False",
+   "xml": "<autoFilter ref=\"A1:D13\" xr:uid=\"{7C2C2465-C5CC-4AAD-84F4-79B75D06CF31}\"><filterColumn colId=\"3\"><filters blank=\"1\"/></filterColumn></autoFilter>"
+  },
+  {
+   "name": "non_blanks",
+   "setup": "v = ws.Range(\"A1:D13\").AutoFilter(Field:=4, Criteria1:=\"<>\")\n",
+   "reading": "Boolean:True;hidden=5,6,7,8,9,10,11,13, mode=True filtering=True range=$A$1:$D$13 count=4 f1:False f2:False f3:False f4:True op=0 c1=String:<> c2=E1004 db==non_blanks!$A$1:$D$13:False",
+   "reopened": "hidden=5,6,7,8,9,10,11,13, mode=True filtering=True range=$A$1:$D$13 count=4 f1:False f2:False f3:False f4:True op=0 c1=String:<> c2=E1004 db==non_blanks!$A$1:$D$13:False",
+   "xml": "<autoFilter ref=\"A1:D13\" xr:uid=\"{98113558-7BFB-494C-A5E5-5DC1A6CD4C45}\"><filterColumn colId=\"3\"><customFilters><customFilter operator=\"notEqual\" val=\" \"/></customFilters></filterColumn></autoFilter>"
+  },
+  {
+   "name": "two_fields",
+   "setup": "v = ws.Range(\"A1:D13\").AutoFilter(Field:=1, Criteria1:=\"cherry\")\nv = ws.Range(\"A1:D13\").AutoFilter(Field:=4, Criteria1:=\"y\")\n",
+   "reading": "Boolean:True;hidden=2,3,4,5,6,7,8,9,10,11,13, mode=True filtering=True range=$A$1:$D$13 count=4 f1:True op=0 c1=String:=cherry c2=E1004 f2:False f3:False f4:True op=0 c1=String:=y c2=E1004 db==two_fields!$A$1:$D$13:False",
+   "reopened": "hidden=2,3,4,5,6,7,8,9,10,11,13, mode=True filtering=True range=$A$1:$D$13 count=4 f1:True op=0 c1=String:=cherry c2=E1004 f2:False f3:False f4:True op=0 c1=String:=y c2=E1004 db==two_fields!$A$1:$D$13:False",
+   "xml": "<autoFilter ref=\"A1:D13\" xr:uid=\"{7602FCD7-678C-4D7E-AC90-CB40BB37F3A3}\"><filterColumn colId=\"0\"><filters><filter val=\"cherry\"/></filters></filterColumn><filterColumn colId=\"3\"><filters><filter val=\"y\"/></filters></filterColumn></autoFilter>"
+  },
+  {
+   "name": "date_after",
+   "setup": "v = ws.Range(\"A1:D13\").AutoFilter(Field:=3, Criteria1:=\">1/15/2020\")\n",
+   "reading": "Boolean:True;hidden=2,3,7,8,9,11,12,13, mode=True filtering=True range=$A$1:$D$13 count=4 f1:False f2:False f3:True op=0 c1=String:>43845 c2=E1004 f4:False db==date_after!$A$1:$D$13:False",
+   "reopened": "hidden=2,3,7,8,9,11,12,13, mode=True filtering=True range=$A$1:$D$13 count=4 f1:False f2:False f3:True op=0 c1=String:>43845 c2=E1004 f4:False db==date_after!$A$1:$D$13:False",
+   "xml": "<autoFilter ref=\"A1:D13\" xr:uid=\"{A6B68B0F-0A8D-4D7A-A6CF-84709223C47F}\"><filterColumn colId=\"2\"><customFilters><customFilter operator=\"greaterThan\" val=\"43845\"/></customFilters></filterColumn></autoFilter>"
+  },
+  {
+   "name": "date_equals",
+   "setup": "v = ws.Range(\"A1:D13\").AutoFilter(Field:=3, Criteria1:=\"1/15/2020\")\n",
+   "reading": "Boolean:True;hidden=2,4,5,6,7,8,9,10,11,13, mode=True filtering=True range=$A$1:$D$13 count=4 f1:False f2:False f3:True op=0 c1=String:=1/15/2020 c2=E1004 f4:False db==date_equals!$A$1:$D$13:False",
+   "reopened": "hidden=2,4,5,6,7,8,9,10,11,13, mode=True filtering=True range=$A$1:$D$13 count=4 f1:False f2:False f3:True op=0 c1=String:=1/15/2020 c2=E1004 f4:False db==date_equals!$A$1:$D$13:False",
+   "xml": "<autoFilter ref=\"A1:D13\" xr:uid=\"{260D2518-CDA2-4CB9-AA50-E09AF369CD78}\"><filterColumn colId=\"2\"><filters><filter val=\"1/15/2020\"/></filters></filterColumn></autoFilter>"
+  },
+  {
+   "name": "text_greater",
+   "setup": "v = ws.Range(\"A1:D13\").AutoFilter(Field:=1, Criteria1:=\">b\")\n",
+   "reading": "Boolean:True;hidden=2,3,6,8,9,13, mode=True filtering=True range=$A$1:$D$13 count=4 f1:True op=0 c1=String:>b c2=E1004 f2:False f3:False f4:False db==text_greater!$A$1:$D$13:False",
+   "reopened": "hidden=2,3,6,8,9,13, mode=True filtering=True range=$A$1:$D$13 count=4 f1:True op=0 c1=String:>b c2=E1004 f2:False f3:False f4:False db==text_greater!$A$1:$D$13:False",
+   "xml": "<autoFilter ref=\"A1:D13\" xr:uid=\"{BAD88CBF-32FC-4F4F-B7C0-1880DD5E5B1E}\"><filterColumn colId=\"0\"><customFilters><customFilter operator=\"greaterThan\" val=\"b\"/></customFilters></filterColumn></autoFilter>"
+  },
+  {
+   "name": "number_equals",
+   "setup": "v = ws.Range(\"A1:D13\").AutoFilter(Field:=2, Criteria1:=\"1\")\n",
+   "reading": "Boolean:True;hidden=3,4,5,6,7,8,9,10,11,12,13, mode=True filtering=True range=$A$1:$D$13 count=4 f1:False f2:True op=0 c1=String:=1 c2=E1004 f3:False f4:False db==number_equals!$A$1:$D$13:False",
+   "reopened": "hidden=3,4,5,6,7,8,9,10,11,12,13, mode=True filtering=True range=$A$1:$D$13 count=4 f1:False f2:True op=0 c1=String:=1 c2=E1004 f3:False f4:False db==number_equals!$A$1:$D$13:False",
+   "xml": "<autoFilter ref=\"A1:D13\" xr:uid=\"{4A1133B2-0AD0-4F01-934F-C8B7DF7002F4}\"><filterColumn colId=\"1\"><filters><filter val=\"1\"/></filters></filterColumn></autoFilter>"
+  },
+  {
+   "name": "number_shown",
+   "setup": "v = ws.Range(\"A1:D13\").AutoFilter(Field:=2, Criteria1:=\"1.00\")\n",
+   "reading": "Boolean:True;hidden=2,3,4,5,6,8,9,10,11,12,13, mode=True filtering=True range=$A$1:$D$13 count=4 f1:False f2:True op=0 c1=String:=1.00 c2=E1004 f3:False f4:False db==number_shown!$A$1:$D$13:False",
+   "reopened": "hidden=2,3,4,5,6,8,9,10,11,12,13, mode=True filtering=True range=$A$1:$D$13 count=4 f1:False f2:True op=0 c1=String:=1.00 c2=E1004 f3:False f4:False db==number_shown!$A$1:$D$13:False",
+   "xml": "<autoFilter ref=\"A1:D13\" xr:uid=\"{ED865C15-7008-4FC1-BB4A-680361344201}\"><filterColumn colId=\"1\"><filters><filter val=\"1.00\"/></filters></filterColumn></autoFilter>"
+  },
+  {
+   "name": "not_number",
+   "setup": "v = ws.Range(\"A1:D13\").AutoFilter(Field:=2, Criteria1:=\"<>2\")\n",
+   "reading": "Boolean:True;hidden=3,12, mode=True filtering=True range=$A$1:$D$13 count=4 f1:False f2:True op=0 c1=String:<>2 c2=E1004 f3:False f4:False db==not_number!$A$1:$D$13:False",
+   "reopened": "hidden=3,12, mode=True filtering=True range=$A$1:$D$13 count=4 f1:False f2:True op=0 c1=String:<>2 c2=E1004 f3:False f4:False db==not_number!$A$1:$D$13:False",
+   "xml": "<autoFilter ref=\"A1:D13\" xr:uid=\"{D4C3575D-076B-425D-9216-EA649F65E165}\"><filterColumn colId=\"1\"><customFilters><customFilter operator=\"notEqual\" val=\"2\"/></customFilters></filterColumn></autoFilter>"
+  },
+  {
+   "name": "any_text",
+   "setup": "v = ws.Range(\"A1:D13\").AutoFilter(Field:=1, Criteria1:=\"*\")\n",
+   "reading": "Boolean:True;hidden=13, mode=True filtering=True range=$A$1:$D$13 count=4 f1:True op=0 c1=String:=* c2=E1004 f2:False f3:False f4:False db==any_text!$A$1:$D$13:False",
+   "reopened": "hidden=13, mode=True filtering=True range=$A$1:$D$13 count=4 f1:True op=0 c1=String:=* c2=E1004 f2:False f3:False f4:False db==any_text!$A$1:$D$13:False",
+   "xml": "<autoFilter ref=\"A1:D13\" xr:uid=\"{9A5F5551-D4BB-4829-8EB8-88D3B57BD686}\"><filterColumn colId=\"0\"><customFilters><customFilter val=\"*\"/></customFilters></filterColumn></autoFilter>"
+  },
+  {
+   "name": "shown_all",
+   "setup": "v = ws.Range(\"A1:D13\").AutoFilter(Field:=1, Criteria1:=\"apple\")\nws.ShowAllData\n",
+   "reading": "Boolean:True;hidden= mode=True filtering=False range=$A$1:$D$13 count=4 f1:False f2:False f3:False f4:False db==shown_all!$A$1:$D$13:False",
+   "reopened": "hidden= mode=True filtering=False range=$A$1:$D$13 count=4 f1:False f2:False f3:False f4:False db==shown_all!$A$1:$D$13:False",
+   "xml": "<autoFilter ref=\"A1:D13\" xr:uid=\"{1AEA936B-8B66-4724-BDB3-3C385B5B86A3}\"/>"
+  },
+  {
+   "name": "turned_off",
+   "setup": "v = ws.Range(\"A1:D13\").AutoFilter(Field:=1, Criteria1:=\"apple\")\nws.AutoFilterMode = False\n",
+   "reading": "Boolean:True;hidden= mode=False filtering=False db==turned_off!$A$1:$D$13:False",
+   "reopened": "hidden= mode=False filtering=False db==turned_off!$A$1:$D$13:False",
+   "xml": ""
+  },
+  {
+   "name": "escaped",
+   "setup": "v = ws.Range(\"A1:D13\").AutoFilter(Field:=1, Criteria1:=\"b~*\")\n",
+   "reading": "Boolean:True;hidden=2,3,4,5,6,8,9,10,11,12,13, mode=True filtering=True range=$A$1:$D$13 count=4 f1:True op=0 c1=String:=b~* c2=E1004 f2:False f3:False f4:False db==escaped!$A$1:$D$13:False",
+   "reopened": "hidden=2,3,4,5,6,8,9,10,11,12,13, mode=True filtering=True range=$A$1:$D$13 count=4 f1:True op=0 c1=String:=b~* c2=E1004 f2:False f3:False f4:False db==escaped!$A$1:$D$13:False",
+   "xml": "<autoFilter ref=\"A1:D13\" xr:uid=\"{862CC066-280F-405C-B5C5-01FAB45B3D96}\"><filterColumn colId=\"0\"><filters><filter val=\"b*\"/></filters></filterColumn></autoFilter>"
+  },
+  {
+   "name": "time_after",
+   "setup": "v = ws.Range(\"A1:D13\").AutoFilter(Field:=3, Criteria1:=\">1/15/2020 5:00\")\n",
+   "reading": "Boolean:True;hidden=2,3,7,8,9,11,12,13, mode=True filtering=True range=$A$1:$D$13 count=4 f1:False f2:False f3:True op=0 c1=String:>43845.2083333333 c2=E1004 f4:False db==time_after!$A$1:$D$13:False",
+   "reopened": "hidden=2,3,7,8,9,11,12,13, mode=True filtering=True range=$A$1:$D$13 count=4 f1:False f2:False f3:True op=0 c1=String:>43845.2083333333 c2=E1004 f4:False db==time_after!$A$1:$D$13:False",
+   "xml": "<autoFilter ref=\"A1:D13\" xr:uid=\"{AA6ED827-0B12-468A-BE72-4ACFF1F5A112}\"><filterColumn colId=\"2\"><customFilters><customFilter operator=\"greaterThan\" val=\"43845.208333333336\"/></customFilters></filterColumn></autoFilter>"
+  },
+  {
+   "name": "hidden_button",
+   "setup": "v = ws.Range(\"A1:D13\").AutoFilter(Field:=1, Criteria1:=\"apple\", VisibleDropDown:=False)\n",
+   "reading": "Boolean:True;hidden=4,5,6,7,8,9,10,11,12,13, mode=True filtering=True range=$A$1:$D$13 count=4 f1:True op=0 c1=String:=apple c2=E1004 f2:False f3:False f4:False db==hidden_button!$A$1:$D$13:False",
+   "reopened": "hidden=4,5,6,7,8,9,10,11,12,13, mode=True filtering=True range=$A$1:$D$13 count=4 f1:True op=0 c1=String:=apple c2=E1004 f2:False f3:False f4:False db==hidden_button!$A$1:$D$13:False",
+   "xml": "<autoFilter ref=\"A1:D13\" xr:uid=\"{4C96D3E4-5FF0-40F9-A8D4-A1D9AEFF9285}\"><filterColumn colId=\"0\" hiddenButton=\"1\"><filters><filter val=\"apple\"/></filters></filterColumn></autoFilter>"
+  },
+  {
+   "name": "or_custom",
+   "setup": "v = ws.Range(\"A1:D13\").AutoFilter(Field:=1, Criteria1:=\"a*\", Operator:=xlOr, Criteria2:=\"cherry\")\n",
+   "reading": "Boolean:True;hidden=4,7,8,9,10,11,13, mode=True filtering=True range=$A$1:$D$13 count=4 f1:True op=2 c1=String:=a* c2=String:=cherry f2:False f3:False f4:False db==or_custom!$A$1:$D$13:False",
+   "reopened": "hidden=4,7,8,9,10,11,13, mode=True filtering=True range=$A$1:$D$13 count=4 f1:True op=2 c1=String:=a* c2=String:=cherry f2:False f3:False f4:False db==or_custom!$A$1:$D$13:False",
+   "xml": "<autoFilter ref=\"A1:D13\" xr:uid=\"{2FE5E139-7348-4697-8779-FB6837002AF4}\"><filterColumn colId=\"0\"><customFilters><customFilter val=\"a*\"/><customFilter val=\"cherry\"/></customFilters></filterColumn></autoFilter>"
+  },
+  {
+   "name": "and_plain",
+   "setup": "v = ws.Range(\"A1:D13\").AutoFilter(Field:=1, Criteria1:=\"apple\", Operator:=xlAnd, Criteria2:=\"Apple\")\n",
+   "reading": "Boolean:True;hidden=4,5,6,7,8,9,10,11,12,13, mode=True filtering=True range=$A$1:$D$13 count=4 f1:True op=1 c1=String:=apple c2=String:=Apple f2:False f3:False f4:False db==and_plain!$A$1:$D$13:False",
+   "reopened": "hidden=4,5,6,7,8,9,10,11,12,13, mode=True filtering=True range=$A$1:$D$13 count=4 f1:True op=1 c1=String:=apple c2=String:=Apple f2:False f3:False f4:False db==and_plain!$A$1:$D$13:False",
+   "xml": "<autoFilter ref=\"A1:D13\" xr:uid=\"{C2FBC68E-9E29-4374-9358-CD158CF20625}\"><filterColumn colId=\"0\"><customFilters and=\"1\"><customFilter val=\"apple\"/><customFilter val=\"Apple\"/></customFilters></filterColumn></autoFilter>"
+  },
+  {
+   "name": "or_blank",
+   "setup": "v = ws.Range(\"A1:D13\").AutoFilter(Field:=4, Criteria1:=\"=\", Operator:=xlOr, Criteria2:=\"x\")\n",
+   "reading": "Boolean:True;hidden=3,12, mode=True filtering=True range=$A$1:$D$13 count=4 f1:False f2:False f3:False f4:True op=2 c1=String:= c2=String:=x db==or_blank!$A$1:$D$13:False",
+   "reopened": "hidden=3,12, mode=True filtering=True range=$A$1:$D$13 count=4 f1:False f2:False f3:False f4:True op=2 c1=String:= c2=String:=x db==or_blank!$A$1:$D$13:False",
+   "xml": "<autoFilter ref=\"A1:D13\" xr:uid=\"{A52D810B-AD05-48BD-A1A6-4E8056D22B11}\"><filterColumn colId=\"3\"><filters blank=\"1\"><filter val=\"x\"/></filters></filterColumn></autoFilter>"
+  },
+  {
+   "name": "decimal_greater",
+   "setup": "v = ws.Range(\"A1:D13\").AutoFilter(Field:=2, Criteria1:=\">2.50\")\n",
+   "reading": "Boolean:True;hidden=2,3,4,6,7,9,10,11,12,13, mode=True filtering=True range=$A$1:$D$13 count=4 f1:False f2:True op=0 c1=String:>2.5 c2=E1004 f3:False f4:False db==decimal_greater!$A$1:$D$13:False",
+   "reopened": "hidden=2,3,4,6,7,9,10,11,12,13, mode=True filtering=True range=$A$1:$D$13 count=4 f1:False f2:True op=0 c1=String:>2.5 c2=E1004 f3:False f4:False db==decimal_greater!$A$1:$D$13:False",
+   "xml": "<autoFilter ref=\"A1:D13\" xr:uid=\"{5F1726D6-8E40-4106-AEB4-2380AEE3E2B1}\"><filterColumn colId=\"1\"><customFilters><customFilter operator=\"greaterThan\" val=\"2.5\"/></customFilters></filterColumn></autoFilter>"
+  },
+  {
+   "name": "grown_below",
+   "setup": "v = ws.Range(\"A1:D13\").AutoFilter(Field:=1, Criteria1:=\"apple\")\nws.Range(\"A14\").Value = \"apple\"\n",
+   "reading": "Boolean:True;hidden=4,5,6,7,8,9,10,11,12,13, mode=True filtering=True range=$A$1:$D$14 count=4 f1:True op=0 c1=String:=apple c2=E1004 f2:False f3:False f4:False db==grown_below!$A$1:$D$13:False",
+   "reopened": "hidden=4,5,6,7,8,9,10,11,12,13, mode=True filtering=True range=$A$1:$D$14 count=4 f1:True op=0 c1=String:=apple c2=E1004 f2:False f3:False f4:False db==grown_below!$A$1:$D$13:False",
+   "xml": "<autoFilter ref=\"A1:D13\" xr:uid=\"{300CC880-6175-4A36-A564-4D7827E7BA8F}\"><filterColumn colId=\"0\"><filters><filter val=\"apple\"/></filters></filterColumn></autoFilter>"
+  },
+  {
+   "name": "grown_reapplied",
+   "setup": "v = ws.Range(\"A1:D13\").AutoFilter(Field:=1, Criteria1:=\"apple\")\nws.Range(\"A14\").Value = \"pear\"\nws.AutoFilter.ApplyFilter\n",
+   "reading": "Boolean:True;hidden=4,5,6,7,8,9,10,11,12,13,14, mode=True filtering=True range=$A$1:$D$14 count=4 f1:True op=0 c1=String:=apple c2=E1004 f2:False f3:False f4:False db==grown_reapplied!$A$1:$D$13:False",
+   "reopened": "hidden=4,5,6,7,8,9,10,11,12,13,14, mode=True filtering=True range=$A$1:$D$14 count=4 f1:True op=0 c1=String:=apple c2=E1004 f2:False f3:False f4:False db==grown_reapplied!$A$1:$D$13:False",
+   "xml": "<autoFilter ref=\"A1:D14\" xr:uid=\"{0C70AEBB-566A-4DA7-A1AD-F1D671DEC8D0}\"><filterColumn colId=\"0\"><filters><filter val=\"apple\"/></filters></filterColumn></autoFilter>"
+  },
+  {
+   "name": "sub_range",
+   "setup": "v = ws.Range(\"A1:D5\").AutoFilter(Field:=1, Criteria1:=\"apple\")\n",
+   "reading": "Boolean:True;hidden=4,5,6,7,8,9,10,11,12,13, mode=True filtering=True range=$A$1:$D$13 count=4 f1:True op=0 c1=String:=apple c2=E1004 f2:False f3:False f4:False db==sub_range!$A$1:$D$5:False",
+   "reopened": "hidden=4,5,6,7,8,9,10,11,12,13, mode=True filtering=True range=$A$1:$D$13 count=4 f1:True op=0 c1=String:=apple c2=E1004 f2:False f3:False f4:False db==sub_range!$A$1:$D$5:False",
+   "xml": "<autoFilter ref=\"A1:D13\" xr:uid=\"{5F04EA06-DFB9-48A3-8571-0667B2737C61}\"><filterColumn colId=\"0\"><filters><filter val=\"apple\"/></filters></filterColumn></autoFilter>"
+  },
+  {
+   "name": "sub_range_arrows",
+   "setup": "v = ws.Range(\"A1:D5\").AutoFilter\n",
+   "reading": "Boolean:True;hidden= mode=True filtering=False range=$A$1:$D$13 count=4 f1:False f2:False f3:False f4:False db==sub_range_arrows!$A$1:$D$5:False",
+   "reopened": "hidden= mode=True filtering=False range=$A$1:$D$13 count=4 f1:False f2:False f3:False f4:False db==sub_range_arrows!$A$1:$D$5:False",
+   "xml": "<autoFilter ref=\"A1:D5\" xr:uid=\"{D8411F03-3B0F-4D50-84E8-5F8028797BE6}\"/>"
+  },
+  {
+   "name": "sub_range_then_field",
+   "setup": "v = ws.Range(\"A1:D5\").AutoFilter\nv = ws.Range(\"A1\").AutoFilter(Field:=1, Criteria1:=\"apple\")\n",
+   "reading": "Boolean:True;hidden=4,5,6,7,8,9,10,11,12,13, mode=True filtering=True range=$A$1:$D$13 count=4 f1:True op=0 c1=String:=apple c2=E1004 f2:False f3:False f4:False db==sub_range_then_field!$A$1:$D$13:False",
+   "reopened": "hidden=4,5,6,7,8,9,10,11,12,13, mode=True filtering=True range=$A$1:$D$13 count=4 f1:True op=0 c1=String:=apple c2=E1004 f2:False f3:False f4:False db==sub_range_then_field!$A$1:$D$13:False",
+   "xml": "<autoFilter ref=\"A1:D13\" xr:uid=\"{01C95D3F-7628-4897-A5A2-BF3C37411EFD}\"><filterColumn colId=\"0\"><filters><filter val=\"apple\"/></filters></filterColumn></autoFilter>"
+  },
+  {
+   "name": "sub_range_refiltered",
+   "setup": "v = ws.Range(\"A1:D5\").AutoFilter(Field:=1, Criteria1:=\"apple\")\nv = ws.Range(\"A1:D5\").AutoFilter(Field:=2, Criteria1:=\">1\")\n",
+   "reading": "Boolean:True;hidden=2,4,5,6,7,8,9,10,11,12,13, mode=True filtering=True range=$A$1:$D$13 count=4 f1:True op=0 c1=String:=apple c2=E1004 f2:True op=0 c1=String:>1 c2=E1004 f3:False f4:False db==sub_range_refiltered!$A$1:$D$13:False",
+   "reopened": "hidden=2,4,5,6,7,8,9,10,11,12,13, mode=True filtering=True range=$A$1:$D$13 count=4 f1:True op=0 c1=String:=apple c2=E1004 f2:True op=0 c1=String:>1 c2=E1004 f3:False f4:False db==sub_range_refiltered!$A$1:$D$13:False",
+   "xml": "<autoFilter ref=\"A1:D13\" xr:uid=\"{142D4112-2583-49BD-856E-F2312D682EC8}\"><filterColumn colId=\"0\"><filters><filter val=\"apple\"/></filters></filterColumn><filterColumn colId=\"1\"><customFilters><customFilter operator=\"greaterThan\" val=\"1\"/></customFilters></filterColumn></autoFilter>"
+  },
+  {
+   "name": "sub_range_mid",
+   "setup": "v = ws.Range(\"A3:D5\").AutoFilter(Field:=1, Criteria1:=\"apple\")\n",
+   "reading": "Boolean:True;hidden=4,5,6,7,8,9,10,11,12,13, mode=True filtering=True range=$A$3:$D$13 count=4 f1:True op=0 c1=String:=apple c2=E1004 f2:False f3:False f4:False db==sub_range_mid!$A$3:$D$5:False",
+   "reopened": "hidden=4,5,6,7,8,9,10,11,12,13, mode=True filtering=True range=$A$3:$D$13 count=4 f1:True op=0 c1=String:=apple c2=E1004 f2:False f3:False f4:False db==sub_range_mid!$A$3:$D$5:False",
+   "xml": "<autoFilter ref=\"A3:D13\" xr:uid=\"{98061C5A-2175-4BC8-8BB3-F93EB0A729CC}\"><filterColumn colId=\"0\"><filters><filter val=\"apple\"/></filters></filterColumn></autoFilter>"
+  }
+ ]
+}
